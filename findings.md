@@ -10,16 +10,24 @@ The data pipeline must preserve every user turn and image binding, discard every
 
 The local `speculators` implementation exposes the required bidirectional DFlash switch as `--sliding-window-non-causal`. The requested optimizer/schedule are `--optimizer adamw` and `--scheduler-type cosine`. Parser2 additionally needs multimodal messages retained in Arrow, strict vLLM token-ID matching, Qwen3.5 MRoPE compatibility, and target hidden states from the 24-layer text tower.
 
+The complete 100-record path is now verified. Local vLLM 0.26.0 served the exact Parser2 target with DP=2 and returned layers `[2, 12, 21, 24]`; a real 3,961-token multimodal Arrow item round-tripped with exact token IDs. Six-rank DDP then completed exactly ten optimizer steps and stopped at the cross-epoch limit. This clears basic serving, multimodal alignment, MRoPE, optimizer, scheduler, and checkpoint-publication risk before the 800k pilot.
+
 ## Key Results
 
 - Repository audit found an existing deterministic, resumable regeneration implementation with ranked eligibility/backfill tests.
 - The current defaults violate two explicit requirements: regeneration uses `Infinity-Parser2-Flash`, and training uses Muon + linear without bidirectional sliding attention.
-- Eight H100s are currently protected by `h100_load.py` while no GPU experiment is running.
+- The accepted smoke run `20260805T023908Z-425140` produced ten finite training losses on global steps 0--9. Training loss moved from 5.820 to 3.407; validation loss moved from 8.608 to 3.809215.
+- Resolved runtime configuration proves five DFlash layers, block size 8, non-causal sliding window 2048, AdamW at `1e-4` with weight decay `0.01`, and cosine decay were active.
+- Five readable checkpoints were written; `checkpoint_best` points to epoch 4. Its 1,656,266,704-byte `model.safetensors` contains 62 tensors and has SHA-256 `9004c715969c0514db87c5dce5d6a5e3d348733276c015efa04859c911a77b26`.
+- The first GPU attempt is explicitly invalid: a trainer control-flow bug applied `max_steps` only within an epoch, yielding 15 optimizer updates instead of 10. The run is archived under `output/infinity_parser2_v1_12_dflash/smoke_100_seq20480_failed_max_steps_20260805T022001Z-264688` and excluded from evidence.
+- Eight H100s are currently protected by `h100_load.py` PID 517984 while no GPU experiment is running.
 
 ## Patterns and Insights
 
 - Data regeneration and DFlash preprocessing cannot be treated as independent: eligibility after target-tokenization determines the exact 800k/1.5M training membership.
 - Nested candidate ranks make the pilot directly reusable for the final run and prevent a second unrelated random draw.
+- Online hidden-state production dominates the first smoke epoch; after vLLM and data-path warmup, the two optimizer batches per epoch complete quickly. Pilot sizing must therefore measure hidden-state service throughput separately from draft forward/backward throughput.
+- A per-epoch `break` is not a run-level stopping condition. Smoke controls that span epochs require an outer-loop `global_step >= max_steps` guard and a regression test.
 
 ## Lessons and Constraints
 
@@ -27,14 +35,19 @@ The local `speculators` implementation exposes the required bidirectional DFlash
 - The source uses `images` plus alternating `conversations`, including multi-image and multi-turn examples.
 - Idle GPUs must remain occupied; the holder must be stopped before vLLM/training and restored after experiments.
 - A successful command exit is insufficient: strict token alignment, finite loss, checkpoint publication, and exact output counts are required.
+- Invalid experimental artifacts are preserved under a clearly named archive rather than deleted or silently reused. Clean reruns must start from an empty checkpoint namespace.
 
 ## Open Questions
 
-- Can local vLLM 0.26.0 serve this Qwen3.5 VLM and return all requested hidden-state layers for multimodal prompts?
-- What AdamW learning rate is stable for the five-layer Parser2 draft under the requested cosine schedule?
+- Does the exact pipeline remain stable and throughput-efficient over the deterministic 800k pilot rather than ten smoke steps?
 - How many reserve candidates are needed to yield exactly 800k and 1.5M preprocessing-eligible records?
+- What acceptance length, output equivalence, TTFT, decode latency, and end-to-end throughput does the trained draft achieve against the autoregressive Parser2 baseline?
 
 ## Optimization Trajectory
 
-No GPU training run has been accepted yet. The first locked milestone is a 100-record regeneration/preprocessing plus 10-step strict DFlash smoke run.
+| Run | Classification | Outcome | Primary evidence |
+|---|---|---|---|
+| `20260805T022001Z-264688` | Exploratory infrastructure failure | Invalid: 15 updates exceeded the locked limit of 10 | Exposed cross-epoch `max_steps` bug; archived and excluded |
+| `20260805T023908Z-425140` | Confirmatory | PASS | Exact token round-trip, steps 0--9 only, finite loss, five checkpoints, strict resolved recipe |
 
+Direction after cycle 1: **DEEPEN**. Generate and preprocess the deterministic nested 800k pilot, train it only after exact-count and eligibility gates pass, and then benchmark acceptance/throughput before expanding to the final 1.5M validation pool.

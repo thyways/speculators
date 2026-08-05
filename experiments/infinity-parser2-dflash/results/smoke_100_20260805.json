@@ -1,0 +1,48 @@
+{
+  "schema_version": "parser2-dflash-result-v1",
+  "classification": "confirmatory",
+  "status": "passed",
+  "run_id": "20260805T023908Z-425140",
+  "protocol_commit": "e44c3de",
+  "code_commit": "27037e3",
+  "teacher_verifier": "/home/ma-user/work/data_mllm/publish_models/Infinity-Parser2-2B-2604",
+  "data": {
+    "records": 100,
+    "train_records": 90,
+    "validation_records": 10,
+    "sequence_length": 20480,
+    "real_roundtrip_tokens": 3961,
+    "hidden_state_layers": 4,
+    "hidden_size": 2048
+  },
+  "training": {
+    "world_size": 6,
+    "optimizer_steps": 10,
+    "global_steps": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    "losses": [5.820, 5.749, 8.318, 4.009, 5.224, 4.355, 3.824, 3.439, 3.434, 3.407],
+    "final_validation_loss": 3.809215,
+    "optimizer": "adamw",
+    "learning_rate": 0.0001,
+    "weight_decay": 0.01,
+    "scheduler": "cosine",
+    "sliding_window_non_causal": true,
+    "fatal_errors": 0
+  },
+  "checkpoint": {
+    "best_epoch": 4,
+    "model_bytes": 1656266704,
+    "tensor_count": 62,
+    "sha256": "9004c715969c0514db87c5dce5d6a5e3d348733276c015efa04859c911a77b26"
+  },
+  "logs": {
+    "train": "output/infinity_parser2_v1_12_dflash/smoke_100_seq20480/train-20260805T023908Z-425140.log",
+    "train_sha256": "e00369c5a49a1be1a175bed72781a1de424f01e25caf5f9768363a8de6dc4d48",
+    "vllm": "output/infinity_parser2_v1_12_dflash/smoke_100_seq20480/vllm-20260805T023908Z-425140.log",
+    "successful_hidden_state_requests": 501
+  },
+  "invalid_predecessor": {
+    "run_id": "20260805T022001Z-264688",
+    "reason": "cross-epoch max_steps control-flow bug produced 15 updates instead of 10",
+    "archive": "output/infinity_parser2_v1_12_dflash/smoke_100_seq20480_failed_max_steps_20260805T022001Z-264688"
+  }
+}

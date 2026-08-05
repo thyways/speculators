@@ -2,6 +2,7 @@ project:
   title: "Infinity-Parser2 DFlash acceleration"
   question: "Can a bidirectional DFlash draft trained on target-model-regenerated Infinity-Parser2 responses accelerate Infinity-Parser2-2B-2604 while preserving the verifier distribution?"
   status: active
+  current_phase: "Strict 100-record / 10-step smoke passed; prepare the nested 800k pilot"
   started: "2026-08-05"
   domain: "multimodal speculative decoding"
 
@@ -11,7 +12,7 @@ literature:
     - "Reliable multimodal target-response regeneration and token alignment at 800k-1.5M scale"
     - "Stable online hidden-state DFlash training for a Qwen3.5 VLM verifier"
   evidence_gaps:
-    - "No verified end-to-end Parser2 smoke run yet"
+    - "No verified 800k regeneration/preprocessing/training run yet"
     - "No Parser2 DFlash acceptance-length or throughput baseline yet"
 
 hypotheses:
@@ -23,7 +24,7 @@ hypotheses:
     priority: high
   - id: H2
     statement: "A Qwen3 draft using bidirectional block attention, AdamW, and cosine decay can complete a strict multimodal smoke training run with finite loss and exact verifier token alignment."
-    status: pending
+    status: supported_at_smoke
     motivation: "This is the requested training recipe and the minimum evidence that the full 800k run is viable."
     parent: null
     priority: high
@@ -37,14 +38,41 @@ hypotheses:
 experiments:
   proxy_metric: "Exact validated record count plus a 10-step strict smoke run with finite loss, zero token-ID mismatches, zero hidden-state failures, and a saved checkpoint"
   baseline_value: null
-  best_value: null
-  total_runs: 0
-  trajectory: []
+  best_value: 3.809215
+  total_runs: 2
+  trajectory:
+    - id: smoke_100_attempt_1
+      hypothesis: H2
+      classification: exploratory_infrastructure_failure
+      status: invalid
+      metric: "optimizer steps before termination"
+      value: 15
+      target: 10
+      summary: "Trainer enforced max_steps only inside each epoch, so later epochs each performed one extra update; archived and excluded."
+    - id: smoke_100_attempt_2
+      hypothesis: H2
+      classification: confirmatory
+      status: passed
+      metric: "validation loss after exactly 10 optimizer steps"
+      value: 3.809215
+      wall_time_min: 12.22
+      summary: "Exact multimodal token round-trip; finite losses on steps 0-9; AdamW + cosine + bidirectional SWA; checkpoint_best=4."
 
 outer_loop:
-  cycle: 0
-  last_direction: null
-  last_reflection: ""
+  cycle: 1
+  last_direction: "DEEPEN: scale the verified pipeline to the deterministic nested 800k pilot"
+  last_reflection: "The requested Parser2 DFlash recipe is operational at smoke scale. The next uncertainty is scale, not basic token/hidden-state alignment."
+
+operations:
+  keepalive:
+    command: "/inspire/sfs/project/inf-multimodal/public/wumengke/h100_load.py"
+    current_pid: 517984
+    policy: "Keep all eight H100s occupied whenever no GPU experiment is running; stop only the exact keepalive process group immediately before an experiment and restore it immediately afterward."
+  last_accepted_run:
+    run_id: "20260805T023908Z-425140"
+    run_dir: "output/infinity_parser2_v1_12_dflash/smoke_100_seq20480"
+    checkpoint: "output/infinity_parser2_v1_12_dflash/smoke_100_seq20480/checkpoints/4/model.safetensors"
+    checkpoint_sha256: "9004c715969c0514db87c5dce5d6a5e3d348733276c015efa04859c911a77b26"
 
 workspace:
   findings: "findings.md"
