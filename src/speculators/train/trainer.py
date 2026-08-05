@@ -639,6 +639,17 @@ class Trainer:
     def run_training(self):
         n_epochs = self.config.num_epochs
         for epoch in range(self.current_epoch, n_epochs):
+            if (
+                self.config.max_steps is not None
+                and self.global_step >= self.config.max_steps
+            ):
+                root_logger.info(
+                    "Reached max_steps=%d at global_step=%d; stopping training",
+                    self.config.max_steps,
+                    self.global_step,
+                )
+                break
+
             root_logger.info(f"Training epoch {epoch + 1}/{n_epochs} started")
             self.train_epoch(epoch)
             root_logger.info(f"Training epoch {epoch + 1}/{n_epochs} completed")
@@ -667,3 +678,14 @@ class Trainer:
 
             if self.is_distributed:
                 dist.barrier()
+
+            if (
+                self.config.max_steps is not None
+                and self.global_step >= self.config.max_steps
+            ):
+                root_logger.info(
+                    "Reached max_steps=%d at global_step=%d; stopping training",
+                    self.config.max_steps,
+                    self.global_step,
+                )
+                break

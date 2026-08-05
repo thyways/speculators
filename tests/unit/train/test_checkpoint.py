@@ -210,6 +210,34 @@ def test_checkpoint_freq_flag_controls_saves(
     assert best_path.resolve() == (tmp_path / "5").resolve()
 
 
+def test_run_training_stops_at_max_steps_across_epochs(tmp_path: Path):
+    trainer = _make_minimal_trainer(tmp_path, checkpoint_freq=99, save_best=False)
+    trainer.config = trainer.config._replace(num_epochs=10, max_steps=5)
+
+    trained_epochs: list[int] = []
+    validated_epochs: list[int] = []
+    saved_epochs: list[int] = []
+
+    def fake_train_epoch(epoch: int):
+        trained_epochs.append(epoch)
+        for _ in range(2):
+            trainer.global_step += 1
+            if trainer.global_step >= trainer.config.max_steps:
+                break
+
+    trainer.train_epoch = fake_train_epoch
+    trainer.val_epoch = lambda epoch: validated_epochs.append(epoch) or None
+    trainer.maybe_save_checkpoint = lambda epoch: saved_epochs.append(epoch)
+    trainer.maybe_update_best = lambda _epoch, _metrics: None
+
+    trainer.run_training()
+
+    assert trainer.global_step == 5
+    assert trained_epochs == [0, 1, 2]
+    assert validated_epochs == [0, 1, 2]
+    assert saved_epochs == [0, 1, 2]
+
+
 def test_save_and_load_val_metrics(tmp_path: Path):
     cp = SingleGPUCheckpointer(str(tmp_path))
 
