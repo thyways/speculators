@@ -43,3 +43,19 @@ Smoke acceptance criteria:
 ## Scale-up decision
 
 Proceed from smoke to 800k only after all smoke criteria pass. Proceed from 800k to the nested 1.5M final validation only after data and training stability are confirmed. Final acceleration claims require an autoregressive baseline, DFlash throughput/latency, acceptance length, and output-equivalence checks on the same held-out prompts.
+
+## Pre-generation amendment: one 1.5M corpus, nested 800k training view
+
+Date: 2026-08-05  
+Status: LOCKED before any pilot/full generation request
+
+At the user's direction, generate and preprocess the full deterministic 1.5M stage once instead of publishing a separately tokenized 800k corpus first. The pilot training run will consume exactly the first 800,000 preprocessing-eligible Arrow rows in ascending `candidate_rank` order, then apply its 99/1 train/validation split within that prefix. The full run will consume all 1,500,000 rows.
+
+This amendment preserves the original nested-sample claim while avoiding a second merge, target-tokenization pass, and vocabulary build. The 800k and 1.5M runs intentionally share the vocabulary mapping computed from the complete 1.5M corpus; that shared mapping is part of the amended protocol and must be disclosed in analysis. No rows after the 800,000-row boundary may contribute gradients or validation hidden-state requests during the pilot run.
+
+Additional acceptance criteria:
+
+1. The full prepared Arrow dataset contains exactly 1,500,000 rows sorted by strictly increasing `candidate_rank`.
+2. The pilot loader applies its 800,000-row limit before the train/validation split, yielding exactly 792,000 training and 8,000 validation records at ratio 0.99.
+3. A regression test proves that both pilot splits are contained in the first 800,000 rows and that row 800,000 or later is never accessed.
+4. Regeneration remains deterministic with `temperature=0`, `top_p=1`, seed 42, thinking disabled, and the exact `Infinity-Parser2-2B-2604` teacher.
