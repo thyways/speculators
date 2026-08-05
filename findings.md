@@ -20,7 +20,7 @@ The complete 100-record path is now verified. Local vLLM 0.26.0 served the exact
 - Resolved runtime configuration proves five DFlash layers, block size 8, non-causal sliding window 2048, AdamW at `1e-4` with weight decay `0.01`, and cosine decay were active.
 - Five readable checkpoints were written; `checkpoint_best` points to epoch 4. Its 1,656,266,704-byte `model.safetensors` contains 62 tensors and has SHA-256 `9004c715969c0514db87c5dce5d6a5e3d348733276c015efa04859c911a77b26`.
 - The first GPU attempt is explicitly invalid: a trainer control-flow bug applied `max_steps` only within an epoch, yielding 15 optimizer updates instead of 10. The run is archived under `output/infinity_parser2_v1_12_dflash/smoke_100_seq20480_failed_max_steps_20260805T022001Z-264688` and excluded from evidence.
-- Eight H100s are currently protected by `h100_load.py` PID 517984 while no GPU experiment is running.
+- Full-stage generation is running on eight one-GPU teacher replicas at 32 requests per endpoint. A locked A/B measured 43.57 committed records/s, about 3.90x the concurrency-4 baseline, for a 10--13 hour operational generation estimate.
 
 ## Patterns and Insights
 
@@ -28,12 +28,14 @@ The complete 100-record path is now verified. Local vLLM 0.26.0 served the exact
 - Nested candidate ranks make the pilot directly reusable for the final run and prevent a second unrelated random draw.
 - Online hidden-state production dominates the first smoke epoch; after vLLM and data-path warmup, the two optimizer batches per epoch complete quickly. Pilot sizing must therefore measure hidden-state service throughput separately from draft forward/backward throughput.
 - A per-epoch `break` is not a run-level stopping condition. Smoke controls that span epochs require an outer-loop `global_step >= max_steps` guard and a regression test.
+- vLLM 0.26 multimodal processor caching can race under repeated image hashes at higher concurrency. Disabling it with `--mm-processor-cache-gb 0` eliminated receiver-cache HTTP 500s and enabled stable per-replica concurrency 32.
 
 ## Lessons and Constraints
 
 - Teacher and verifier must both resolve to `/home/ma-user/work/data_mllm/publish_models/Infinity-Parser2-2B-2604`; a similarly named Flash checkpoint is out of scope.
 - The source uses `images` plus alternating `conversations`, including multi-image and multi-turn examples.
 - Idle GPUs must remain occupied; the holder must be stopped before vLLM/training and restored after experiments.
+- Scaled regeneration must keep the MM processor cache disabled unless a later vLLM build is proven to fix the receiver-cache race.
 - A successful command exit is insufficient: strict token alignment, finite loss, checkpoint publication, and exact output counts are required.
 - Invalid experimental artifacts are preserved under a clearly named archive rather than deleted or silently reused. Clean reruns must start from an empty checkpoint namespace.
 

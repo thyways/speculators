@@ -68,6 +68,21 @@ operations:
     command: "/inspire/sfs/project/inf-multimodal/public/wumengke/h100_load.py"
     current_pid: null
     policy: "Keep all eight H100s occupied whenever no GPU experiment is running; stop only the exact keepalive process group immediately before an experiment and restore it immediately afterward."
+  active_generation:
+    stage: "full"
+    mode: "generation-only"
+    protocol_commit: "31d7d01"
+    teacher_manager_pid: 711275
+    generator_pid: 783872
+    started_at: "2026-08-05T03:11:24Z"
+    current_process_started_at: "2026-08-05T03:32:51Z"
+    target_pool_records: 1519877
+    concurrency_per_endpoint: 32
+    total_concurrency: 256
+    mm_processor_cache_gb: 0
+    measured_records_per_second: 43.5745
+    operational_eta_hours: "10-13"
+    status: "running"
   last_accepted_run:
     run_id: "20260805T023908Z-425140"
     run_dir: "output/infinity_parser2_v1_12_dflash/smoke_100_seq20480"
