@@ -44,18 +44,19 @@ Smoke acceptance criteria:
 
 Proceed from smoke to 800k only after all smoke criteria pass. Proceed from 800k to the nested 1.5M final validation only after data and training stability are confirmed. Final acceleration claims require an autoregressive baseline, DFlash throughput/latency, acceptance length, and output-equivalence checks on the same held-out prompts.
 
-## Pre-generation amendment: one 1.5M corpus, nested 800k training view
+## Pre-generation amendment: one 1.5M generation corpus, separately prepared 800k pilot
 
 Date: 2026-08-05  
 Status: LOCKED before any pilot/full generation request
 
-At the user's direction, generate and preprocess the full deterministic 1.5M stage once instead of publishing a separately tokenized 800k corpus first. The pilot training run will consume exactly the first 800,000 preprocessing-eligible Arrow rows in ascending `candidate_rank` order, then apply its 99/1 train/validation split within that prefix. The full run will consume all 1,500,000 rows.
+At the user's direction, run the expensive target-model regeneration only once over the full deterministic 1.5M candidate stage. After full generation completes, derive the nested pilot from those same immutable successful generation events, then separately merge, target-tokenize, rank-backfill, build its vocabulary mapping, and train the exact 800,000-record pilot. The later full-data preprocessing and mapping may run independently from the same generation journal.
 
-This amendment preserves the original nested-sample claim while avoiding a second merge, target-tokenization pass, and vocabulary build. The 800k and 1.5M runs intentionally share the vocabulary mapping computed from the complete 1.5M corpus; that shared mapping is part of the amended protocol and must be disclosed in analysis. No rows after the 800,000-row boundary may contribute gradients or validation hidden-state requests during the pilot run.
+This amendment preserves the original nested-sample claim and avoids a second set of teacher requests. It intentionally does not share vocabulary mappings: the 800k pilot mapping is computed from the exact 800k Arrow corpus, while the 1.5M mapping is computed later from the exact 1.5M Arrow corpus. Re-running the pilot pipeline after full generation is permitted only as a local skip/merge/preprocess operation; it must issue zero new teacher completions.
 
 Additional acceptance criteria:
 
-1. The full prepared Arrow dataset contains exactly 1,500,000 rows sorted by strictly increasing `candidate_rank`.
-2. The pilot loader applies its 800,000-row limit before the train/validation split, yielding exactly 792,000 training and 8,000 validation records at ratio 0.99.
-3. A regression test proves that both pilot splits are contained in the first 800,000 rows and that row 800,000 or later is never accessed.
-4. Regeneration remains deterministic with `temperature=0`, `top_p=1`, seed 42, thinking disabled, and the exact `Infinity-Parser2-2B-2604` teacher.
+1. The full generation journal completes before pilot merge/preprocessing begins and covers the frozen full candidate stage.
+2. The subsequent pilot generation command reports zero new successes/errors and skips every already generated pilot candidate; any new teacher request is a protocol violation.
+3. Pilot preprocessing publishes exactly 800,000 rows sorted by strictly increasing `candidate_rank`, with its own `token_freq.pt`, `d2t.npy`, and `t2d.npy`.
+4. Full preprocessing later publishes exactly 1,500,000 rows and its own independently derived mappings.
+5. Regeneration remains deterministic with `temperature=0`, `top_p=1`, seed 42, thinking disabled, and the exact `Infinity-Parser2-2B-2604` teacher.
