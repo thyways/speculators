@@ -156,7 +156,7 @@ def _adapt_part_for_vllm(part: str | dict):
     for modality in ("image", "video", "audio"):
         if part_type == modality:
             if local_path := part.get("path"):
-                file_url = f"file://{Path(local_path).absolute()}"
+                file_url = Path(local_path).absolute().as_uri()
                 return {"type": f"{modality}_url", f"{modality}_url": {"url": file_url}}
             if url := part.get("url"):
                 return {"type": f"{modality}_url", f"{modality}_url": {"url": url}}
@@ -497,7 +497,10 @@ def _parse_conv_tools(conv_tools: object, idx: int) -> list | None:
 
 
 def _passthrough_pretokenized(
-    examples: dict, max_length: int, minimum_valid_tokens: int | None = None
+    examples: dict,
+    max_length: int,
+    minimum_valid_tokens: int | None = None,
+    preserve_columns: tuple[str, ...] = (),
 ) -> dict[str, list]:
     """Carry pre-tokenized ``(input_ids, loss_mask)`` rows through, truncated only.
 
@@ -505,7 +508,11 @@ def _passthrough_pretokenized(
     need no chat-template rendering or regex span detection.
     """
     results: dict[str, list] = {"input_ids": [], "loss_mask": [], "seq_len": []}
-    for ids, mask in zip(examples["input_ids"], examples["loss_mask"], strict=True):
+    for column in preserve_columns:
+        results[column] = []
+    for idx, (ids, mask) in enumerate(
+        zip(examples["input_ids"], examples["loss_mask"], strict=True)
+    ):
         # `strict=True` only pairs the columns; a per-row skew would survive it and
         # the collator packs each key independently, silently shifting the mask
         # against the ids for every sample packed after this one.
@@ -524,6 +531,8 @@ def _passthrough_pretokenized(
         results["input_ids"].append(torch.tensor(trimmed_ids, dtype=torch.long))
         results["loss_mask"].append(torch.tensor(trimmed_mask, dtype=torch.long))
         results["seq_len"].append(len(trimmed_ids))
+        for column in preserve_columns:
+            results[column].append(examples[column][idx])
     return results
 
 
@@ -533,15 +542,23 @@ def _preprocess_batch(
     max_length: int,
     assistant_pattern: str | Pattern[str] | None,
     minimum_valid_tokens: int | None = None,
+    preserve_columns: tuple[str, ...] = (),
 ) -> dict[str, list]:
     """Process a batch of conversations into tokenized format with loss masks."""
 
     # On-policy regeneration rows are already masked (boundary); pass them through
     # instead of re-tokenizing and re-masking.
     if "input_ids" in examples and "loss_mask" in examples:
-        return _passthrough_pretokenized(examples, max_length, minimum_valid_tokens)
+        return _passthrough_pretokenized(
+            examples,
+            max_length,
+            minimum_valid_tokens,
+            preserve_columns,
+        )
 
     results: dict[str, list] = {"input_ids": [], "loss_mask": [], "seq_len": []}
+    for column in preserve_columns:
+        results[column] = []
     conversations: list[dict] = examples.get("conversations", [])
 
     # MM inputs must use Chat Completions API
@@ -613,6 +630,8 @@ def _preprocess_batch(
         results["input_ids"].append(torch.tensor(input_ids, dtype=torch.long))
         results["loss_mask"].append(loss_mask)
         results["seq_len"].append(len(input_ids))
+        for column in preserve_columns:
+            results[column].append(examples[column][idx])
 
         if "messages" in results:
             results["messages"].append(_adapt_conv_for_vllm(normalized_conv))
@@ -627,6 +646,9 @@ def build_eagle3_dataset(
     num_proc: int = 8,
     assistant_pattern: str | Pattern[str] | None = None,
     minimum_valid_tokens: int | None = None,
+    preserve_columns: tuple[str, ...] = (),
+    keep_in_memory: bool = True,
+    map_batch_size: int = 1000,
 ) -> HFDataset:
     """Build EAGLE3 dataset by tokenizing conversations and creating loss masks.
 
@@ -641,6 +663,9 @@ def build_eagle3_dataset(
                           responses. If None, pattern will be auto-detected from
                           chat template.
         minimum_valid_tokens: Number of tokens to consider for a valid sample
+        preserve_columns: Input columns copied for rows that survive preprocessing
+        keep_in_memory: Keep mapped Arrow data in memory
+        map_batch_size: Number of raw rows in each preprocessing batch
     """
     original_cols = dataset.column_names
     # These rows carry the generation boundary as their mask, so _preprocess_batch
@@ -677,12 +702,13 @@ def build_eagle3_dataset(
                 max_length,
                 assistant_pattern,
                 minimum_valid_tokens,
+                preserve_columns,
             ),
             batched=True,
             num_proc=num_proc,
-            batch_size=1000,
+            batch_size=map_batch_size,
             remove_columns=original_cols,
-            keep_in_memory=True,  # skip caching
+            keep_in_memory=keep_in_memory,
         )
 
     dataset.set_format(type="torch")

@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
+
+PYTHON_BIN="${PARSER2_PYTHON_BIN:-${REPO_ROOT}/speculators_venv/bin/python}"
+VLLM_BIN="${PARSER2_VLLM_BIN:-${REPO_ROOT}/vllm_venv/bin/vllm}"
+PIPELINE="${SCRIPT_DIR}/script.py"
+PREPARE_SCRIPT="${REPO_ROOT}/scripts/infinity_parser2_prepare_data.py"
+VOCAB_SCRIPT="${REPO_ROOT}/scripts/build_vocab_mapping.py"
+
+SOURCE_JSONL="${PARSER2_SOURCE_JSONL:-/home/ma-user/work/data_mllm/new_datasets/swift_merged_datasets/version_v1.12/train_v1.12.jsonl}"
+MEDIA_ROOT="${PARSER2_MEDIA_ROOT:-/inspire/sfs/project/inf-multimodal/public}"
+MODEL="${PARSER2_MODEL:-/home/ma-user/work/data_mllm/publish_models/Infinity-Parser2-2B-2604}"
+OUTPUT_ROOT="${PARSER2_REGEN_ROOT:-/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/infinity_parser2_v1_12_regen_1p5m}"
+FINAL_DIR="${PARSER2_FINAL_DIR:-/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/infinity_parser2_v1_12_target_answers}"
+PREPARED_ROOT="${PARSER2_PREPARED_ROOT:-/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/infinity_parser2_v1_12_dflash_data}"
+
+POPULATION_SIZE="${PARSER2_POPULATION_SIZE:-5275950}"
+FULL_SIZE="${PARSER2_FULL_SIZE:-1500000}"
+PILOT_SIZE="${PARSER2_PILOT_SIZE:-800000}"
+RESERVE_SIZE="${PARSER2_RESERVE_SIZE:-20000}"
+SEED="${PARSER2_SEED:-42}"
+MAX_TOKENS="${PARSER2_MAX_TOKENS:-32768}"
+CONCURRENCY="${PARSER2_CONCURRENCY_PER_ENDPOINT:-4}"
+SEQ_LENGTH="${PARSER2_SEQ_LENGTH:-20480}"
+PREPROCESSING_WORKERS="${PARSER2_PREPROCESSING_WORKERS:-16}"
+PREPROCESSING_BATCH_SIZE="${PARSER2_PREPROCESSING_BATCH_SIZE:-64}"
+MINIMUM_VALID_TOKENS="${PARSER2_MINIMUM_VALID_TOKENS:-1}"
+DRAFT_VOCAB_SIZE="${PARSER2_DRAFT_VOCAB_SIZE:-32000}"
+TRAIN_DATA_RATIO="${PARSER2_TRAIN_DATA_RATIO:-0.99}"
+SMOKE_TRAIN_DATA_RATIO="${PARSER2_SMOKE_TRAIN_DATA_RATIO:-0.90}"
+PREPARE_ONLY="${PARSER2_PREPARE_ONLY:-0}"
+
+export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+
+TEACHER_GPU_IDS="${PARSER2_TEACHER_GPU_IDS:-0,1,2,3,4,5,6,7}"
+TEACHER_BASE_PORT="${PARSER2_TEACHER_BASE_PORT:-8000}"
+TEACHER_HOST="${PARSER2_TEACHER_HOST:-127.0.0.1}"
+TEACHER_MAX_MODEL_LEN="${PARSER2_TEACHER_MAX_MODEL_LEN:-65536}"
+TEACHER_MAX_IMAGES="${PARSER2_TEACHER_MAX_IMAGES:-16}"
+TEACHER_START_TIMEOUT="${PARSER2_TEACHER_START_TIMEOUT:-1800}"
+TEACHER_ENDPOINTS="${PARSER2_ENDPOINTS:-}"
+
+declare -a TEACHER_PIDS=()
+declare -a ENDPOINTS=()
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") sample|smoke|pilot|full|status [stage]
+
+  sample  Build the deterministic sample database.
+  smoke   Regenerate and prepare 100 rows.
+  pilot   Regenerate and prepare the ${PILOT_SIZE}-row pilot.
+  full    Regenerate and prepare the ${FULL_SIZE}-row full dataset.
+  status  Show local progress (default stage: full).
+
+Set PARSER2_ENDPOINTS to comma-separated external endpoints to skip local
+teacher startup. Set PARSER2_PREPARE_ONLY=1 to use completed generations only.
+EOF
+}
+
+die() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+require_executable() {
+    [[ -x "$1" ]] || die "missing executable: $1"
+}
+
+stop_teachers() {
+    local pid
+    local alive
+    local attempt
+
+    for pid in "${TEACHER_PIDS[@]}"; do
+        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    done
+    for attempt in {1..30}; do
+        alive=0
+        for pid in "${TEACHER_PIDS[@]}"; do
+            kill -0 "$pid" 2>/dev/null && alive=1
+        done
+        (( alive == 0 )) && break
+        sleep 1
+    done
+    for pid in "${TEACHER_PIDS[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+        fi
+        wait "$pid" 2>/dev/null || true
+    done
+    TEACHER_PIDS=()
+}
+
+cleanup() {
+    local status=$?
+    trap - EXIT INT TERM HUP
+    stop_teachers
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+
+sample_data() {
+    local -a args=(
+        "$PYTHON_BIN" "$PIPELINE" sample
+        --source "$SOURCE_JSONL"
+        --output-root "$OUTPUT_ROOT"
+        --population-size "$POPULATION_SIZE"
+        --sample-size "$FULL_SIZE"
+        --pilot-size "$PILOT_SIZE"
+        --reserve-size "$RESERVE_SIZE"
+        --seed "$SEED"
+        --source-version v1.12
+        --allowed-media-root "$MEDIA_ROOT"
+        --path-map "/home/ma-user/work/=${MEDIA_ROOT}/"
+    )
+    [[ "${PARSER2_OVERWRITE_SAMPLE:-0}" == "1" ]] && args+=(--overwrite)
+    "${args[@]}"
+}
+
+start_teachers() {
+    local -a gpus=()
+    local -a extra_args=()
+    local gpu
+    local index
+    local port
+    local pid
+    local log_dir="${OUTPUT_ROOT}/teacher_logs"
+
+    require_executable "$VLLM_BIN"
+    command -v curl >/dev/null || die "curl is required"
+    command -v setsid >/dev/null || die "setsid is required"
+    IFS=',' read -r -a gpus <<< "$TEACHER_GPU_IDS"
+    [[ ${#gpus[@]} -gt 0 ]] || die "PARSER2_TEACHER_GPU_IDS is empty"
+    [[ -n "${PARSER2_VLLM_EXTRA_ARGS:-}" ]] && \
+        read -r -a extra_args <<< "$PARSER2_VLLM_EXTRA_ARGS"
+    mkdir -p "$log_dir"
+
+    for index in "${!gpus[@]}"; do
+        gpu="${gpus[$index]//[[:space:]]/}"
+        port=$((TEACHER_BASE_PORT + index))
+        setsid env CUDA_VISIBLE_DEVICES="$gpu" \
+            "$VLLM_BIN" serve "$MODEL" \
+            --host "$TEACHER_HOST" \
+            --port "$port" \
+            --served-model-name "$MODEL" \
+            --tensor-parallel-size 1 \
+            --max-model-len "$TEACHER_MAX_MODEL_LEN" \
+            --allowed-local-media-path "$MEDIA_ROOT" \
+            --limit-mm-per-prompt "{\"image\":${TEACHER_MAX_IMAGES}}" \
+            "${extra_args[@]}" \
+            >"${log_dir}/teacher_${index}.log" 2>&1 &
+        pid=$!
+        TEACHER_PIDS+=("$pid")
+        ENDPOINTS+=("http://${TEACHER_HOST}:${port}/v1/chat/completions")
+    done
+
+    local deadline=$((SECONDS + TEACHER_START_TIMEOUT))
+    local ready
+    while true; do
+        ready=0
+        for index in "${!TEACHER_PIDS[@]}"; do
+            pid="${TEACHER_PIDS[$index]}"
+            port=$((TEACHER_BASE_PORT + index))
+            if ! kill -0 "$pid" 2>/dev/null; then
+                tail -n 80 "${log_dir}/teacher_${index}.log" >&2 || true
+                die "teacher ${index} exited during startup"
+            fi
+            if curl -fsS --max-time 5 \
+                "http://${TEACHER_HOST}:${port}/health" >/dev/null 2>&1; then
+                ready=$((ready + 1))
+            fi
+        done
+        (( ready == ${#TEACHER_PIDS[@]} )) && break
+        (( SECONDS < deadline )) || die "teacher startup timed out"
+        echo "Waiting for teachers: ${ready}/${#TEACHER_PIDS[@]} ready"
+        sleep 5
+    done
+}
+
+resolve_endpoints() {
+    local endpoint
+    if [[ -n "$TEACHER_ENDPOINTS" ]]; then
+        IFS=',' read -r -a ENDPOINTS <<< "$TEACHER_ENDPOINTS"
+        for endpoint in "${!ENDPOINTS[@]}"; do
+            ENDPOINTS[$endpoint]="${ENDPOINTS[$endpoint]//[[:space:]]/}"
+        done
+    else
+        start_teachers
+    fi
+}
+
+generate_stage() {
+    local stage="$1"
+    local endpoint
+    local -a args=(
+        "$PYTHON_BIN" "$PIPELINE" generate
+        --output-root "$OUTPUT_ROOT"
+        --model-path "$MODEL"
+        --model "$MODEL"
+        --stage "$stage"
+        --max-tokens "$MAX_TOKENS"
+        --temperature 0
+        --top-p 1
+        --seed "$SEED"
+        --concurrency-per-endpoint "$CONCURRENCY"
+        --timeout 600
+        --connect-timeout 30
+        --max-retries 5
+    )
+    for endpoint in "${ENDPOINTS[@]}"; do
+        args+=(--endpoint "$endpoint")
+    done
+    [[ "${PARSER2_RETRY_ERRORS:-0}" == "1" ]] && args+=(--retry-errors)
+    "${args[@]}"
+}
+
+prepare_stage() {
+    local stage="$1"
+    local target_records
+    local token_freq_ratio
+    local pool_path="${FINAL_DIR}/${stage}.pool.jsonl"
+    local final_path="${FINAL_DIR}/${stage}.jsonl"
+    local prepared_dir="${PREPARED_ROOT}/${stage}"
+    local -a prepare_args
+
+    case "$stage" in
+        smoke)
+            target_records=100
+            token_freq_ratio="$SMOKE_TRAIN_DATA_RATIO"
+            ;;
+        pilot)
+            target_records="$PILOT_SIZE"
+            token_freq_ratio="$TRAIN_DATA_RATIO"
+            ;;
+        full)
+            target_records="$FULL_SIZE"
+            token_freq_ratio="$TRAIN_DATA_RATIO"
+            ;;
+        *) die "unknown stage: $stage" ;;
+    esac
+
+    mkdir -p "$FINAL_DIR" "$PREPARED_ROOT"
+    "$PYTHON_BIN" "$PIPELINE" export \
+        --output-root "$OUTPUT_ROOT" \
+        --stage "$stage" \
+        --output "$pool_path" \
+        --minimum-count "$target_records" \
+        --report "${pool_path%.jsonl}.export.json"
+
+    prepare_args=(
+        "$PYTHON_BIN" "$PREPARE_SCRIPT"
+        --model "$MODEL"
+        --data "$pool_path"
+        --output "$prepared_dir"
+        --seq-length "$SEQ_LENGTH"
+        --ranked-target-samples "$target_records"
+        --token-freq-train-ratio "$token_freq_ratio"
+        --minimum-valid-tokens "$MINIMUM_VALID_TOKENS"
+        --num-preprocessing-workers "$PREPROCESSING_WORKERS"
+        --preprocessing-batch-size "$PREPROCESSING_BATCH_SIZE"
+    )
+    [[ "${PARSER2_OVERWRITE_PREPARED:-0}" == "1" ]] && \
+        prepare_args+=(--overwrite)
+    "${prepare_args[@]}"
+
+    "$PYTHON_BIN" "$VOCAB_SCRIPT" \
+        --token-freq-path "${prepared_dir}/token_freq.pt" \
+        --draft-vocab-size "$DRAFT_VOCAB_SIZE" \
+        --target-model-path "$MODEL" \
+        --output-path "$prepared_dir"
+
+    "$PYTHON_BIN" "$PIPELINE" export \
+        --output-root "$OUTPUT_ROOT" \
+        --stage "$stage" \
+        --output "$final_path" \
+        --selection-manifest "${prepared_dir}/ranked_selection.json" \
+        --report "${final_path%.jsonl}.export.json"
+}
+
+require_executable "$PYTHON_BIN"
+[[ "$PREPARE_ONLY" == "0" || "$PREPARE_ONLY" == "1" ]] || \
+    die "PARSER2_PREPARE_ONLY must be 0 or 1"
+
+action="${1:-}"
+case "$action" in
+    sample)
+        sample_data
+        ;;
+    status)
+        "$PYTHON_BIN" "$PIPELINE" status \
+            --output-root "$OUTPUT_ROOT" \
+            --stage "${2:-full}"
+        ;;
+    smoke|pilot|full)
+        sample_data
+        if [[ "$PREPARE_ONLY" == "0" ]]; then
+            if ! "$PYTHON_BIN" "$PIPELINE" status \
+                --output-root "$OUTPUT_ROOT" \
+                --stage "$action" \
+                --require-complete >/dev/null; then
+                resolve_endpoints
+                generate_stage "$action"
+                stop_teachers
+            fi
+        else
+            "$PYTHON_BIN" "$PIPELINE" status \
+                --output-root "$OUTPUT_ROOT" \
+                --stage "$action" \
+                --require-complete
+        fi
+        "$PYTHON_BIN" "$PIPELINE" status \
+            --output-root "$OUTPUT_ROOT" \
+            --stage "$action"
+        prepare_stage "$action"
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac
