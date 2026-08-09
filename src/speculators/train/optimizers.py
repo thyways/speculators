@@ -23,7 +23,7 @@ logger = logging.getLogger("speculators")
 # Names of parameters that are 2D but should still be optimized with AdamW rather than
 # Muon, following the convention from Keller Jordan's Muon (embeddings and the output
 # head are excluded from the orthogonalized update).
-_ADAMW_NAME_HINTS = ("embed_tokens", "lm_head")
+_ADAMW_NAME_HINTS = ("embed_tokens", "layer_fusion_weights", "lm_head")
 
 # Muon only orthogonalizes 2D weight matrices.
 _MATRIX_NDIM = 2

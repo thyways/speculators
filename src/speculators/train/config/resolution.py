@@ -90,10 +90,12 @@ REQUIRED_FLAGS: dict[str, str] = _required_flags()
 
 # Algorithm group -> the speculator types that consume it. A group set to a
 # non-default value under a speculator_type absent from its set is ignored, and
-# warns. DSpark is-a DFlash, so a dspark run reads the dflash group too; the
-# dspark-exclusive heads belong only to dspark. eagle3 uses no group.
+# warns. DFly and DSpark are DFlash-family models, so both read the dflash
+# group; their exclusive settings remain in their own groups. eagle3 uses no
+# algorithm group.
 _ALGORITHM_GROUP_USERS: dict[str, frozenset[str]] = {
-    "dflash": frozenset({"dflash", "dspark"}),
+    "dflash": frozenset({"dflash", "dfly", "dspark"}),
+    "dfly": frozenset({"dfly"}),
     "dspark": frozenset({"dspark"}),
     "peagle": frozenset({"peagle"}),
     "mtp": frozenset({"mtp"}),

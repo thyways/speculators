@@ -438,7 +438,7 @@ class LoggingArgs(_Group):
 
 
 class DFlashArgs(_Group):
-    """DFlash-family backbone knobs (also used by DSpark, which is-a DFlash)."""
+    """DFlash-family backbone knobs shared by DFlash, DFly, and DSpark."""
 
     block_size: int = Field(
         default=8, description="Block size for DFlash model (default: 8)."
@@ -446,10 +446,11 @@ class DFlashArgs(_Group):
     sample_from_anchor: bool | None = Field(
         default=None,
         description="Sample from the anchor position (all positions predict). "
-        "Default: False for dflash, True for dspark.",
+        "Default: False for dflash/dfly, True for dspark.",
     )
     dflash_decay_gamma: float = Field(
-        default=4.0, description="Decay gamma for DFlash/DSpark loss weighting."
+        default=4.0,
+        description="Decay gamma for DFlash/DFly/DSpark loss weighting.",
     )
     per_position_loss_weight: Literal["fixed-exp-decay", "dpace"] = Field(
         default="fixed-exp-decay",
@@ -460,6 +461,26 @@ class DFlashArgs(_Group):
         default=0.5,
         description="Smoothing constant for the D-PACE loss (default: 0.5). Must be in "
         "(0, 1] when --per-position-loss-weight=dpace.",
+    )
+
+
+class DFlyArgs(_Group):
+    """DFly-exclusive hidden-state correction settings."""
+
+    enable_hidden_correction: bool = Field(
+        default=True,
+        description=(
+            "DFly: apply previous-token-conditioned hidden-state correction "
+            "before the draft LM head."
+        ),
+    )
+    hidden_correction_intermediate_size: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "DFly: SwiGLU width for hidden-state correction. Defaults to the "
+            "draft hidden size."
+        ),
     )
 
 
@@ -525,6 +546,7 @@ _GROUPS: dict[str, type[_Group]] = {
     "trainer": TrainerArgs,
     "logging": LoggingArgs,
     "dflash": DFlashArgs,
+    "dfly": DFlyArgs,
     "dspark": DSparkArgs,
     "peagle": PEagleArgs,
     "mtp": MTPArgs,
@@ -609,7 +631,7 @@ class TrainConfig(BaseSettings):
     speculator_type: str = Field(
         default="eagle3",
         description="Type of speculator model to train "
-        "(eagle3, dflash, dspark, peagle, mtp).",
+        "(eagle3, dflash, dfly, dspark, peagle, mtp).",
     )
     dry_run: bool = Field(
         default=False,
@@ -634,6 +656,7 @@ class TrainConfig(BaseSettings):
     trainer: TrainerArgs = Field(default_factory=TrainerArgs)
     logging: LoggingArgs = Field(default_factory=LoggingArgs)
     dflash: DFlashArgs = Field(default_factory=DFlashArgs)
+    dfly: DFlyArgs = Field(default_factory=DFlyArgs)
     dspark: DSparkArgs = Field(default_factory=DSparkArgs)
     peagle: PEagleArgs = Field(default_factory=PEagleArgs)
     mtp: MTPArgs = Field(default_factory=MTPArgs)

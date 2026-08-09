@@ -260,6 +260,36 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             )
         return self.config.mask_token_id
 
+    def _project_base_context(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project concatenated verifier features into the shared context."""
+        return self.hidden_norm(self.fc(hidden_states))
+
+    def _build_layer_context(
+        self,
+        _hidden_states: torch.Tensor,
+        base_context: torch.Tensor,
+        _layer_idx: int,
+    ) -> torch.Tensor:
+        """Return the verifier context consumed by one draft layer.
+
+        DFlash uses one shared projected context for every layer. DFlash-family
+        subclasses can override this hook to add layer-specific conditioning.
+        """
+        return base_context
+
+    def _compute_draft_logits(
+        self,
+        hidden: torch.Tensor,
+        _input_ids: torch.Tensor,
+        _anchored_block_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project draft hidden states to vocabulary logits.
+
+        The extra arguments let subclasses condition the projection on tokens
+        aligned with the anchored blocks while plain DFlash remains unchanged.
+        """
+        return self.lm_head(hidden)
+
     @torch.compiler.disable
     def _create_attention_mask(
         self,
@@ -359,8 +389,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         noise_embedding = self.embed_tokens(mask_token_ids)
         # shape: [1, num_anchors*block_size, hidden_size]
 
-        fc_output = self.fc(hidden_states)
-        fc_output = self.hidden_norm(fc_output)
+        base_context = self._project_base_context(hidden_states)
         # shape: [1, total_seq_len, hidden_size]
 
         mask_position_ids = get_base_indices_for_anchored_blocks(
@@ -399,7 +428,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         for layer_idx, layer in enumerate(self.layers):
             noise_embedding = layer(
                 hidden_states=noise_embedding,
-                target_hidden=fc_output,
+                target_hidden=self._build_layer_context(
+                    hidden_states,
+                    base_context,
+                    layer_idx,
+                ),
                 attention_mask=sliding_window_attn_mask
                 if layer_idx in self.sliding_window_indices
                 else full_attn_mask,
@@ -410,7 +443,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             )
 
         hidden = self.norm(noise_embedding)
-        logits = self.lm_head(hidden)
+        logits = self._compute_draft_logits(
+            hidden,
+            input_ids,
+            anchored_block_indices,
+        )
         # shape: [1, num_anchors*block_size, vocab_size]
 
         aligned_loss_mask = loss_mask.clone()[:, anchored_block_indices]
