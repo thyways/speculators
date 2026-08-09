@@ -107,6 +107,7 @@ def create_train_val_loaders(
     prefetch_factor: int,
     preprocess: Callable[[BatchType], BatchType] | None,
     train_data_ratio: float = 0.9,
+    fail_on_hidden_state_error: bool = False,
 ) -> tuple[DataLoader, DataLoader]:
     """Create training and validation DataLoaders.
 
@@ -154,6 +155,7 @@ def create_train_val_loaders(
             hidden_states_dtype=hidden_states_dtype,
             request_timeout=request_timeout,
             max_retries=max_retries,
+            fail_on_hidden_state_error=fail_on_hidden_state_error,
         )
         val_dataset = ArrowDataset(
             datapath=data_path,
@@ -168,6 +170,7 @@ def create_train_val_loaders(
             hidden_states_dtype=hidden_states_dtype,
             request_timeout=request_timeout,
             max_retries=max_retries,
+            fail_on_hidden_state_error=fail_on_hidden_state_error,
         )
 
     train_loader = _setup_dataloader(

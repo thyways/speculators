@@ -290,6 +290,13 @@ class GenerationArgs(_Group):
         description="Maximum retry attempts per vLLM request on failure. Only applies "
         "if --on-missing=generate.",
     )
+    fail_on_hidden_state_error: bool = Field(
+        default=False,
+        description=(
+            "Abort training when online hidden-state generation fails or returns "
+            "token IDs that differ from the prepared sample."
+        ),
+    )
 
 
 class LossArgs(_Group):

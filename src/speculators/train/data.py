@@ -215,6 +215,7 @@ class ArrowDataset(BaseDataset):
         model: str | None = None,
         request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        fail_on_hidden_state_error: bool = False,
     ):
         self.data = load_from_disk(datapath)
         if not 0.0 < train_ratio <= 1.0:
@@ -244,6 +245,7 @@ class ArrowDataset(BaseDataset):
         self.model = model
         self.request_timeout = request_timeout
         self.max_retries = max_retries
+        self.fail_on_hidden_state_error = fail_on_hidden_state_error
 
         # Delay super init so that `_compute_approx_lengths` has required data
         super().__init__(max_len, transform, hidden_states_dtype)
@@ -304,6 +306,10 @@ class ArrowDataset(BaseDataset):
         except Exception as e:
             if isinstance(e, ValueError) and "NaN" in str(e):
                 raise
+            if self.fail_on_hidden_state_error:
+                raise RuntimeError(
+                    f"Online hidden-state generation failed for sample {index}"
+                ) from e
             warnings.warn(
                 f"Failed to load/cache hidden states for sample {index}: {e}",
                 stacklevel=1,
@@ -342,8 +348,12 @@ class ArrowDataset(BaseDataset):
         # }
 
         if not torch.equal(loaded_hs["token_ids"], self.data[index]["input_ids"]):
+            if self.fail_on_hidden_state_error:
+                raise RuntimeError(
+                    f"Loaded hidden-state token ids do not match sample {index}"
+                )
             warnings.warn(
-                f"Loaded token ids {loaded_hs['token_ids']} for index {index} don't"
+                f"Loaded token ids {loaded_hs['token_ids']} for index {index} don't "
                 f"match input ids {self.data[index]['input_ids']}",
                 stacklevel=1,
             )

@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 
+import pytest
 import torch
 from datasets import Dataset
 from safetensors.torch import save_file
@@ -526,3 +527,79 @@ def test_arrow_dataset_on_generate_cache_creates_hidden_states_dir(tmp_path: Pat
     assert arrow_ds.transfer.hidden_states_path.is_dir()
     # And the cached file should exist
     assert (arrow_ds.transfer.hidden_states_path / "hs_0.safetensors").exists()
+
+
+def _save_torch_arrow_dataset(tmp_path: Path) -> Path:
+    data_path = tmp_path / "data"
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3]],
+            "loss_mask": [[1, 1, 1]],
+            "seq_len": [3],
+        }
+    )
+    ds.set_format("torch")
+    ds.save_to_disk(str(data_path))
+    return data_path
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_arrow_dataset_generation_failure_respects_strict_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, strict: bool
+):
+    data_path = _save_torch_arrow_dataset(tmp_path)
+    arrow_ds = ArrowDataset(
+        max_len=128,
+        datapath=str(data_path),
+        on_missing="generate",
+        fail_on_hidden_state_error=strict,
+    )
+    arrow_ds.client = object()  # type: ignore[assignment]
+    arrow_ds.model = "verifier"
+
+    def fail_generation(*args, **kwargs):
+        raise ConnectionError("vLLM unavailable")
+
+    monkeypatch.setattr(
+        "speculators.train.data.generate_hidden_states", fail_generation
+    )
+
+    if strict:
+        with pytest.raises(
+            RuntimeError, match="Online hidden-state generation failed for sample 0"
+        ):
+            arrow_ds._maybe_generate_hs(0)
+    else:
+        with pytest.warns(
+            UserWarning, match="Failed to load/cache hidden states for sample 0"
+        ):
+            assert arrow_ds._maybe_generate_hs(0) is None
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_arrow_dataset_token_id_mismatch_respects_strict_mode(
+    tmp_path: Path, strict: bool
+):
+    data_path = _save_torch_arrow_dataset(tmp_path)
+
+    class MismatchedTransfer:
+        def get_cached(self, file_idx: int):
+            return {
+                "token_ids": torch.tensor([1, 2, 4]),
+                "hidden_states": torch.zeros(3, 4, 2),
+            }
+
+    arrow_ds = ArrowDataset(
+        max_len=128,
+        datapath=str(data_path),
+        transfer=MismatchedTransfer(),  # type: ignore[arg-type]
+        on_missing="generate",
+        fail_on_hidden_state_error=strict,
+    )
+
+    if strict:
+        with pytest.raises(RuntimeError, match="token ids do not match sample 0"):
+            arrow_ds._get_raw_data(0)
+    else:
+        with pytest.warns(UserWarning, match="don't match input ids"):
+            assert arrow_ds._get_raw_data(0) is None
