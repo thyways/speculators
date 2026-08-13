@@ -172,6 +172,10 @@ class Trainer:
         val_loader: DataLoader | None = None,
     ):
         self.model = model
+        # Kept before setup_model(): the DDP path replaces self.model with a
+        # DistributedDataParallel wrapper, and nn.Module.__getattr__ does not
+        # forward plain method lookups to .module.
+        self._unwrapped_model = model
         self.config = config
         self.local_rank = get_local_rank()
         self.rank = get_rank()
@@ -421,6 +425,22 @@ class Trainer:
             )
         return skip_steps
 
+    def _training_step_horizon(self, steps_per_epoch: int) -> int | None:
+        """Total-step horizon handed to ``model.on_training_step``.
+
+        Reuses the LR scheduler's horizon so ``--scheduler-total-steps`` drives
+        progress-dependent objectives too, and clamps to ``--max-steps`` when
+        that cuts the run short. None when there is no meaningful horizon.
+        """
+        total = (
+            self.config.scheduler_total_steps
+            if self.config.scheduler_total_steps is not None
+            else self.config.num_epochs * steps_per_epoch
+        )
+        if self.config.max_steps is not None:
+            total = min(total, self.config.max_steps)
+        return total if total > 0 else None
+
     def train_epoch(self, epoch: int):
         self.model.train()
         if hasattr(self.train_loader.batch_sampler, "set_epoch"):
@@ -443,6 +463,7 @@ class Trainer:
         )
         t_before_fetch = time.perf_counter()
         timer = _StepTimer()
+        step_horizon = self._training_step_horizon(num_steps)
         for local_step_rel, batch in enumerate(train_loader, 1):
             # local_step is 1-based index into the *full* epoch (not the slice).
             local_step = local_step_rel + skip_steps
@@ -455,6 +476,9 @@ class Trainer:
                 else v
                 for k, v in batch.items()
             }
+
+            # Let progress-dependent objectives update their schedule state.
+            self._unwrapped_model.on_training_step(self.global_step, step_horizon)
 
             with torch.autocast(
                 self.device_type, dtype=self.config.hidden_states_dtype

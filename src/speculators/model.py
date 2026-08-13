@@ -542,6 +542,28 @@ class SpeculatorModel(ClassRegistryMixin, PreTrainedModel):  # type: ignore[misc
             "to support training infrastructure."
         )
 
+    def on_training_step(
+        self,
+        global_step: int,
+        total_steps: int | None = None,
+    ) -> None:
+        """Hook called by the trainer before each training forward pass.
+
+        The per-forward kwargs from :meth:`get_trainer_kwargs` are fixed for the
+        whole run, so objectives whose weighting depends on training progress
+        (Domino's decaying base-loss weight, for example) read it here instead.
+        The trainer restores ``global_step`` when resuming, so a schedule driven
+        from this hook resumes at the right point.
+
+        Implementations should write into a tensor buffer rather than a Python
+        attribute: a changing Python scalar read inside a ``torch.compile``d
+        forward is specialized on by value and forces a recompile every step.
+
+        Args:
+            global_step: Optimizer steps completed so far in the run.
+            total_steps: The run's step horizon, or None when it is unknown.
+        """
+
     def __init__(self, config: SpeculatorModelConfig, **kwargs):
         """
         Initialize a SpeculatorModel instance.

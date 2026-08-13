@@ -173,7 +173,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
     ) -> dict:
         """Shared DFlash-family config kwargs for ``from_training_args``.
 
-        DSpark reuses this and appends its Markov/confidence/loss fields.
+        DSpark, DFly, and Domino reuse this and append their own head fields.
         """
         from speculators.config import (  # noqa: PLC0415
             SpeculatorsConfig,
@@ -191,7 +191,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         )
         block_size = kwargs.get("block_size", 8)
 
-        default_sample_from_anchor = algorithm == "dspark"
+        default_sample_from_anchor = algorithm in ("dspark", "domino")
         sample_from_anchor_arg = kwargs.get("sample_from_anchor")
         sample_from_anchor = (
             default_sample_from_anchor

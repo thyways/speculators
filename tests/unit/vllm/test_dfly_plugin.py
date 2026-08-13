@@ -1,22 +1,24 @@
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
-import torch
 
+from speculators.vllm._dflash_family import (
+    map_speculative_method,
+    preserve_dspark_anchor_mode,
+    propagate_intra_block_causality,
+    register_speculative_method_alias,
+    resolve_dspark_target_hidden_size,
+)
 from speculators.vllm.dfly import (
     _dfly_context_width,
-    _map_dfly_speculative_method,
-    _preserve_dspark_anchor_mode,
-    _resolve_dspark_target_hidden_size,
-    _sample_sequential_with_hidden_correction,
     _update_dfly,
 )
 
 
 def test_dfly_config_is_mapped_to_sequential_runtime():
-    mapped = _map_dfly_speculative_method(
-        {"method": "dfly", "num_speculative_tokens": 7}
-    )
+    register_speculative_method_alias("dfly", "dspark")
+    mapped = map_speculative_method({"method": "dfly", "num_speculative_tokens": 7})
     assert mapped == {
         "method": "dspark",
         "num_speculative_tokens": 7,
@@ -42,7 +44,7 @@ def test_dfly_config_translation_preserves_training_semantics(
         "enable_hidden_correction": True,
         "hidden_correction_intermediate_size": 24,
     }
-    translated = {
+    translated: dict[str, Any] = {
         "hidden_size": 16,
         "rope_parameters": {
             "rope_type": "default",
@@ -73,9 +75,9 @@ def test_dspark_config_translation_preserves_training_semantics(
     sample_from_anchor,
     dspark_bonus_anchor,
 ):
-    translated = {"dspark_bonus_anchor": True}
+    translated: dict[str, Any] = {"dspark_bonus_anchor": True}
 
-    _preserve_dspark_anchor_mode(
+    preserve_dspark_anchor_mode(
         {"sample_from_anchor": sample_from_anchor},
         translated,
     )
@@ -85,16 +87,16 @@ def test_dspark_config_translation_preserves_training_semantics(
 
 
 def test_dspark_config_translation_keeps_legacy_default_when_field_is_missing():
-    translated = {"dspark_bonus_anchor": True}
+    translated: dict[str, Any] = {"dspark_bonus_anchor": True}
 
-    _preserve_dspark_anchor_mode({}, translated)
+    preserve_dspark_anchor_mode({}, translated)
 
     assert translated == {"dspark_bonus_anchor": True}
 
 
 def test_dspark_config_translation_rejects_non_boolean_anchor_mode():
     with pytest.raises(TypeError, match="must be a boolean"):
-        _preserve_dspark_anchor_mode(
+        preserve_dspark_anchor_mode(
             {"sample_from_anchor": "true"},
             {},
         )
@@ -108,9 +110,9 @@ def test_dspark_config_translation_resolves_target_hidden_size(
     source_size,
     expected_size,
 ):
-    translated = {"hidden_size": 16}
+    translated: dict[str, Any] = {"hidden_size": 16}
 
-    _resolve_dspark_target_hidden_size(
+    resolve_dspark_target_hidden_size(
         {"target_hidden_size": source_size},
         translated,
     )
@@ -120,101 +122,83 @@ def test_dspark_config_translation_resolves_target_hidden_size(
 
 def test_dspark_config_translation_requires_a_target_hidden_size():
     with pytest.raises(ValueError, match="must be a positive integer"):
-        _resolve_dspark_target_hidden_size({}, {})
+        resolve_dspark_target_hidden_size({}, {})
 
 
-class _FakeDFlyModel:
-    def __init__(self):
-        self.previous_tokens: list[torch.Tensor] = []
+@pytest.mark.parametrize(
+    ("non_causal", "expected_causal"),
+    [(True, False), (False, True)],
+)
+def test_dspark_intra_block_causality_follows_the_checkpoint(
+    non_causal,
+    expected_causal,
+):
+    """vLLM's own DSpark updater never writes dflash_config.
 
-    def has_hidden_correction(self):
-        return True
+    Without this propagation a DSpark draft trained with
+    --sliding-window-non-causal is served with its sliding-window layers made
+    causal (vLLM's fallback), a train/serve mismatch that costs acceptance.
+    """
+    translated: dict[str, Any] = {"hidden_size": 16}
 
-    def has_markov(self):
-        return False
-
-    def apply_hidden_correction(self, hidden, previous):
-        self.previous_tokens.append(previous.clone())
-        return previous.to(hidden.dtype).unsqueeze(-1)
-
-    def compute_draft_logits(self, hidden):
-        next_ids = hidden[:, 0].long() + 1
-        logits = torch.full((hidden.shape[0], 16), -1000.0)
-        logits.scatter_(1, next_ids.unsqueeze(1), 0.0)
-        return logits
-
-    def map_draft_to_target(self, token_ids):
-        return token_ids
-
-
-def test_dfly_hidden_correction_uses_previous_sampled_token():
-    model = _FakeDFlyModel()
-    state = SimpleNamespace(
-        num_speculative_steps=3,
-        sample_indices=torch.tensor([0, 1, 2]),
-        sample_idx_mapping=torch.zeros(3, dtype=torch.int32),
-        sample_pos=torch.tensor([1, 2, 3]),
-        input_buffers=SimpleNamespace(input_ids=torch.tensor([3, 0, 0, 0])),
-        _anchor_idx=torch.tensor([0]),
-        model=model,
-        draft_logits=None,
-        draft_tokens=torch.zeros((1, 3), dtype=torch.long),
-        _d2t_scatter_index=None,
-        _draft_scatter_buf=None,
+    propagate_intra_block_causality(
+        {"sliding_window_non_causal": non_causal},
+        translated,
     )
 
-    _sample_sequential_with_hidden_correction(
-        state,
-        num_reqs=1,
-        head_hidden=torch.zeros((3, 1)),
+    assert translated["dflash_config"]["causal"] is expected_causal
+
+
+def test_intra_block_causality_preserves_existing_dflash_config_keys():
+    translated: dict[str, Any] = {"dflash_config": {"mask_token_id": 7}}
+
+    propagate_intra_block_causality(
+        {"sliding_window_non_causal": True},
+        translated,
     )
 
-    assert state.draft_tokens.tolist() == [[4, 5, 6]]
-    assert [tokens.item() for tokens in model.previous_tokens] == [3, 4, 5]
+    assert translated["dflash_config"] == {"mask_token_id": 7, "causal": False}
 
 
-class _FakeDSparkModel:
-    def __init__(self):
-        self.previous_tokens: list[torch.Tensor] = []
+def test_intra_block_causality_leaves_external_checkpoints_alone():
+    """External DSpark checkpoints never had the field; keep vLLM's fallback."""
+    translated: dict[str, Any] = {"hidden_size": 16}
 
-    def compute_draft_logits(self, hidden):
-        return torch.zeros((hidden.shape[0], 16))
+    propagate_intra_block_causality({}, translated)
 
-    def markov_embed(self, previous):
-        self.previous_tokens.append(previous.clone())
-        return previous
-
-    def markov_bias(self, previous):
-        next_ids = previous.long() + 1
-        logits = torch.full((previous.shape[0], 16), -1000.0)
-        logits.scatter_(1, next_ids.unsqueeze(1), 0.0)
-        return logits
-
-    def map_draft_to_target(self, token_ids):
-        return token_ids
+    assert "dflash_config" not in translated
 
 
-def test_patched_sequential_sampler_preserves_dspark_markov_path():
-    model = _FakeDSparkModel()
-    state = SimpleNamespace(
-        num_speculative_steps=3,
-        sample_indices=torch.tensor([0, 1, 2]),
-        sample_idx_mapping=torch.zeros(3, dtype=torch.int32),
-        sample_pos=torch.tensor([1, 2, 3]),
-        input_buffers=SimpleNamespace(input_ids=torch.tensor([3, 0, 0, 0])),
-        _anchor_idx=torch.tensor([0]),
-        model=model,
-        draft_logits=None,
-        draft_tokens=torch.zeros((1, 3), dtype=torch.long),
-        _d2t_scatter_index=None,
-        _draft_scatter_buf=None,
+def test_intra_block_causality_honours_an_explicit_default():
+    translated: dict[str, Any] = {}
+
+    propagate_intra_block_causality({}, translated, default=False)
+
+    assert translated["dflash_config"]["causal"] is True
+
+
+def test_intra_block_causality_rejects_a_non_boolean():
+    with pytest.raises(TypeError, match="must be a boolean"):
+        propagate_intra_block_causality(
+            {"sliding_window_non_causal": "true"},
+            {},
+        )
+
+
+def test_dfly_keeps_sample_from_anchor_out_of_dflash_config():
+    """Same constraint as Domino: the key belongs at the top level only."""
+    translated: dict[str, Any] = {"hidden_size": 16}
+
+    _update_dfly(
+        {
+            "aux_hidden_state_layer_ids": [2, 7, 12],
+            "draft_vocab_size": 128,
+            "mask_token_id": 127,
+            "block_size": 8,
+            "sample_from_anchor": True,
+        },
+        translated,
     )
 
-    _sample_sequential_with_hidden_correction(
-        state,
-        num_reqs=1,
-        head_hidden=torch.zeros((3, 1)),
-    )
-
-    assert state.draft_tokens.tolist() == [[4, 5, 6]]
-    assert [tokens.item() for tokens in model.previous_tokens] == [3, 4, 5]
+    assert translated["sample_from_anchor"] is True
+    assert "sample_from_anchor" not in translated["dflash_config"]

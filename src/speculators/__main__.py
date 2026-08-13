@@ -96,7 +96,7 @@ def convert(
                 "The source repo/algorithm to convert from into the matching algorithm "
                 "in Speculators"
             ),
-            click_type=click.Choice(["eagle", "eagle3", "mtp"]),
+            click_type=click.Choice(["eagle", "eagle3", "mtp", "domino"]),
         ),
     ],
     output_path: Annotated[
@@ -120,7 +120,9 @@ def convert(
                 'Options for Eagle: {"layernorms": true, "fusion_bias": true}. '
                 'Options for Eagle3: {"norm_before_residual": true, '
                 '"eagle_aux_hidden_state_layer_ids": [1,23,44]}. '
-                'Options for MTP: {"num_speculative_steps": 3}.'
+                'Options for MTP: {"num_speculative_steps": 3}. '
+                'Options for Domino: {"aux_hidden_state_layer_ids": '
+                "[2,10,18,26,34]}."
             ),
         ),
     ] = None,
@@ -169,6 +171,14 @@ def convert(
             --algorithm mtp \\
             --verifier "Qwen/Qwen3-Next-80B-A3B-Instruct" \\
             --algorithm-kwargs '{"num_speculative_steps": 3}'
+
+    \b
+    algorithm=="domino":
+        Domino checkpoints produced by SpecForge
+        ::
+        speculators convert "./domino/checkpoint" \\
+            --algorithm domino \\
+            --verifier "Qwen/Qwen3-8B"
     """
     if not algorithm_kwargs:
         algorithm_kwargs = {}

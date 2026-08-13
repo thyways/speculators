@@ -29,6 +29,26 @@ class TestMaybeConvertExternalCheckpoint:
         assert mock_convert.call_args.kwargs["algorithm"] == "dflash"
         assert mock_convert.call_args.kwargs["verifier"] == "Qwen/Qwen3-8B"
 
+    @patch("speculators.convert.entrypoints.convert_model")
+    @patch("speculators.convert.entrypoints.PretrainedConfig.get_config_dict")
+    def test_external_domino_converts(self, mock_cfg, mock_convert):
+        mock_cfg.return_value = (
+            {
+                "architectures": ["DominoDraftModel"],
+                "dflash_config": {"projector_type": "domino"},
+            },
+            None,
+        )
+        out = maybe_convert_external_checkpoint(
+            "some/domino-model",
+            verifier="Qwen/Qwen3-8B",
+            output_path="/tmp/out",
+        )
+        assert out == "/tmp/out"
+        mock_convert.assert_called_once()
+        assert mock_convert.call_args.kwargs["algorithm"] == "domino"
+        assert mock_convert.call_args.kwargs["verifier"] == "Qwen/Qwen3-8B"
+
     @patch("speculators.convert.entrypoints.PretrainedConfig.get_config_dict")
     def test_external_without_verifier_raises(self, mock_cfg):
         mock_cfg.return_value = ({"architectures": ["DFlashDraftModel"]}, None)
