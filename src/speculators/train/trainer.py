@@ -102,6 +102,7 @@ class TrainerConfig(NamedTuple):
     lr: float
     num_epochs: int
     save_path: str
+    kv_bridge_lr: float | None = None
     resume_from_checkpoint: bool = False
     train_call_kwargs: dict | None = None
     val_call_kwargs: dict | None = None
@@ -123,6 +124,41 @@ class TrainerConfig(NamedTuple):
     log_freq: int = 1
     fsdp_shard: bool = False
     max_steps: int | None = None
+
+
+def _optimizer_lrs(
+    optimizers: list[torch.optim.Optimizer],
+) -> dict[str, float]:
+    """Return every optimizer-group LR without hiding bridge-specific groups."""
+
+    current_lrs: dict[str, float] = {}
+    for optimizer in optimizers:
+        optimizer_name = type(optimizer).__name__
+        if len(optimizer.param_groups) == 1:
+            current_lrs[optimizer_name] = optimizer.param_groups[0]["lr"]
+            continue
+        for group_index, group in enumerate(optimizer.param_groups):
+            group_name = group.get("name", str(group_index))
+            current_lrs[f"{optimizer_name}/{group_name}"] = group["lr"]
+    return current_lrs
+
+
+def _reduce_step_metrics(
+    metrics: dict[str, torch.Tensor],
+    *,
+    distributed: bool,
+) -> dict[str, float]:
+    """Reduce copied float scalars so logging cannot mutate compiled aliases."""
+
+    if not metrics:
+        return {}
+    metric_keys = tuple(metrics)
+    stacked = torch.stack(
+        [metrics[key].detach().to(dtype=torch.float32).reshape(()) for key in metric_keys]
+    )
+    if distributed:
+        dist.reduce(stacked, dst=0, op=dist.ReduceOp.SUM)
+    return dict(zip(metric_keys, stacked.tolist(), strict=True))
 
 
 def _resolve_scheduler_steps(
@@ -391,6 +427,19 @@ class Trainer:
         for scheduler in self.schedulers:
             scheduler.step()
 
+    def _pop_batch_valid(self, batch: dict) -> bool:
+        valid = batch.pop("batch_valid", None)
+        if valid is None:
+            return True
+        valid = valid.to(
+            device=self.local_rank,
+            dtype=torch.uint8,
+            non_blocking=True,
+        )
+        if self.is_distributed:
+            dist.all_reduce(valid, op=dist.ReduceOp.MIN)
+        return bool(valid.item())
+
     def _prepare_resume_skip(self, epoch: int) -> int:
         """Prepare fast-skip state for mid-epoch resume and return skipped steps."""
         skip_steps = 0
@@ -476,6 +525,13 @@ class Trainer:
                 else v
                 for k, v in batch.items()
             }
+            if not self._pop_batch_valid(gpu_batch):
+                root_logger.warning(
+                    "Skipping packed batch because at least one rank received no "
+                    "valid online verifier payloads."
+                )
+                t_before_fetch = time.perf_counter()
+                continue
 
             # Let progress-dependent objectives update their schedule state.
             self._unwrapped_model.on_training_step(self.global_step, step_horizon)
@@ -491,14 +547,16 @@ class Trainer:
             timer.mark("fwd")
             self._optimizers_zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                1.0,
+                error_if_nonfinite=True,
+            )
 
             timer.mark("bwd")
             self._optimizers_step()
 
-            current_lrs = {
-                type(opt).__name__: opt.param_groups[0]["lr"] for opt in self.optimizers
-            }
+            current_lrs = _optimizer_lrs(self.optimizers)
             self._schedulers_step()
             timer.mark("opt")
             t_before_fetch = timer.now() or time.perf_counter()
@@ -507,11 +565,10 @@ class Trainer:
             if timer.enabled:
                 num_tokens = int((gpu_batch["document_ids"] != -1).sum().item())
                 profile = timer.profile(num_tokens)
-                if self.is_distributed:
-                    for v in metrics.values():
-                        dist.reduce(v, dst=0, op=dist.ReduceOp.SUM)
-
-                metrics = {k: v.item() for k, v in metrics.items()}
+                metrics = _reduce_step_metrics(
+                    metrics,
+                    distributed=self.is_distributed,
+                )
                 world_size = dist.get_world_size() if self.is_distributed else 1
                 metrics = normalize_counted_metrics(metrics, world_size)
                 lr_info = (
@@ -564,7 +621,7 @@ class Trainer:
             val_loader = tqdm(val_loader, desc=f"Epoch {epoch}")  # type: ignore[assignment]
 
         accumulated: dict[str, torch.Tensor] = {}
-        num_batches = len(val_loader)
+        num_batches = 0
         for i, batch in enumerate(val_loader):
             self._maybe_val_sync(i)
             gpu_batch = {
@@ -573,6 +630,13 @@ class Trainer:
                 else v
                 for k, v in batch.items()
             }
+            if not self._pop_batch_valid(gpu_batch):
+                root_logger.warning(
+                    "Skipping validation batch because at least one rank received "
+                    "no valid online verifier payloads."
+                )
+                continue
+            num_batches += 1
 
             with torch.autocast(
                 self.device_type, dtype=self.config.hidden_states_dtype
@@ -593,7 +657,8 @@ class Trainer:
             val_metrics = dict(zip(accumulated, stacked.tolist(), strict=True))
 
         world_size = dist.get_world_size() if self.is_distributed else 1
-        val_metrics = {k: v / num_batches for k, v in val_metrics.items()}
+        denominator = max(num_batches, 1)
+        val_metrics = {k: v / denominator for k, v in val_metrics.items()}
         val_metrics = normalize_counted_metrics(val_metrics, world_size)
         val_metrics = {f"{k}_epoch": v for k, v in val_metrics.items()}
 

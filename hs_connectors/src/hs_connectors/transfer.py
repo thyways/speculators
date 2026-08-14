@@ -152,7 +152,9 @@ class FileTransfer(HiddenStatesTransfer):
         shutil.move(handle, target)
 
     def delete(self, handle: str) -> None:
-        Path(handle).unlink()
+        path = Path(handle)
+        path.unlink(missing_ok=True)
+        Path(f"{handle}.lock").unlink(missing_ok=True)
 
 
 @HiddenStatesBackend.register("file")
@@ -194,13 +196,25 @@ class FileBackend(HiddenStatesBackend):
 
     @staticmethod
     def build_kv_transfer_config(args: argparse.Namespace) -> dict[str, Any]:
-        return {
-            "kv_connector": "ExampleHiddenStatesConnector",
+        verifier_kv_layer_ids = getattr(args, "verifier_kv_layer_ids", None)
+        config: dict[str, Any] = {
+            "kv_connector": (
+                "VerifierKVConnector"
+                if verifier_kv_layer_ids
+                else "ExampleHiddenStatesConnector"
+            ),
             "kv_role": "kv_producer",
             "kv_connector_extra_config": {
                 "shared_storage_path": args.hidden_states_path,
             },
         }
+        if verifier_kv_layer_ids:
+            config["kv_connector_module_path"] = "hs_connectors.verifier_kv_connector"
+            config["kv_connector_extra_config"]["verifier_kv_layer_ids"] = (
+                verifier_kv_layer_ids
+            )
+            config["kv_connector_extra_config"]["online_only"] = True
+        return config
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +310,13 @@ class MooncakeBackend(HiddenStatesBackend):
             protocol=args.mooncake_protocol,
         )
 
+        verifier_kv_layer_ids = getattr(args, "verifier_kv_layer_ids", None)
+        if verifier_kv_layer_ids:
+            raise NotImplementedError(
+                "Exporting verifier K/V is currently supported only by the file "
+                "hidden-states backend. Use '--hidden-states-backend file' for "
+                "KV-native DSpark training; Mooncake support has not been wired yet."
+            )
         return {
             "kv_connector": "MooncakeHiddenStatesConnector",
             "kv_role": "kv_producer",

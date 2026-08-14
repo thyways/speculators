@@ -14,7 +14,6 @@ from datasets import load_from_disk
 from torch.utils.data import Dataset
 
 from hs_connectors import FileTransfer, HiddenStatesTransfer
-from speculators.data_generation.offline import check_hidden_states
 from speculators.data_generation.vllm_client import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_REQUEST_TIMEOUT,
@@ -22,6 +21,7 @@ from speculators.data_generation.vllm_client import (
     generate_hidden_states,
 )
 from speculators.train.noise_transforms import TransformTensors
+from speculators.train.online_payload import check_online_payload
 
 BatchType = dict[str, Any]
 
@@ -58,7 +58,11 @@ StandardizeFnSig = Callable[[dict[str, Any]], dict[str, Any]]
 
 
 def create_empty_sample(
-    hidden_size: int, num_target_layers: int = 3, dtype: torch.dtype = torch.bfloat16
+    hidden_size: int,
+    num_target_layers: int = 3,
+    dtype: torch.dtype = torch.bfloat16,
+    verifier_kv_shape: tuple[int, int, int] | None = None,
+    verifier_kv_layer_ids: list[int] | None = None,
 ):
     # data structure: {
     #     "hidden_states": [seq_len, num_target_layers * hidden_size],
@@ -73,7 +77,7 @@ def create_empty_sample(
     # we substitute an empty sample), the implicit float32 placeholders crashed
     # bf16 EAGLE-3 layers (fc, verifier_lm_head) with a dtype mismatch.
 
-    return {
+    sample = {
         "hidden_states": torch.empty(0, num_target_layers * hidden_size, dtype=dtype),
         "input_ids": torch.empty(0, dtype=torch.long),
         "verifier_last_hidden_states": torch.empty(0, hidden_size, dtype=dtype),
@@ -81,6 +85,29 @@ def create_empty_sample(
         "lengths": torch.tensor([0], dtype=torch.long),
         "position_ids": torch.arange(0, dtype=torch.long),
     }
+    if verifier_kv_shape is not None:
+        num_layers, num_kv_heads, head_dim = verifier_kv_shape
+        layer_ids = (
+            torch.tensor(verifier_kv_layer_ids, dtype=torch.long)
+            if verifier_kv_layer_ids is not None
+            else torch.zeros(num_layers, dtype=torch.long)
+        )
+        if layer_ids.shape != (num_layers,):
+            raise ValueError(
+                "verifier_kv_layer_ids must match verifier_kv_shape's layer axis"
+            )
+        sample.update(
+            {
+                "verifier_keys": torch.empty(
+                    0, num_layers, num_kv_heads, head_dim, dtype=dtype
+                ),
+                "verifier_values": torch.empty(
+                    0, num_layers, num_kv_heads, head_dim, dtype=dtype
+                ),
+                "verifier_kv_layer_ids": layer_ids,
+            }
+        )
+    return sample
 
 
 def standardize_data_v1(data: dict[str, Any]) -> dict[str, Any]:
@@ -180,7 +207,7 @@ class BaseDataset(Dataset):
         data["lengths"] = torch.tensor([seq_len], dtype=torch.long)
         # shape: [1]
 
-        data["position_ids"] = torch.arange(seq_len, dtype=torch.long)
+        data.setdefault("position_ids", torch.arange(seq_len, dtype=torch.long))
         # shape: [seq_len]
 
         # data structure: {
@@ -200,7 +227,7 @@ class BaseDataset(Dataset):
 
 
 class ArrowDataset(BaseDataset):
-    def __init__(
+    def __init__(  # noqa: PLR0917
         self,
         max_len: int,
         datapath: str | PathLike,
@@ -216,6 +243,9 @@ class ArrowDataset(BaseDataset):
         request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
         fail_on_hidden_state_error: bool = False,
+        require_verifier_kv: bool = False,
+        verifier_kv_shape: tuple[int, int, int] | None = None,
+        verifier_kv_layer_ids: list[int] | None = None,
     ):
         self.data = load_from_disk(datapath)
         if not 0.0 < train_ratio <= 1.0:
@@ -246,6 +276,9 @@ class ArrowDataset(BaseDataset):
         self.request_timeout = request_timeout
         self.max_retries = max_retries
         self.fail_on_hidden_state_error = fail_on_hidden_state_error
+        self.require_verifier_kv = require_verifier_kv
+        self.verifier_kv_shape = verifier_kv_shape
+        self.verifier_kv_layer_ids = verifier_kv_layer_ids
 
         # Delay super init so that `_compute_approx_lengths` has required data
         super().__init__(max_len, transform, hidden_states_dtype)
@@ -280,8 +313,19 @@ class ArrowDataset(BaseDataset):
             self._setup_client()
 
         dataset_item = self.data[index]
+        if (
+            self.require_verifier_kv
+            and "messages" in dataset_item
+            and _has_multimodal_content(dataset_item["messages"])
+        ):
+            raise ValueError(
+                "KV-native training currently supports text-only samples; "
+                f"sample {index} contains multimodal message content"
+            )
         client_item = build_client_item(dataset_item)
 
+        handle: str | None = None
+        handle_consumed = False
         try:
             handle = generate_hidden_states(
                 self.client,  # type:ignore[arg-type]
@@ -295,16 +339,33 @@ class ArrowDataset(BaseDataset):
             if loaded_hs is None:
                 raise ValueError(f"Failed to load hidden states for handle {handle}")
 
-            check_hidden_states(loaded_hs, dataset_item["input_ids"].tolist())
+            check_online_payload(
+                loaded_hs,
+                dataset_item["input_ids"].tolist(),
+                require_verifier_kv=self.require_verifier_kv,
+                expected_verifier_kv_shape=self.verifier_kv_shape,
+                expected_verifier_kv_layer_ids=self.verifier_kv_layer_ids,
+            )
 
             file_idx = self._map_to_file_idx(index)
             match self.on_generate:
                 case "cache":
                     self.transfer.cache(handle, file_idx)
+                    handle_consumed = True
                 case "delete":
                     self.transfer.delete(handle)
+                    handle_consumed = True
         except Exception as e:
-            if isinstance(e, ValueError) and "NaN" in str(e):
+            if handle is not None and not handle_consumed:
+                try:
+                    self.transfer.delete(handle)
+                except OSError as cleanup_error:
+                    warnings.warn(
+                        f"Failed to delete invalid online payload {handle}: "
+                        f"{cleanup_error}",
+                        stacklevel=1,
+                    )
+            if isinstance(e, ValueError) and ("NaN" in str(e) or "Inf" in str(e)):
                 raise
             if self.fail_on_hidden_state_error:
                 raise RuntimeError(
@@ -320,12 +381,18 @@ class ArrowDataset(BaseDataset):
 
     def _get_raw_data(self, index):
         file_idx = self._map_to_file_idx(index)
-        loaded_hs = self.transfer.get_cached(file_idx)
+        # KV-native training is deliberately online-only: ignore any persistent
+        # hidden-state cache and request a fresh verifier payload for every sample.
+        loaded_hs = (
+            None if self.require_verifier_kv else self.transfer.get_cached(file_idx)
+        )
 
+        payload_was_validated = False
         if loaded_hs is None:
             match self.on_missing:
                 case "generate":
                     loaded_hs = self._maybe_generate_hs(index)
+                    payload_was_validated = loaded_hs is not None
                 case "skip":
                     return None
                 case "warn":
@@ -359,7 +426,17 @@ class ArrowDataset(BaseDataset):
             )
             return None
 
-        return {
+        if not payload_was_validated:
+            expected_tokens = self.data[index]["input_ids"].tolist()
+            check_online_payload(
+                loaded_hs,
+                expected_tokens,
+                require_verifier_kv=self.require_verifier_kv,
+                expected_verifier_kv_shape=self.verifier_kv_shape,
+                expected_verifier_kv_layer_ids=self.verifier_kv_layer_ids,
+            )
+
+        result = {
             "hidden_states": loaded_hs["hidden_states"][:, :-1].flatten(
                 1
             ),  # [seq_len, 3 * hidden_size]
@@ -369,6 +446,16 @@ class ArrowDataset(BaseDataset):
             ],  # [seq_len, hidden_size]
             "loss_mask": self.data[index]["loss_mask"],  # [seq_len]
         }
+        if "verifier_keys" in loaded_hs:
+            result.update(
+                {
+                    "verifier_keys": loaded_hs["verifier_keys"],
+                    "verifier_values": loaded_hs["verifier_values"],
+                    "verifier_kv_layer_ids": loaded_hs["verifier_kv_layer_ids"],
+                    "position_ids": loaded_hs["position_ids"],
+                }
+            )
+        return result
 
 
 class SampleFileDataset(BaseDataset):
@@ -471,27 +558,34 @@ class SampleFileDataset(BaseDataset):
 class CollateFn:
     """Picklable collate function for use with ``multiprocessing_context='spawn'``."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0917
         self,
         max_len: int,
         hidden_size: int,
         num_target_layers: int = 3,
         dtype: torch.dtype = torch.bfloat16,
         preprocess: Callable[[BatchType], BatchType] | None = None,
+        verifier_kv_shape: tuple[int, int, int] | None = None,
+        verifier_kv_layer_ids: list[int] | None = None,
     ):
         self.max_len = max_len
         self.hidden_size = hidden_size
         self.num_target_layers = num_target_layers
         self.dtype = dtype
         self.preprocess = preprocess
+        self.verifier_kv_shape = verifier_kv_shape
+        self.verifier_kv_layer_ids = verifier_kv_layer_ids
 
-    def __call__(self, batch: Sequence[BatchType | None]) -> BatchType:
+    def __call__(  # noqa: C901
+        self, batch: Sequence[BatchType | None]
+    ) -> BatchType:
         max_len = self.max_len
         dtype = self.dtype
         preprocess = self.preprocess
 
         # Apply per-sample preprocessing and filter failed samples
         batch = [preprocess(b) if preprocess else b for b in batch if b is not None]
+        batch_valid = bool(batch)
 
         if not batch:
             # Create empty sample which then gets padded to full
@@ -500,7 +594,11 @@ class CollateFn:
             # downstream layers loaded at a different precision (e.g. bf16
             # weights vs fp32 default placeholders).
             empty = create_empty_sample(
-                self.hidden_size, self.num_target_layers, dtype=dtype
+                self.hidden_size,
+                self.num_target_layers,
+                dtype=dtype,
+                verifier_kv_shape=self.verifier_kv_shape,
+                verifier_kv_layer_ids=self.verifier_kv_layer_ids,
             )
             if preprocess:
                 empty = preprocess(empty)
@@ -511,9 +609,25 @@ class CollateFn:
             if key == "lengths":
                 collated_data[key] = torch.cat([b[key] for b in batch], dim=0)  # type: ignore[index]
                 continue
+            if key == "verifier_kv_layer_ids":
+                first_ids = batch[0][key]  # type: ignore[index]
+                if any(
+                    not torch.equal(first_ids, b[key])  # type: ignore[index]
+                    for b in batch[1:]
+                ):
+                    raise ValueError(
+                        "All samples in a packed batch must use identical "
+                        "verifier_kv_layer_ids"
+                    )
+                collated_data[key] = first_ids.clone()
+                continue
             # one copy per sample: preallocated buffer, hidden states cast during write
             first = batch[0][key]  # type: ignore[index]
-            buffer_dtype = dtype if "hidden_states" in key else first.dtype
+            buffer_dtype = (
+                dtype
+                if "hidden_states" in key or key in {"verifier_keys", "verifier_values"}
+                else first.dtype
+            )
             out = torch.zeros(
                 (max_len, *first.shape[1:]), dtype=buffer_dtype, device=first.device
             )
@@ -554,5 +668,7 @@ class CollateFn:
         ).unsqueeze(0)
         # shape: [1, max_len]
         collated_data["document_ids"] = document_ids
+        if self.verifier_kv_shape is not None:
+            collated_data["batch_valid"] = torch.tensor(batch_valid, dtype=torch.bool)
 
         return collated_data

@@ -38,6 +38,37 @@ _ADAMW_NAME_HINTS = (
 _MATRIX_NDIM = 2
 
 
+def split_named_params_for_kv_bridge(
+    model: Module,
+) -> tuple[list[tuple[str, Tensor]], list[tuple[str, Tensor]]]:
+    """Split trainable parameters into base and target-to-draft bridge groups."""
+
+    base_params: list[tuple[str, Tensor]] = []
+    bridge_params: list[tuple[str, Tensor]] = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        target = (
+            bridge_params if ".kv_bridge." in f".{name}." else base_params
+        )
+        target.append((name, param))
+    return base_params, bridge_params
+
+
+def _named_param_group(
+    named_params: list[tuple[str, Tensor]],
+    *,
+    name: str,
+    lr: float,
+) -> dict:
+    return {
+        "params": [param for _, param in named_params],
+        "param_names": [param_name for param_name, _ in named_params],
+        "name": name,
+        "lr": lr,
+    }
+
+
 def split_named_params_for_muon(
     model: Module,
 ) -> tuple[list[tuple[str, Tensor]], list[tuple[str, Tensor]]]:
@@ -76,6 +107,40 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
         "adamw" returns a single optimizer; "muon" returns ``[Muon, AdamW]``.
     """
     if config.optimizer == "adamw":
+        if config.kv_bridge_lr is not None:
+            base_params, bridge_params = split_named_params_for_kv_bridge(model)
+            if not bridge_params:
+                raise ValueError(
+                    "kv_bridge_lr was set, but the model has no trainable "
+                    "'.kv_bridge.' parameters."
+                )
+            param_groups = []
+            if base_params:
+                param_groups.append(
+                    _named_param_group(base_params, name="base", lr=config.lr)
+                )
+            param_groups.append(
+                _named_param_group(
+                    bridge_params,
+                    name="kv_bridge",
+                    lr=config.kv_bridge_lr,
+                )
+            )
+            logger.info(
+                "AdamW optimizer: %d base params at %.3g LR, %d KV-bridge params "
+                "at %.3g LR.",
+                len(base_params),
+                config.lr,
+                len(bridge_params),
+                config.kv_bridge_lr,
+            )
+            return [
+                torch.optim.AdamW(
+                    param_groups,
+                    lr=config.lr,
+                    weight_decay=config.weight_decay,
+                )
+            ]
         return [
             torch.optim.AdamW(
                 model.named_parameters(),
@@ -85,6 +150,8 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
         ]
 
     if config.optimizer == "muon":
+        if config.kv_bridge_lr is not None:
+            raise ValueError("kv_bridge_lr is currently supported only with AdamW.")
         muon_params, adamw_params = split_named_params_for_muon(model)
         logger.info(
             "Muon optimizer: %d 2D params via Muon, %d params via AdamW.",

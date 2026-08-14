@@ -7,6 +7,7 @@ import pytest
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark.core import DSparkDraftModel
 from speculators.models.eagle3.core import Eagle3DraftModel
+from speculators.models.kv_native_dspark.core import KVNativeDSparkDraftModel
 from speculators.models.metrics import ce_loss, kl_div_loss, tv_loss_fused_or_eager
 from speculators.models.peagle.core import PEagleDraftModel
 from speculators.train.config import TrainConfig
@@ -126,6 +127,57 @@ def test_dspark_confidence_head_alpha(monkeypatch):
     train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
     assert train_kw["confidence_head_alpha"] == 0.5
     assert val_kw["confidence_head_alpha"] == 0.5
+
+
+def test_kv_native_speculative_length_is_checkpoint_config_only(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "kv_native_dspark",
+            "--num-layers",
+            "6",
+            "--hidden-states-backend",
+            "file",
+            "--on-missing",
+            "generate",
+            "--on-generate",
+            "delete",
+        ],
+    )
+    train_kw, val_kw = KVNativeDSparkDraftModel.get_trainer_kwargs(**vars(args))
+    assert args.num_speculative_tokens == 7
+    assert "num_speculative_tokens" not in train_kw
+    assert "num_speculative_tokens" not in val_kw
+
+
+def test_kv_bridge_cli_flags_flow_into_config(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "kv_native_dspark",
+            "--num-layers",
+            "6",
+            "--kv-bridge-enabled",
+            "--kv-bridge-rank",
+            "16",
+            "--kv-bridge-residual-scale",
+            "0.1",
+            "--kv-bridge-max-correction-ratio",
+            "0.5",
+            "--kv-bridge-normalize-keys",
+            "--kv-bridge-lr",
+            "6e-5",
+        ],
+    )
+
+    assert args.kv_bridge_enabled is True
+    assert args.kv_bridge_rank == 16
+    assert args.kv_bridge_residual_scale == 0.1
+    assert args.kv_bridge_max_correction_ratio == 0.5
+    assert args.kv_bridge_normalize_keys is True
+    assert args.kv_bridge_lr == 6e-5
 
 
 # ---------------------------------------------------------------------------

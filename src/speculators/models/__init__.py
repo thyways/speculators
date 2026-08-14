@@ -5,6 +5,10 @@ from .dfly import DFlyDraftModel, DFlySpeculatorConfig
 from .domino import DominoDraftModel, DominoSpeculatorConfig
 from .dspark import DSparkDraftModel, DSparkSpeculatorConfig
 from .eagle3 import Eagle3DraftModel, Eagle3SpeculatorConfig
+from .kv_native_dspark import (
+    KVNativeDSparkDraftModel,
+    KVNativeDSparkSpeculatorConfig,
+)
 from .mtp import MTPDraftModel, MTPSpeculatorConfig
 from .peagle import PEagleDraftModel, PEagleSpeculatorConfig
 
@@ -19,6 +23,8 @@ __all__ = [
     "DominoSpeculatorConfig",
     "Eagle3DraftModel",
     "Eagle3SpeculatorConfig",
+    "KVNativeDSparkDraftModel",
+    "KVNativeDSparkSpeculatorConfig",
     "MTPDraftModel",
     "MTPSpeculatorConfig",
     "PEagleDraftModel",
