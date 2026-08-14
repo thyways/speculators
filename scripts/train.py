@@ -659,6 +659,7 @@ def main(cfg: TrainConfig):  # noqa: C901
         num_epochs=args.epochs,
         save_path=args.save_path,
         lr=args.lr,
+        kv_bridge_lr=args.kv_bridge_lr,
         resume_from_checkpoint=not args.no_resume_from_checkpoint,
         train_call_kwargs=train_call_kwargs,
         val_call_kwargs=val_call_kwargs,

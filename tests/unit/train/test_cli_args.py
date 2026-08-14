@@ -151,6 +151,35 @@ def test_kv_native_speculative_length_is_checkpoint_config_only(monkeypatch):
     assert "num_speculative_tokens" not in val_kw
 
 
+def test_kv_bridge_cli_flags_flow_into_config(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "kv_native_dspark",
+            "--num-layers",
+            "6",
+            "--kv-bridge-enabled",
+            "--kv-bridge-rank",
+            "16",
+            "--kv-bridge-residual-scale",
+            "0.1",
+            "--kv-bridge-max-correction-ratio",
+            "0.5",
+            "--kv-bridge-normalize-keys",
+            "--kv-bridge-lr",
+            "6e-5",
+        ],
+    )
+
+    assert args.kv_bridge_enabled is True
+    assert args.kv_bridge_rank == 16
+    assert args.kv_bridge_residual_scale == 0.1
+    assert args.kv_bridge_max_correction_ratio == 0.5
+    assert args.kv_bridge_normalize_keys is True
+    assert args.kv_bridge_lr == 6e-5
+
+
 # ---------------------------------------------------------------------------
 # Per-speculator-type defaults for draft_arch, norm_before_fc, norm_output
 # ---------------------------------------------------------------------------

@@ -326,6 +326,14 @@ class OptimizerArgs(_Group):
         "AdamW to the remaining params (norms, biases, embeddings, lm_head).",
     )
     lr: float = Field(default=1e-4, description="Learning rate (AdamW / base group).")
+    kv_bridge_lr: float | None = Field(
+        default=None,
+        gt=0.0,
+        description=(
+            "Optional AdamW learning rate for parameters whose name contains "
+            "'.kv_bridge.'. When unset, all parameters use --lr."
+        ),
+    )
     weight_decay: float = Field(
         default=0.01,
         description="Weight decay for the AdamW optimizer (and the AdamW group in muon "
@@ -487,23 +495,59 @@ class KVNativeDSparkArgs(_Group):
     """Online real-K/V training settings for KV-native DSpark."""
 
     verifier_kv_layer_ids: list[int] = Field(
-        default_factory=lambda: [3, 11, 19, 27, 35, 39],
+        default_factory=lambda: [3, 11, 19, 27, 31, 39],
         description=(
             "Full-attention verifier layers exported by the online vLLM service."
         ),
     )
     verifier_kv_layer_mapping: list[int] = Field(
-        default_factory=lambda: [3, 11, 19, 27, 35, 39],
-        description="One exported verifier layer selected for every draft layer.",
+        default_factory=lambda: [3, 11, 19, 27, 31, 39],
+        description=(
+            "Direct-read mode only: one exported verifier layer selected for every "
+            "draft layer. The learned bridge consumes all exported layers."
+        ),
     )
     verifier_num_key_value_heads: int = Field(default=2, gt=0)
     verifier_head_dim: int = Field(default=256, gt=0)
     verifier_partial_rotary_factor: float = Field(default=0.25, gt=0.0, le=1.0)
     verifier_rope_theta: float = Field(default=10_000_000.0, gt=0.0)
     verifier_mrope_section: list[int] = Field(default_factory=lambda: [11, 11, 10])
-    local_kv_loss_alpha: float = Field(default=0.1, ge=0.0)
-    query_key_loss_alpha: float = Field(default=1.0, ge=0.0)
-    attention_value_loss_alpha: float = Field(default=1.0, ge=0.0)
+    kv_bridge_enabled: bool = Field(
+        default=False,
+        description=(
+            "Learn an all-exported-layer softmax-gated low-rank mapping from "
+            "verifier K/V into draft cache space."
+        ),
+    )
+    kv_bridge_rank: int = Field(
+        default=32,
+        gt=0,
+        description=(
+            "Width of each per-source projection before learned layer fusion."
+        ),
+    )
+    kv_bridge_residual_scale: float = Field(
+        default=1.0,
+        ge=0.0,
+        description=(
+            "Fixed multiplier applied to the learned low-rank bridge correction. "
+            "The softmax-fused verifier K/V base is not scaled."
+        ),
+    )
+    kv_bridge_max_correction_ratio: float | None = Field(
+        default=None,
+        gt=0.0,
+        description=(
+            "Optional per-token RMS upper bound for the learned bridge correction "
+            "relative to its fused base."
+        ),
+    )
+    kv_bridge_normalize_keys: bool = Field(
+        default=False,
+        description=(
+            "RMS-normalize mapped content Keys before restoring verifier MRoPE."
+        ),
+    )
     num_speculative_tokens: int = Field(
         default=7,
         gt=0,
@@ -739,21 +783,23 @@ class TrainConfig(BaseSettings):
             raise ValueError("--verifier-kv-layer-ids must not contain duplicates")
         if any(layer_id < 0 for layer_id in exported_ids):
             raise ValueError("--verifier-kv-layer-ids must be non-negative")
-        if (
-            len(self.kv_native_dspark.verifier_kv_layer_mapping)
-            != self.draft.num_layers
-        ):
-            raise ValueError(
-                "--verifier-kv-layer-mapping must contain exactly --num-layers IDs"
+        if not self.kv_native_dspark.kv_bridge_enabled:
+            if (
+                len(self.kv_native_dspark.verifier_kv_layer_mapping)
+                != self.draft.num_layers
+            ):
+                raise ValueError(
+                    "--verifier-kv-layer-mapping must contain exactly --num-layers IDs"
+                )
+            exported = set(exported_ids)
+            unknown = sorted(
+                set(self.kv_native_dspark.verifier_kv_layer_mapping) - exported
             )
-        exported = set(exported_ids)
-        unknown = sorted(
-            set(self.kv_native_dspark.verifier_kv_layer_mapping) - exported
-        )
-        if unknown:
-            raise ValueError(
-                f"--verifier-kv-layer-mapping references non-exported layers: {unknown}"
-            )
+            if unknown:
+                raise ValueError(
+                    "--verifier-kv-layer-mapping references non-exported layers: "
+                    f"{unknown}"
+                )
         rotary_dim = int(
             self.kv_native_dspark.verifier_head_dim
             * self.kv_native_dspark.verifier_partial_rotary_factor
@@ -772,9 +818,7 @@ class TrainConfig(BaseSettings):
         if sample_from_anchor is None:
             sample_from_anchor = True
         trained_tokens = (
-            self.dflash.block_size
-            if sample_from_anchor
-            else self.dflash.block_size - 1
+            self.dflash.block_size if sample_from_anchor else self.dflash.block_size - 1
         )
         if self.kv_native_dspark.num_speculative_tokens > trained_tokens:
             raise ValueError(

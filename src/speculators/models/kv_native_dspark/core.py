@@ -12,9 +12,8 @@ from speculators.models.dspark.metrics import compute_metrics
 from speculators.models.kv_native_dspark.config import (
     KVNativeDSparkSpeculatorConfig,
 )
-from speculators.models.kv_native_dspark.metrics import add_kv_native_losses
 from speculators.models.kv_native_dspark.model_definitions import (
-    KVLayerArtifacts,
+    KVBridgeDiagnostics,
     Qwen3KVNativeDecoderLayer,
     VerifierRotaryEmbedding,
 )
@@ -23,6 +22,8 @@ from speculators.models.utils import conditional_torch_compile, get_verifier_con
 
 _DEFAULT_LOSS_CONFIG: LossConfig = {"kl_div": (kl_div_loss, 1.0)}
 _TEXT_POSITION_IDS_NDIM = 2
+_MROPE_POSITION_IDS_NDIM = 3
+_MROPE_COORDINATES = 3
 
 __all__ = ["KVNativeDSparkDraftModel"]
 
@@ -38,6 +39,7 @@ class KVNativeDSparkDraftModel(DSparkDraftModel):
 
     def __init__(self, config: KVNativeDSparkSpeculatorConfig) -> None:
         super().__init__(config=config)
+        num_draft_layers = config.transformer_layer_config.num_hidden_layers
         self.layers = torch.nn.ModuleList(
             [
                 Qwen3KVNativeDecoderLayer(
@@ -45,13 +47,24 @@ class KVNativeDSparkDraftModel(DSparkDraftModel):
                     layer_idx,
                     verifier_num_key_value_heads=config.verifier_num_key_value_heads,
                     verifier_head_dim=config.verifier_head_dim,
+                    kv_bridge_enabled=config.kv_bridge_enabled,
+                    kv_bridge_num_source_layers=len(config.verifier_kv_layer_ids),
+                    kv_bridge_rank=config.kv_bridge_rank,
+                    kv_bridge_residual_scale=config.kv_bridge_residual_scale,
+                    kv_bridge_max_correction_ratio=(
+                        config.kv_bridge_max_correction_ratio
+                    ),
+                    kv_bridge_normalize_keys=config.kv_bridge_normalize_keys,
                 )
-                for layer_idx in range(len(self.layers))
+                for layer_idx in range(num_draft_layers)
             ]
         )
         for layer in self.kv_native_layers:
             layer.apply(self._initialize_weights)
-            layer.kv_adapter.reset_parameters()
+            if layer.kv_adapter is not None:
+                layer.kv_adapter.reset_parameters()
+            if layer.kv_bridge is not None:
+                layer.kv_bridge.reset_parameters()
 
         self.verifier_rotary_emb = VerifierRotaryEmbedding(
             head_dim=config.verifier_head_dim,
@@ -59,10 +72,14 @@ class KVNativeDSparkDraftModel(DSparkDraftModel):
             rope_theta=config.verifier_rope_theta,
             mrope_section=config.verifier_mrope_section,
         )
-        self._verifier_kv_mapping_indices = self._resolve_mapping_indices(
-            config.verifier_kv_layer_ids,
-            config.verifier_kv_layer_mapping,
-            len(self.layers),
+        self._verifier_kv_mapping_indices = (
+            ()
+            if config.kv_bridge_enabled
+            else self._resolve_mapping_indices(
+                config.verifier_kv_layer_ids,
+                config.verifier_kv_layer_mapping,
+                num_draft_layers,
+            )
         )
 
     @property
@@ -80,9 +97,7 @@ class KVNativeDSparkDraftModel(DSparkDraftModel):
                 "verifier_kv_layer_mapping must contain one layer ID per draft "
                 f"layer: got {len(mapping)} for {num_draft_layers} layers"
             )
-        lookup = {
-            layer_id: index for index, layer_id in enumerate(exported_layer_ids)
-        }
+        lookup = {layer_id: index for index, layer_id in enumerate(exported_layer_ids)}
         unknown = sorted(set(mapping) - set(lookup))
         if unknown:
             raise ValueError(
@@ -97,6 +112,111 @@ class KVNativeDSparkDraftModel(DSparkDraftModel):
             self.config.verifier_num_key_value_heads,
             self.config.verifier_head_dim,
         )
+
+    def get_kv_bridge_fusion_weights(self) -> dict[str, torch.Tensor]:
+        """Return per-draft-layer learned weights over exported verifier layers."""
+
+        if not self.config.kv_bridge_enabled:
+            raise RuntimeError("KV bridge fusion weights require kv_bridge_enabled")
+        key_weights: list[torch.Tensor] = []
+        value_weights: list[torch.Tensor] = []
+        for layer_idx, layer in enumerate(self.kv_native_layers):
+            if layer.kv_bridge is None:
+                raise RuntimeError(f"draft layer {layer_idx} has no KV bridge")
+            layer_key_weights, layer_value_weights = layer.kv_bridge.fusion_weights()
+            key_weights.append(layer_key_weights)
+            value_weights.append(layer_value_weights)
+        return {
+            "keys": torch.stack(key_weights),
+            "values": torch.stack(value_weights),
+        }
+
+    def convert_verifier_kv_cache(
+        self,
+        verifier_keys: torch.Tensor,
+        verifier_values: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Materialize bridge-mapped per-layer draft prefix caches.
+
+        Inputs use token-major training layout
+        ``[batch,tokens,exported_layers,kv_heads,head_dim]``. Sliding-attention
+        draft layers retain only their trailing window, while full-attention layers
+        retain the complete prefix.
+        """
+
+        if not self.config.kv_bridge_enabled:
+            raise RuntimeError("KV bridge cache conversion requires kv_bridge_enabled")
+        if verifier_keys.shape != verifier_values.shape:
+            raise ValueError("verifier key/value shapes must match")
+        if verifier_keys.ndim != 5:  # noqa: PLR2004
+            raise ValueError(
+                "Expected verifier K/V [batch,tokens,layers,heads,dim], got "
+                f"{tuple(verifier_keys.shape)}"
+            )
+        expected_tail = self.verifier_kv_shape
+        if tuple(verifier_keys.shape[2:]) != expected_tail:
+            raise ValueError(
+                f"Expected verifier K/V tail {expected_tail}, got "
+                f"{tuple(verifier_keys.shape[2:])}"
+            )
+        batch_size, total_tokens = verifier_keys.shape[:2]
+        if position_ids is None:
+            position_ids = torch.arange(
+                total_tokens,
+                device=verifier_keys.device,
+            ).expand(batch_size, -1)
+        text_positions = (
+            position_ids.ndim == _TEXT_POSITION_IDS_NDIM
+            and position_ids.shape
+            == (
+                batch_size,
+                total_tokens,
+            )
+        )
+        mrope_positions = (
+            position_ids.ndim == _MROPE_POSITION_IDS_NDIM
+            and position_ids.shape
+            == (
+                _MROPE_COORDINATES,
+                batch_size,
+                total_tokens,
+            )
+        )
+        if not text_positions and not mrope_positions:
+            raise ValueError(
+                "position_ids must be [batch,tokens] or [3,batch,tokens], got "
+                f"{tuple(position_ids.shape)}"
+            )
+
+        mapped_caches: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for layer_idx, layer in enumerate(self.kv_native_layers):
+            if layer.kv_bridge is None:
+                raise RuntimeError(f"draft layer {layer_idx} has no KV bridge")
+            start = 0
+            if (
+                layer_idx in self.sliding_window_indices
+                and self.sliding_window is not None
+            ):
+                start = max(0, total_tokens - self.sliding_window)
+            layer_keys = verifier_keys[:, start:].permute(0, 2, 3, 1, 4)
+            layer_values = verifier_values[:, start:].permute(0, 2, 3, 1, 4)
+            layer_positions = (
+                position_ids[:, start:]
+                if text_positions
+                else position_ids[:, :, start:]
+            )
+            position_embeddings = self.verifier_rotary_emb(
+                layer_values[:, 0, 0],
+                layer_positions,
+            )
+            bridge_output = layer.kv_bridge(
+                layer_keys,
+                layer_values,
+                position_embeddings,
+            )
+            mapped_caches.append((bridge_output.keys, bridge_output.values))
+        return mapped_caches
 
     @classmethod
     def from_training_args(
@@ -132,6 +252,15 @@ class KVNativeDSparkDraftModel(DSparkDraftModel):
             verifier_partial_rotary_factor=kwargs["verifier_partial_rotary_factor"],
             verifier_rope_theta=kwargs["verifier_rope_theta"],
             verifier_mrope_section=kwargs["verifier_mrope_section"],
+            kv_bridge_enabled=kwargs.get("kv_bridge_enabled", False),
+            kv_bridge_rank=kwargs.get("kv_bridge_rank", 32),
+            kv_bridge_residual_scale=kwargs.get("kv_bridge_residual_scale", 1.0),
+            kv_bridge_max_correction_ratio=kwargs.get(
+                "kv_bridge_max_correction_ratio"
+            ),
+            kv_bridge_normalize_keys=kwargs.get(
+                "kv_bridge_normalize_keys", False
+            ),
             num_speculative_tokens=kwargs["num_speculative_tokens"],
         )
         model = cls(config=config)
@@ -213,19 +342,8 @@ class KVNativeDSparkDraftModel(DSparkDraftModel):
                 "per_position_loss_weight", "fixed-exp-decay"
             ),
             "dpace_alpha": kwargs.get("dpace_alpha", 0.5),
-            "local_kv_loss_alpha": kwargs.get("local_kv_loss_alpha", 0.1),
-            "query_key_loss_alpha": kwargs.get("query_key_loss_alpha", 1.0),
-            "attention_value_loss_alpha": kwargs.get("attention_value_loss_alpha", 1.0),
         }
         return dict(shared), dict(shared)
-
-    @staticmethod
-    def _teacher_local_kv(
-        tensor: torch.Tensor,
-        anchored_indices: torch.Tensor,
-        layer_index: int,
-    ) -> torch.Tensor:
-        return tensor[:, anchored_indices, layer_index]
 
     def _teacher_targets(
         self,
@@ -268,9 +386,6 @@ class KVNativeDSparkDraftModel(DSparkDraftModel):
         confidence_head_alpha: float = 1.0,
         per_position_loss_weight: str = "fixed-exp-decay",
         dpace_alpha: float = 0.5,
-        local_kv_loss_alpha: float = 0.1,
-        query_key_loss_alpha: float = 1.0,
-        attention_value_loss_alpha: float = 1.0,
         **kwargs,
     ):
         if hidden_states.shape[:2] != input_ids.shape:
@@ -343,33 +458,30 @@ class KVNativeDSparkDraftModel(DSparkDraftModel):
             anchored_indices,
         )
 
-        artifacts: list[KVLayerArtifacts] = []
-        teacher_keys: list[torch.Tensor] = []
-        teacher_values: list[torch.Tensor] = []
+        bridge_diagnostics: list[KVBridgeDiagnostics] = []
+        if self.config.kv_bridge_enabled:
+            layer_keys = verifier_keys.permute(0, 2, 3, 1, 4)
+            layer_values = verifier_values.permute(0, 2, 3, 1, 4)
         for layer_idx, layer in enumerate(self.kv_native_layers):
-            source_index = self._verifier_kv_mapping_indices[layer_idx]
             attention_mask = (
                 sliding_mask if layer_idx in self.sliding_window_indices else full_mask
             )
-            noise_embedding, layer_artifacts = layer(
+            if not self.config.kv_bridge_enabled:
+                source_index = self._verifier_kv_mapping_indices[layer_idx]
+                layer_keys = verifier_keys[:, :, source_index].transpose(1, 2)
+                layer_values = verifier_values[:, :, source_index].transpose(1, 2)
+            noise_embedding, layer_diagnostics = layer(
                 hidden_states=noise_embedding,
-                verifier_keys=verifier_keys[:, :, source_index].transpose(1, 2),
-                verifier_values=verifier_values[:, :, source_index].transpose(1, 2),
+                verifier_keys=layer_keys,
+                verifier_values=layer_values,
                 attention_mask=attention_mask,
                 verifier_position_embeddings=verifier_position_embeddings,
                 **kwargs,
             )
-            artifacts.append(layer_artifacts)
-            teacher_keys.append(
-                self._teacher_local_kv(
-                    verifier_keys, anchored_indices, source_index
-                )
-            )
-            teacher_values.append(
-                self._teacher_local_kv(
-                    verifier_values, anchored_indices, source_index
-                )
-            )
+            if self.config.kv_bridge_enabled:
+                if layer_diagnostics is None:
+                    raise RuntimeError("KV bridge layer did not return diagnostics")
+                bridge_diagnostics.append(layer_diagnostics)
 
         hidden = self.norm(noise_embedding)
         logits = self.lm_head(hidden)
@@ -427,22 +539,35 @@ class KVNativeDSparkDraftModel(DSparkDraftModel):
             dpace_alpha=dpace_alpha,
             sample_from_anchor=self.config.sample_from_anchor,
         )
-        loss, metrics = add_kv_native_losses(
-            loss,
-            metrics,
-            predicted_keys=torch.stack(
-                [item.local_keys for item in artifacts], dim=2
-            ),
-            predicted_values=torch.stack(
-                [item.local_values for item in artifacts], dim=2
-            ),
-            teacher_keys=torch.stack(teacher_keys, dim=2),
-            teacher_values=torch.stack(teacher_values, dim=2),
-            queries=torch.stack([item.queries for item in artifacts], dim=2),
-            loss_mask=aligned_loss_mask,
-            block_size=self.block_size,
-            local_kv_loss_alpha=local_kv_loss_alpha,
-            query_key_loss_alpha=query_key_loss_alpha,
-            attention_value_loss_alpha=attention_value_loss_alpha,
-        )
+        if self.config.kv_bridge_enabled:
+            one = torch.ones((), device=loss.device)
+            diagnostic_metrics = (
+                (
+                    "key_correction_ratio",
+                    torch.stack(
+                        [item.key_correction_ratio for item in bridge_diagnostics]
+                    ).mean(),
+                ),
+                (
+                    "value_correction_ratio",
+                    torch.stack(
+                        [item.value_correction_ratio for item in bridge_diagnostics]
+                    ).mean(),
+                ),
+                (
+                    "key_gate_entropy",
+                    torch.stack(
+                        [item.key_gate_entropy for item in bridge_diagnostics]
+                    ).mean(),
+                ),
+                (
+                    "value_gate_entropy",
+                    torch.stack(
+                        [item.value_gate_entropy for item in bridge_diagnostics]
+                    ).mean(),
+                ),
+            )
+            for name, value in diagnostic_metrics:
+                metrics[f"kv_bridge_{name}_sum"] = value.detach()
+                metrics[f"kv_bridge_{name}_total"] = one.clone()
         return None, loss, metrics

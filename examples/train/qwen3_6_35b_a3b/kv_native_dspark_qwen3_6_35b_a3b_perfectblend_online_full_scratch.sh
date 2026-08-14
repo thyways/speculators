@@ -2,8 +2,9 @@
 # KV-native DSpark trained FROM SCRATCH on Qwen3.6-35B-A3B (R0: 5 SWA + 1 Full).
 #
 # The verifier exports only its final hidden state plus six selected full-attention
-# K/V layers. The draft and its identity-initialized KV-space adapters are trained
-# jointly for one full pass over the 500K corpus.
+# K/V layers. The draft uses either identity-initialized KV-space adapters or an
+# opt-in all-layer gated target-to-draft bridge and trains for one full pass over
+# the 500K corpus.
 #
 # Run this as the cluster job command; do not wrap it in nohup. It does not
 # manage or terminate pre-existing GPU jobs -- stop the GPU-hold script first.
@@ -11,8 +12,9 @@
 
 set -Eeuo pipefail
 
-ROOT="/inspire/sfs/project/inf-multimodal/public/wumengke"
-REPO="$ROOT/speculators"
+ROOT="${ROOT:-/inspire/sfs/project/inf-multimodal/public/wumengke}"
+REPO="${REPO:-$ROOT/speculators}"
+ENV_REPO="${ENV_REPO:-$REPO}"
 MODEL="$ROOT/model_weights/Qwen/Qwen3.6-35B-A3B"
 DATA_DIR="$ROOT/datasets/qwen3_6_35b_500k"
 
@@ -29,9 +31,16 @@ MAX_STEPS="${MAX_STEPS:-}"
 DEFAULT_LOSS_FN='{"ce": 0.1, "tv": 0.9}'
 
 IFS=' ' read -r -a VERIFIER_KV_LAYER_IDS \
-    <<< "${VERIFIER_KV_LAYER_IDS:-3 11 19 27 35 39}"
+    <<< "${VERIFIER_KV_LAYER_IDS:-3 11 19 27 31 39}"
 IFS=' ' read -r -a VERIFIER_KV_LAYER_MAPPING \
     <<< "${VERIFIER_KV_LAYER_MAPPING:-${VERIFIER_KV_LAYER_IDS[*]}}"
+
+KV_BRIDGE_ENABLED="${KV_BRIDGE_ENABLED:-0}"
+KV_BRIDGE_RANK="${KV_BRIDGE_RANK:-32}"
+KV_BRIDGE_RESIDUAL_SCALE="${KV_BRIDGE_RESIDUAL_SCALE:-1.0}"
+KV_BRIDGE_MAX_CORRECTION_RATIO="${KV_BRIDGE_MAX_CORRECTION_RATIO:-}"
+KV_BRIDGE_NORMALIZE_KEYS="${KV_BRIDGE_NORMALIZE_KEYS:-0}"
+KV_BRIDGE_LR="${KV_BRIDGE_LR:-}"
 
 JOB_TAG="${SLURM_JOB_ID:-${JOB_ID:-$$}}"
 RUN_NAME="${RUN_NAME:-kv_native_scratch_r0_${JOB_TAG}}"
@@ -39,9 +48,9 @@ HIDDEN_STATES_DIR="${HIDDEN_STATES_DIR:-${TMPDIR:-/tmp}/\
 kv_native_scratch_qwen3_6_35b_${JOB_TAG}_hidden_states}"
 VLLM_LOG="$RUN_DIR/vllm_${JOB_TAG}.log"
 
-SPEC_PYTHON="$REPO/speculators_venv/bin/python"
-TORCHRUN="$REPO/speculators_venv/bin/torchrun"
-VLLM_PYTHON="$REPO/vllm_venv/bin/python"
+SPEC_PYTHON="$ENV_REPO/speculators_venv/bin/python"
+TORCHRUN="$ENV_REPO/speculators_venv/bin/torchrun"
+VLLM_PYTHON="$ENV_REPO/vllm_venv/bin/python"
 LOCAL_PYTHONPATH="$REPO/src:$REPO/hs_connectors/src"
 
 for executable in "$SPEC_PYTHON" "$TORCHRUN" "$VLLM_PYTHON"; do
@@ -71,9 +80,23 @@ for command in setsid curl flock; do
     fi
 done
 
-if (( ${#VERIFIER_KV_LAYER_MAPPING[@]} != 6 )); then
+if (( KV_BRIDGE_ENABLED == 0 && ${#VERIFIER_KV_LAYER_MAPPING[@]} != 6 )); then
     echo "VERIFIER_KV_LAYER_MAPPING must contain one ID per draft layer (6)" >&2
     exit 1
+fi
+if [[ "$KV_BRIDGE_ENABLED" != "0" && "$KV_BRIDGE_ENABLED" != "1" ]]; then
+    echo "KV_BRIDGE_ENABLED must be 0 or 1" >&2
+    exit 1
+fi
+if (( KV_BRIDGE_ENABLED == 1 )); then
+    if [[ "$KV_BRIDGE_NORMALIZE_KEYS" != "0" && "$KV_BRIDGE_NORMALIZE_KEYS" != "1" ]]; then
+        echo "KV_BRIDGE_NORMALIZE_KEYS must be 0 or 1" >&2
+        exit 1
+    fi
+    if [[ ! "$KV_BRIDGE_RANK" =~ ^[1-9][0-9]*$ ]]; then
+        echo "KV_BRIDGE_RANK must be a positive integer" >&2
+        exit 1
+    fi
 fi
 
 # Preserve scheduler-provided device identifiers, including UUID lists. On a
@@ -119,7 +142,6 @@ TRAIN_ARGS=(
     --save-path "$CHECKPOINT_DIR"
     --speculator-type kv_native_dspark
     --verifier-kv-layer-ids "${VERIFIER_KV_LAYER_IDS[@]}"
-    --verifier-kv-layer-mapping "${VERIFIER_KV_LAYER_MAPPING[@]}"
     --verifier-num-key-value-heads 2
     --verifier-head-dim 256
     --verifier-partial-rotary-factor 0.25
@@ -143,9 +165,6 @@ TRAIN_ARGS=(
     --confidence-head-with-markov
     --confidence-head-alpha "${CONFIDENCE_HEAD_ALPHA:-1.0}"
     --loss-fn "${LOSS_FN:-$DEFAULT_LOSS_FN}"
-    --local-kv-loss-alpha "${LOCAL_KV_LOSS_ALPHA:-0.1}"
-    --query-key-loss-alpha "${QUERY_KEY_LOSS_ALPHA:-1.0}"
-    --attention-value-loss-alpha "${ATTENTION_VALUE_LOSS_ALPHA:-1.0}"
     --optimizer adamw
     --lr "${LR:-6e-4}"
     --weight-decay "${WEIGHT_DECAY:-0.01}"
@@ -169,9 +188,30 @@ TRAIN_ARGS=(
     --logger tensorboard
     --log-dir "$TENSORBOARD_DIR"
     --run-name "$RUN_NAME"
-    --log-freq "${LOG_FREQ:-10}"
     --seed "${SEED:-42}"
 )
+if (( KV_BRIDGE_ENABLED == 1 )); then
+    TRAIN_ARGS+=(
+        --kv-bridge-enabled
+        --kv-bridge-rank "$KV_BRIDGE_RANK"
+        --kv-bridge-residual-scale "$KV_BRIDGE_RESIDUAL_SCALE"
+    )
+    if [[ -n "$KV_BRIDGE_MAX_CORRECTION_RATIO" ]]; then
+        TRAIN_ARGS+=(
+            --kv-bridge-max-correction-ratio "$KV_BRIDGE_MAX_CORRECTION_RATIO"
+        )
+    fi
+    if (( KV_BRIDGE_NORMALIZE_KEYS == 1 )); then
+        TRAIN_ARGS+=(--kv-bridge-normalize-keys)
+    fi
+    if [[ -n "$KV_BRIDGE_LR" ]]; then
+        TRAIN_ARGS+=(--kv-bridge-lr "$KV_BRIDGE_LR")
+    fi
+else
+    TRAIN_ARGS+=(
+        --verifier-kv-layer-mapping "${VERIFIER_KV_LAYER_MAPPING[@]}"
+    )
+fi
 if [[ -n "$MAX_STEPS" ]]; then
     TRAIN_ARGS+=(
         --max-steps "$MAX_STEPS"
@@ -200,7 +240,13 @@ if config.draft.from_pretrained:
 print(
     "Config validation passed:",
     f"type={config.speculator_type}",
-    f"mapping={config.kv_native_dspark.verifier_kv_layer_mapping}",
+    f"bridge={config.kv_native_dspark.kv_bridge_enabled}",
+    f"bridge_sources={config.kv_native_dspark.verifier_kv_layer_ids}",
+    f"bridge_rank={config.kv_native_dspark.kv_bridge_rank}",
+    f"bridge_scale={config.kv_native_dspark.kv_bridge_residual_scale}",
+    f"bridge_cap={config.kv_native_dspark.kv_bridge_max_correction_ratio}",
+    f"bridge_key_norm={config.kv_native_dspark.kv_bridge_normalize_keys}",
+    f"bridge_lr={config.optimizer.kv_bridge_lr}",
     f"max_steps={config.trainer.max_steps}",
 )
 PY
@@ -315,7 +361,14 @@ echo "Repository:          $REPO"
 echo "Verifier:            $MODEL"
 echo "Data:                $DATA_DIR"
 echo "Init:                from scratch"
-echo "KV layer mapping:    ${VERIFIER_KV_LAYER_MAPPING[*]}"
+echo "Verifier KV layers:  ${VERIFIER_KV_LAYER_IDS[*]}"
+if (( KV_BRIDGE_ENABLED == 1 )); then
+    echo "KV bridge:           learned all-layer fusion (rank=$KV_BRIDGE_RANK, "\
+"scale=$KV_BRIDGE_RESIDUAL_SCALE, cap=${KV_BRIDGE_MAX_CORRECTION_RATIO:-none}, "\
+"key_norm=$KV_BRIDGE_NORMALIZE_KEYS, lr=${KV_BRIDGE_LR:-base})"
+else
+    echo "KV layer mapping:    ${VERIFIER_KV_LAYER_MAPPING[*]}"
+fi
 echo "Hidden state export: final layer only (teacher logits)"
 echo "Checkpoints:         $CHECKPOINT_DIR (every ${CHECKPOINT_FREQ:-0.1} epoch)"
 echo "TensorBoard:         $TENSORBOARD_DIR/$RUN_NAME"

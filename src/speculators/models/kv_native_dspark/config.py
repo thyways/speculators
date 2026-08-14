@@ -28,14 +28,14 @@ class KVNativeDSparkSpeculatorConfig(DSparkSpeculatorConfig):
         ),
     )
     verifier_kv_layer_ids: list[int] = Field(
-        default_factory=lambda: [3, 11, 19, 27, 35, 39],
+        default_factory=lambda: [3, 11, 19, 27, 31, 39],
         description="Verifier full-attention layers exported by the vLLM connector.",
     )
     verifier_kv_layer_mapping: list[int] = Field(
-        default_factory=lambda: [3, 11, 19, 27, 35, 39],
+        default_factory=lambda: [3, 11, 19, 27, 31, 39],
         description=(
-            "One verifier K/V layer selected for each draft layer. Must be a "
-            "subset of verifier_kv_layer_ids."
+            "Direct-read mode only: one verifier K/V layer selected for each "
+            "draft layer. The learned bridge consumes every exported layer."
         ),
     )
     verifier_num_key_value_heads: int = Field(default=2, gt=0)
@@ -43,6 +43,44 @@ class KVNativeDSparkSpeculatorConfig(DSparkSpeculatorConfig):
     verifier_partial_rotary_factor: float = Field(default=0.25, gt=0.0, le=1.0)
     verifier_rope_theta: float = Field(default=10_000_000.0, gt=0.0)
     verifier_mrope_section: list[int] = Field(default_factory=lambda: [11, 11, 10])
+    kv_bridge_enabled: bool = Field(
+        default=False,
+        description=(
+            "Fuse every exported verifier K/V layer into a draft-consumable cache "
+            "instead of moving draft Q/local K/V into verifier space."
+        ),
+    )
+    kv_bridge_rank: int = Field(
+        default=32,
+        gt=0,
+        description=(
+            "Width of each per-source low-rank projection in the learned all-layer "
+            "KV fusion bridge."
+        ),
+    )
+    kv_bridge_residual_scale: float = Field(
+        default=1.0,
+        ge=0.0,
+        description=(
+            "Fixed multiplier on the learned low-rank correction added to the "
+            "softmax-fused verifier K/V base."
+        ),
+    )
+    kv_bridge_max_correction_ratio: float | None = Field(
+        default=None,
+        gt=0.0,
+        description=(
+            "Optional per-token RMS cap on the learned correction relative to "
+            "the softmax-fused base. Unset preserves the original unbounded bridge."
+        ),
+    )
+    kv_bridge_normalize_keys: bool = Field(
+        default=False,
+        description=(
+            "Apply parameter-free per-token RMS normalization to mapped content "
+            "Keys before verifier MRoPE is restored."
+        ),
+    )
     num_speculative_tokens: int = Field(
         default=7,
         gt=0,
@@ -58,20 +96,23 @@ class KVNativeDSparkSpeculatorConfig(DSparkSpeculatorConfig):
         # no arguments: ``save_pretrained`` default-constructs the config class to
         # diff generation parameters, so anything that cross-checks two fields
         # whose defaults are independent would make every checkpoint save fail.
-        # The mapping-length invariant is therefore enforced where both sides are
-        # known to be real: ``TrainConfig`` for the CLI and
-        # ``KVNativeDSparkDraftModel`` for the model.
+        # The direct-read mapping-length invariant is therefore enforced where both
+        # sides are known to be real: ``TrainConfig`` for the CLI and
+        # ``KVNativeDSparkDraftModel`` for the model. The learned bridge has no
+        # manual source mapping; it always consumes every exported verifier layer.
         if not self.verifier_kv_layer_ids:
             raise ValueError("verifier_kv_layer_ids must not be empty")
         if len(self.verifier_kv_layer_ids) != len(set(self.verifier_kv_layer_ids)):
             raise ValueError("verifier_kv_layer_ids must not contain duplicates")
-        unknown = sorted(
-            set(self.verifier_kv_layer_mapping) - set(self.verifier_kv_layer_ids)
-        )
-        if unknown:
-            raise ValueError(
-                f"verifier_kv_layer_mapping references non-exported layers: {unknown}"
+        if not self.kv_bridge_enabled:
+            unknown = sorted(
+                set(self.verifier_kv_layer_mapping) - set(self.verifier_kv_layer_ids)
             )
+            if unknown:
+                raise ValueError(
+                    "verifier_kv_layer_mapping references non-exported layers: "
+                    f"{unknown}"
+                )
         rotary_dim = int(self.verifier_head_dim * self.verifier_partial_rotary_factor)
         if rotary_dim <= 0 or rotary_dim % 2:
             raise ValueError(

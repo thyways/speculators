@@ -53,7 +53,7 @@ def test_from_flat_inverts_flatten():
     cfg = TrainConfig(
         speculator_type="dspark",
         draft=DraftArgs(num_layers=4, full_attention_indices=[2, 18, 33]),
-        optimizer=OptimizerArgs(lr=3e-4),
+        optimizer=OptimizerArgs(lr=3e-4, kv_bridge_lr=3e-5),
     )
     assert TrainConfig.from_flat(cfg.flatten()) == cfg
 
@@ -135,9 +135,57 @@ def test_kv_native_rejects_auxiliary_hidden_layers():
 def test_kv_native_defaults_to_spec7():
     cfg = _kv_native_config()
     assert cfg.kv_native_dspark.num_speculative_tokens == 7
-    assert cfg.kv_native_dspark.verifier_kv_layer_ids == [3, 11, 19, 27, 35, 39]
+    assert cfg.kv_native_dspark.verifier_kv_layer_ids == [3, 11, 19, 27, 31, 39]
 
 
 def test_kv_native_rejects_speculative_length_beyond_block():
     with pytest.raises(ValueError, match="num-speculative-tokens exceeds"):
         _kv_native_config(num_speculative_tokens=9)
+
+
+def test_kv_bridge_uses_all_exported_layers_without_manual_mapping():
+    cfg = _kv_native_config(
+        kv_bridge_enabled=True,
+        kv_bridge_rank=16,
+        verifier_kv_layer_mapping=[],
+    )
+    assert cfg.kv_native_dspark.kv_bridge_enabled is True
+    assert cfg.kv_native_dspark.kv_bridge_rank == 16
+    assert cfg.kv_native_dspark.verifier_kv_layer_mapping == []
+
+
+def test_kv_bridge_stability_fields_round_trip_through_flat_schema():
+    cfg = _kv_native_config(
+        kv_bridge_enabled=True,
+        kv_bridge_residual_scale=0.1,
+        kv_bridge_max_correction_ratio=0.5,
+        kv_bridge_normalize_keys=True,
+    )
+    cfg.optimizer.kv_bridge_lr = 6e-5
+    recovered = TrainConfig.from_flat(cfg.flatten())
+    assert recovered.kv_native_dspark.kv_bridge_residual_scale == pytest.approx(0.1)
+    assert recovered.kv_native_dspark.kv_bridge_max_correction_ratio == pytest.approx(
+        0.5
+    )
+    assert recovered.kv_native_dspark.kv_bridge_normalize_keys is True
+    assert recovered.optimizer.kv_bridge_lr == pytest.approx(6e-5)
+
+
+def test_kv_bridge_ignores_direct_read_mapping():
+    cfg = _kv_native_config(
+        kv_bridge_enabled=True,
+        verifier_kv_layer_mapping=[999],
+    )
+    assert cfg.kv_native_dspark.kv_bridge_enabled is True
+
+
+def test_kv_direct_read_rejects_wrong_mapping_length():
+    with pytest.raises(ValueError, match="verifier-kv-layer-mapping"):
+        _kv_native_config(verifier_kv_layer_mapping=[3, 11])
+
+
+def test_kv_direct_read_rejects_non_exported_layer():
+    with pytest.raises(ValueError, match="non-exported layers"):
+        _kv_native_config(
+            verifier_kv_layer_mapping=[3, 11, 19, 27, 31, 35],
+        )
