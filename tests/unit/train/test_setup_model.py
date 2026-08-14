@@ -192,6 +192,13 @@ def checkpoint_dir(tmp_path, tiny_model_on_gpu):
     ckpt_dir = tmp_path / "ckpt"
     checkpointer = SingleGPUCheckpointer(ckpt_dir)
     optimizer = torch.optim.AdamW(tiny_model_on_gpu.parameters(), lr=1e-4)
+    # Materialize AdamW's moment tensors so distributed resume verifies real
+    # optimizer state rather than an empty pre-step state dict.
+    for parameter in tiny_model_on_gpu.parameters():
+        if parameter.requires_grad:
+            parameter.grad = torch.zeros_like(parameter)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
     checkpointer.save_checkpoint(tiny_model_on_gpu, optimizer, epoch=0)
     return ckpt_dir
 

@@ -395,6 +395,12 @@ class Trainer:
         )
 
         def make_scheduler(opt: torch.optim.Optimizer):
+            # Legacy checkpoints may contain optimizer state without a scheduler
+            # state. PyTorch requires every parameter group to expose its original
+            # learning rate when constructing a scheduler at last_epoch >= 0.
+            if last_epoch >= 0:
+                for param_group in opt.param_groups:
+                    param_group.setdefault("initial_lr", param_group["lr"])
             if self.config.scheduler_type == "linear":
                 return get_linear_schedule_with_warmup(
                     opt,
