@@ -97,6 +97,7 @@ class TestRunGuidellm:
         backend = cmd[idx + 1]
         assert "kind=openai_http" in backend
         assert "target=http://localhost:8000/v1" in backend
+        assert "request_format=/v1/chat/completions" in backend
         assert "max_tokens=4096" in backend
 
     def test_backend_gen_kwargs(self, perf_utils):
@@ -104,6 +105,12 @@ class TestRunGuidellm:
         idx = cmd.index("--backend")
         backend = cmd[idx + 1]
         assert "extras.body.temperature=0.6" in backend
+
+    def test_backend_greedy_temperature(self, perf_utils):
+        cmd = self._capture_cmd(perf_utils, gen_kwargs={"temperature": 0})
+        idx = cmd.index("--backend")
+        backend = cmd[idx + 1]
+        assert "extras.body.temperature=0" in backend
 
     def test_data_huggingface_with_subset(self, perf_utils):
         cmd = self._capture_cmd(perf_utils, subset="qa")
@@ -334,7 +341,26 @@ def _make_sweep_json(subset_name="qa"):
                 "config": {
                     "strategy": {"type_": "throughput"},
                 },
-                "metrics": {},
+                "metrics": {
+                    "requests_per_second": {
+                        "successful": {"median": 12.5},
+                    },
+                    "request_latency": {
+                        "successful": {"median": 0.25},
+                    },
+                    "inter_token_latency_ms": {
+                        "successful": {"median": 5.2},
+                    },
+                    "time_to_first_token_ms": {
+                        "successful": {"median": 22.0},
+                    },
+                    "output_tokens_per_second": {
+                        "successful": {"median": 85.0},
+                    },
+                    "output_tokens": {
+                        "successful": {"sum": 40000},
+                    },
+                },
             },
         ],
     }
@@ -355,6 +381,18 @@ class TestParseSweepFile:
         rows = perf_utils.parse_sweep_file(fp)
         strategies = [r["strategy"] for r in rows]
         assert "throughput" not in strategies
+
+    def test_includes_throughput_metrics_when_requested(self, perf_utils, tmp_path):
+        fp = tmp_path / "run_qa.json"
+        fp.write_text(json.dumps(_make_sweep_json()))
+        rows = perf_utils.parse_sweep_file(fp, include_throughput=True)
+        throughput = next(row for row in rows if row["strategy"] == "throughput")
+        assert throughput["subset"] == "qa"
+        assert throughput["latency_median_s"] == 0.25
+        assert throughput["ttft_median_ms"] == 22.0
+        assert throughput["itl_median_ms"] == 5.2
+        assert throughput["output_tps_median"] == 85.0
+        assert throughput["total_output_tokens"] == 40000
 
     def test_subset_from_filename(self, perf_utils, tmp_path):
         fp = tmp_path / "sweep_HumanEval.json"

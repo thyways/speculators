@@ -55,6 +55,7 @@ DEFAULT_SUBSETS = (
 )
 DEFAULT_MAX_CONCURRENCY = 128
 DEFAULT_MAX_REQUESTS = 200
+DEFAULT_MAX_OUTPUT_TOKENS = 4096
 DEFAULT_GEN_LEN_RATE = 128
 DEFAULT_SWEEP_RATE = 10
 DEFAULT_DATA_COLUMN_MAPPER = (
@@ -169,7 +170,7 @@ def _run_subset(
 
     logger.info("[%s] Starting", subset)
     safe = subset.replace("/", "_").replace(" ", "_")
-    max_tokens = 4096
+    max_tokens = args.max_output_tokens
 
     # For local JSONL files (SPEED-Bench) the dataset path IS the file —
     # no --data-args needed.  For HF datasets subset name doubles as the filter.
@@ -186,7 +187,7 @@ def _run_subset(
             rate=args.gen_len_rate,
             max_requests=None,
             output_path=gen_len_output,
-            max_tokens=4096,
+            max_tokens=args.max_output_tokens,
             gen_kwargs=parse_gen_kwargs(args.gen_kwargs),
         )
         mapping = parse_gen_len_results(
@@ -230,20 +231,22 @@ def _run_subset(
     else:
         logger.warning("[%s] No speculative decoding metrics found", subset)
 
-    if is_sweep:
-        rows = parse_sweep_results(
-            run_output,
-            spec if has_spec else None,
-        )
-        if rows:
-            if perf_csv is None:
-                acc_cols = acceptance_csv_columns(spec) if has_spec else []
-                cols = BASE_CSV_COLUMNS + acc_cols
-                perf_csv = CsvWriter(
-                    output_dir / "perf_results.csv",
-                    cols,
-                )
-            perf_csv.append_rows(rows)
+    rows = parse_sweep_results(
+        run_output,
+        spec if has_spec else None,
+        include_throughput=not is_sweep,
+    )
+    for row in rows:
+        row["subset"] = subset
+    if rows:
+        if perf_csv is None:
+            acc_cols = acceptance_csv_columns(spec) if has_spec else []
+            cols = BASE_CSV_COLUMNS + acc_cols
+            perf_csv = CsvWriter(
+                output_dir / "perf_results.csv",
+                cols,
+            )
+        perf_csv.append_rows(rows)
 
     logger.info("[%s] Complete", subset)
     return acceptance_csv, perf_csv, max_tokens if is_sweep else None
@@ -385,6 +388,15 @@ def main() -> None:
         type=int,
         default=DEFAULT_MAX_REQUESTS,
         help=f"Max requests per sweep point (default: {DEFAULT_MAX_REQUESTS})",
+    )
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=DEFAULT_MAX_OUTPUT_TOKENS,
+        help=(
+            "Maximum generated tokens per request "
+            f"(default: {DEFAULT_MAX_OUTPUT_TOKENS})"
+        ),
     )
     parser.add_argument(
         "--gen-len-rate",

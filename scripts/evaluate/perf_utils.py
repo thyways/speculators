@@ -229,8 +229,8 @@ def pretty_subset(name: str) -> str:
 
 
 def _extract_subset(filepath: Path) -> str:
-    """Extract subset name from gen_len_*.json or sweep(s)_*.json filenames."""
-    match = re.search(r"(?:gen_len|sweeps?)_(.+)\.json$", filepath.name)
+    """Extract the subset from evaluator artifact filenames."""
+    match = re.search(r"(?:gen_len|sweeps?|run)_(.+)\.json$", filepath.name)
     return match.group(1) if match else filepath.stem
 
 
@@ -360,8 +360,12 @@ def load_prometheus_file(path: Path | None) -> list[Metric]:
 # ---------------------------------------------------------------------------
 
 
-def parse_sweep_file(filepath: Path) -> list[dict]:
-    """Parse a single sweep JSON and return rows for the CSV."""
+def parse_sweep_file(
+    filepath: Path,
+    *,
+    include_throughput: bool = False,
+) -> list[dict]:
+    """Parse GuideLLM benchmark JSON and return performance CSV rows."""
     with filepath.open() as f:
         data = json.load(f)
 
@@ -374,7 +378,9 @@ def parse_sweep_file(filepath: Path) -> list[dict]:
     for bm in benchmarks:
         strategy = bm.get("config", {}).get("strategy", {})
         strategy_type = strategy.get("type_", "unknown")
-        if strategy_type in SKIP_STRATEGIES:
+        if strategy_type in SKIP_STRATEGIES and not (
+            include_throughput and strategy_type == "throughput"
+        ):
             continue
 
         metrics = bm.get("metrics", {})
@@ -448,9 +454,11 @@ def parse_gen_len_results(files: list[Path], output: Path) -> dict[str, int]:
 def parse_sweep_results(
     filepath: Path,
     spec_decode_metrics: dict[str, float] | None = None,
+    *,
+    include_throughput: bool = False,
 ) -> list[dict]:
-    """Parse a sweep JSON and enrich rows with pre-computed acceptance metrics."""
-    rows = parse_sweep_file(filepath)
+    """Parse benchmark JSON and enrich rows with acceptance metrics."""
+    rows = parse_sweep_file(filepath, include_throughput=include_throughput)
     if spec_decode_metrics:
         for row in rows:
             row.update(spec_decode_metrics)
@@ -558,7 +566,10 @@ def run_guidellm(
     max_tokens: int,
     gen_kwargs: dict | None = None,
 ) -> None:
-    backend = f"kind=openai_http,target={target},max_tokens={max_tokens}"
+    backend = (
+        f"kind=openai_http,target={target},"
+        f"request_format=/v1/chat/completions,max_tokens={max_tokens}"
+    )
     for k, v in (gen_kwargs or {}).items():
         backend += f",extras.body.{k}={v}"
     cmd = ["guidellm", "run", "--backend", backend]
