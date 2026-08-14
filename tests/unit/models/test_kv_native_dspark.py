@@ -5,6 +5,8 @@ import pytest
 import torch
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
 
+from speculators.losses import resolve_loss_config
+from speculators.losses.eager import tv_loss
 from speculators.models.kv_native_dspark.config import (
     KVNativeDSparkSpeculatorConfig,
 )
@@ -16,6 +18,11 @@ from speculators.models.kv_native_dspark.model_definitions import (
     apply_partial_rotary_pos_emb,
     remove_partial_rotary_pos_emb,
 )
+
+_EAGER_LOSS_KWARGS = {
+    "loss_config": resolve_loss_config("kl_div", "eager"),
+    "tv_loss_fn": tv_loss,
+}
 
 
 def test_partial_rotary_preserves_pass_through_dimensions():
@@ -281,6 +288,7 @@ def test_tiny_kv_native_forward_backward_smoke():
         verifier_values=torch.randn(1, seq_len, 2, 1, 8),
         verifier_kv_layer_ids=torch.tensor([1, 3]),
         max_anchors=2,
+        **_EAGER_LOSS_KWARGS,
     )
     assert torch.isfinite(loss)
     loss.backward()
@@ -303,6 +311,7 @@ def test_tiny_kv_bridge_forward_backward_smoke():
         verifier_values=torch.randn(1, seq_len, 2, 1, 8),
         verifier_kv_layer_ids=torch.tensor([1, 3]),
         max_anchors=2,
+        **_EAGER_LOSS_KWARGS,
     )
     assert torch.isfinite(loss)
     loss.backward()
@@ -346,6 +355,7 @@ def test_tiny_bounded_bridge_uses_dspark_loss():
         verifier_values=torch.randn(1, seq_len, 2, 1, 8),
         verifier_kv_layer_ids=torch.tensor([1, 3]),
         max_anchors=2,
+        **_EAGER_LOSS_KWARGS,
     )
 
     loss.backward()

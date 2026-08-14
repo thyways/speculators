@@ -1,5 +1,5 @@
+from speculators.losses import kl_div_loss
 from speculators.models.dfly import DFlyDraftModel
-from speculators.models.metrics import kl_div_loss
 from speculators.train.config import TrainConfig
 
 

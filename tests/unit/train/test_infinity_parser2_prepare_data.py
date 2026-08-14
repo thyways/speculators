@@ -44,14 +44,17 @@ def _patch_pipeline(
     raw: Dataset,
     *,
     dropped_ranks: set[int] | None = None,
+    fanout_by_rank: dict[int, int] | None = None,
 ) -> None:
     dropped_ranks = dropped_ranks or set()
+    fanout_by_rank = fanout_by_rank or {}
 
     def fake_build(dataset, *, preserve_columns, **_kwargs):
         rows = [
             dataset[index]
             for index in range(len(dataset))
             if dataset[index]["_candidate_rank"] not in dropped_ranks
+            for _ in range(fanout_by_rank.get(dataset[index]["_candidate_rank"], 1))
         ]
         result = Dataset.from_dict(
             {
@@ -76,7 +79,11 @@ def _patch_pipeline(
         "load_raw_dataset",
         lambda _path: (raw, None),
     )
-    monkeypatch.setattr(prepare_module, "build_eagle3_dataset", fake_build)
+    monkeypatch.setattr(
+        prepare_module,
+        "build_speculator_training_dataset",
+        fake_build,
+    )
 
 
 def _args(tmp_path: Path, target_samples: int) -> SimpleNamespace:
@@ -87,7 +94,7 @@ def _args(tmp_path: Path, target_samples: int) -> SimpleNamespace:
         ranked_target_samples=target_samples,
         seq_length=8,
         token_freq_train_ratio=0.67,
-        assistant_pattern=None,
+        render_endpoint="http://127.0.0.1:8000",
         minimum_valid_tokens=None,
         num_preprocessing_workers=1,
         preprocessing_batch_size=2,
@@ -103,6 +110,7 @@ def test_ranked_preprocessing_backfills_and_uses_train_prefix(
         monkeypatch,
         _raw_dataset([4, 0, 3, 1, 2]),
         dropped_ranks={1},
+        fanout_by_rank={0: 2, 2: 3},
     )
     captured = {}
 
@@ -119,15 +127,18 @@ def test_ranked_preprocessing_backfills_and_uses_train_prefix(
     dataset = prepare_module.prepare_ranked_dataset(args)
 
     plain = dataset.with_format(None)
-    assert plain["candidate_rank"] == [0, 2, 3]
-    assert captured["dataset"]["candidate_rank"] == [0, 2]
+    assert plain["candidate_rank"] == [0, 0, 2, 2, 2, 3]
+    assert captured["dataset"]["_candidate_rank"] == [0, 0, 2, 2, 2]
     assert captured["output_path"] == tmp_path / "token_freq.pt"
     metadata = json.loads(dataset.info.description)["ranked_preprocessing"]
     assert metadata == {
-        "dataset_order": "candidate_rank_ascending",
+        "dataset_order": "candidate_rank_ascending_assistant_turn",
         "eligible_records": 4,
+        "eligible_training_rows": 7,
         "generation_config_sha256": "b" * 64,
         "sample_manifest_sha256": "a" * 64,
+        "selected_records": 3,
+        "selected_training_rows": 6,
     }
 
 
@@ -166,12 +177,16 @@ def test_selection_manifest_is_minimal_and_published_last(tmp_path: Path):
     output.mkdir()
     dataset = Dataset.from_dict(
         {
-            "input_ids": [[10, 11], [12, 13]],
-            "loss_mask": [[0, 1], [0, 1]],
-            "seq_len": [2, 2],
-            "id": ["v1.12:0000000003", "v1.12:0000000001"],
-            "source_line_index": [3, 1],
-            "candidate_rank": [0, 2],
+            "input_ids": [[10, 11], [10, 12], [12, 13]],
+            "loss_mask": [[0, 1], [0, 1], [0, 1]],
+            "seq_len": [2, 2, 2],
+            "id": [
+                "v1.12:0000000003",
+                "v1.12:0000000003",
+                "v1.12:0000000001",
+            ],
+            "source_line_index": [3, 3, 1],
+            "candidate_rank": [0, 0, 2],
         }
     )
     dataset.info.description = json.dumps(
@@ -179,6 +194,8 @@ def test_selection_manifest_is_minimal_and_published_last(tmp_path: Path):
             "ranked_preprocessing": {
                 "sample_manifest_sha256": "a" * 64,
                 "generation_config_sha256": "b" * 64,
+                "selected_records": 2,
+                "selected_training_rows": 3,
             }
         }
     )
@@ -191,6 +208,7 @@ def test_selection_manifest_is_minimal_and_published_last(tmp_path: Path):
     assert manifest == {
         "complete": True,
         "target_records": 2,
+        "training_rows": 3,
         "sample_manifest_sha256": "a" * 64,
         "generation_config_sha256": "b" * 64,
         "selection": {

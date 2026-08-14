@@ -227,7 +227,7 @@ class BaseDataset(Dataset):
 
 
 class ArrowDataset(BaseDataset):
-    def __init__(  # noqa: PLR0917
+    def __init__(
         self,
         max_len: int,
         datapath: str | PathLike,
@@ -365,8 +365,6 @@ class ArrowDataset(BaseDataset):
                         f"{cleanup_error}",
                         stacklevel=1,
                     )
-            if isinstance(e, ValueError) and ("NaN" in str(e) or "Inf" in str(e)):
-                raise
             if self.fail_on_hidden_state_error:
                 raise RuntimeError(
                     f"Online hidden-state generation failed for sample {index}"
@@ -379,7 +377,7 @@ class ArrowDataset(BaseDataset):
 
         return loaded_hs
 
-    def _get_raw_data(self, index):
+    def _get_raw_data(self, index):  # noqa: C901
         file_idx = self._map_to_file_idx(index)
         # KV-native training is deliberately online-only: ignore any persistent
         # hidden-state cache and request a fresh verifier payload for every sample.
@@ -558,7 +556,7 @@ class SampleFileDataset(BaseDataset):
 class CollateFn:
     """Picklable collate function for use with ``multiprocessing_context='spawn'``."""
 
-    def __init__(  # noqa: PLR0917
+    def __init__(
         self,
         max_len: int,
         hidden_size: int,

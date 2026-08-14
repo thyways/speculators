@@ -1,7 +1,7 @@
 import warnings
 
+from speculators.losses import kl_div_loss
 from speculators.models.domino import DominoDraftModel
-from speculators.models.metrics import kl_div_loss
 from speculators.train.config import TrainConfig
 
 
@@ -58,9 +58,7 @@ def test_domino_reads_the_shared_dflash_group_without_warning():
         )
 
     group_warnings = [
-        str(item.message)
-        for item in caught
-        if "algorithm group" in str(item.message)
+        str(item.message) for item in caught if "algorithm group" in str(item.message)
     ]
     assert not group_warnings, group_warnings
 
@@ -88,9 +86,7 @@ def test_domino_settings_warn_under_another_speculator_type():
 
 def test_domino_reuses_dflash_training_loss_arguments():
     args = TrainConfig(speculator_type="domino").flatten()
-    train_kwargs, validation_kwargs = DominoDraftModel.get_trainer_kwargs(
-        **args
-    )
+    train_kwargs, validation_kwargs = DominoDraftModel.get_trainer_kwargs(**args)
 
     assert train_kwargs["loss_config"]["kl_div"][0] is kl_div_loss
     assert validation_kwargs["loss_config"]["kl_div"][0] is kl_div_loss

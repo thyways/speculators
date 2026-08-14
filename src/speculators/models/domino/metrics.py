@@ -20,10 +20,10 @@ from typing import Any
 
 import torch
 
+from speculators.losses import LossConfig
 from speculators.models.dflash.metrics import (
     compute_metrics as dflash_compute_metrics,
 )
-from speculators.models.metrics import LossConfig
 
 __all__ = [
     "compute_metrics",
@@ -73,12 +73,8 @@ def compute_metrics(
         # reducer reports it as an unused parameter.
         loss = (1.0 - lambda_base) * final_loss + lambda_base * base_loss
         for key in _BASE_METRIC_KEYS:
-            metrics[f"base_{key}_sum"] = (
-                base_metrics[f"{key}_sum"].detach().clone()
-            )
-            metrics[f"base_{key}_total"] = (
-                base_metrics[f"{key}_total"].detach().clone()
-            )
+            metrics[f"base_{key}_sum"] = base_metrics[f"{key}_sum"].detach().clone()
+            metrics[f"base_{key}_total"] = base_metrics[f"{key}_total"].detach().clone()
     else:
         loss = final_loss
 

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 from transformers import PretrainedConfig
 
+from speculators.losses import LossConfig, kl_div_loss, resolve_loss_config, tv_loss
 from speculators.model import SpeculatorModel
 from speculators.models.dflash.utils import get_base_indices_for_anchored_blocks
 from speculators.models.dspark.core import DSparkDraftModel
@@ -17,8 +18,10 @@ from speculators.models.kv_native_dspark.model_definitions import (
     Qwen3KVNativeDecoderLayer,
     VerifierRotaryEmbedding,
 )
-from speculators.models.metrics import LossConfig, kl_div_loss, resolve_loss_config
 from speculators.models.utils import conditional_torch_compile, get_verifier_config
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _DEFAULT_LOSS_CONFIG: LossConfig = {"kl_div": (kl_div_loss, 1.0)}
 _TEXT_POSITION_IDS_NDIM = 2
@@ -255,12 +258,8 @@ class KVNativeDSparkDraftModel(DSparkDraftModel):
             kv_bridge_enabled=kwargs.get("kv_bridge_enabled", False),
             kv_bridge_rank=kwargs.get("kv_bridge_rank", 32),
             kv_bridge_residual_scale=kwargs.get("kv_bridge_residual_scale", 1.0),
-            kv_bridge_max_correction_ratio=kwargs.get(
-                "kv_bridge_max_correction_ratio"
-            ),
-            kv_bridge_normalize_keys=kwargs.get(
-                "kv_bridge_normalize_keys", False
-            ),
+            kv_bridge_max_correction_ratio=kwargs.get("kv_bridge_max_correction_ratio"),
+            kv_bridge_normalize_keys=kwargs.get("kv_bridge_normalize_keys", False),
             num_speculative_tokens=kwargs["num_speculative_tokens"],
         )
         model = cls(config=config)
@@ -333,8 +332,10 @@ class KVNativeDSparkDraftModel(DSparkDraftModel):
 
     @staticmethod
     def get_trainer_kwargs(**kwargs) -> tuple[dict, dict]:
+        implementation = kwargs.get("loss_implementation", "fused")
         shared = {
-            "loss_config": resolve_loss_config(kwargs["loss_fn"]),
+            "loss_config": resolve_loss_config(kwargs["loss_fn"], implementation),
+            "tv_loss_fn": resolve_loss_config("tv", implementation)["tv"][0],
             "gamma": kwargs.get("dflash_decay_gamma", 4.0),
             "max_anchors": kwargs.get("max_anchors", 3072),
             "confidence_head_alpha": kwargs.get("confidence_head_alpha", 1.0),
@@ -369,7 +370,7 @@ class KVNativeDSparkDraftModel(DSparkDraftModel):
             return verifier_logits[:, anchored_indices]
 
     @conditional_torch_compile
-    def forward(  # noqa: C901, PLR0917
+    def forward(  # noqa: C901
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
@@ -381,6 +382,7 @@ class KVNativeDSparkDraftModel(DSparkDraftModel):
         verifier_kv_layer_ids: torch.Tensor,
         position_ids: torch.Tensor | None = None,
         loss_config: LossConfig | None = None,
+        tv_loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = tv_loss,
         gamma: float = 4.0,
         max_anchors: int = 3072,
         confidence_head_alpha: float = 1.0,
@@ -533,6 +535,7 @@ class KVNativeDSparkDraftModel(DSparkDraftModel):
             aligned_loss_mask,
             self.block_size,
             loss_config=loss_config or _DEFAULT_LOSS_CONFIG,
+            tv_loss_fn=tv_loss_fn,
             gamma=gamma,
             confidence_head_alpha=confidence_head_alpha,
             per_position_loss_weight=per_position_loss_weight,

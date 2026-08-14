@@ -14,7 +14,7 @@ from typing import Any
 from datasets import Dataset, load_from_disk
 
 from speculators.data_generation.preprocessing import (
-    build_eagle3_dataset,
+    build_speculator_training_dataset,
     load_processor,
     load_raw_dataset,
 )
@@ -101,14 +101,6 @@ def _validate_ranked_rows(dataset: Dataset) -> tuple[str, str]:
     )
 
 
-def _processor_supports_chat_template(processor: Any, model: str) -> None:
-    if (
-        not hasattr(processor, "apply_chat_template")
-        or getattr(processor, "chat_template", None) is None
-    ):
-        raise ValueError(f"Processor for {model} does not provide a chat template")
-
-
 def prepare_ranked_dataset(args: argparse.Namespace) -> Dataset:
     """Tokenize the ranked reserve and select the first surviving target rows."""
     if args.ranked_target_samples <= 0:
@@ -143,31 +135,53 @@ def prepare_ranked_dataset(args: argparse.Namespace) -> Dataset:
         args.model,
         trust_remote_code=args.trust_remote_code,
     )
-    _processor_supports_chat_template(processor, args.model)
-    processed = build_eagle3_dataset(
+    processed = build_speculator_training_dataset(
         dataset=raw_dataset,
         processor=processor,
         max_length=args.seq_length,
         num_proc=args.num_preprocessing_workers,
-        assistant_pattern=args.assistant_pattern,
+        render_endpoint=args.render_endpoint,
         minimum_valid_tokens=args.minimum_valid_tokens,
         preserve_columns=_PRESERVED_COLUMNS,
         keep_in_memory=False,
         map_batch_size=args.preprocessing_batch_size,
-    ).sort(
-        "_candidate_rank",
-        keep_in_memory=False,
-        writer_batch_size=args.preprocessing_batch_size,
-    )
+        render_chat_template_kwargs={"enable_thinking": False},
+    ).with_format(None)
 
-    eligible_records = len(processed)
+    eligible_ranks = sorted(int(rank) for rank in processed.unique("_candidate_rank"))
+    eligible_records = len(eligible_ranks)
     if eligible_records < args.ranked_target_samples:
         raise ValueError(
             "preprocessing survivors are below target: "
             f"{eligible_records} < {args.ranked_target_samples}"
         )
 
-    selected = processed.select(range(args.ranked_target_samples))
+    selected_ranks = eligible_ranks[: args.ranked_target_samples]
+    selected_cutoff = selected_ranks[-1]
+    selected = processed.filter(
+        lambda ranks: [rank <= selected_cutoff for rank in ranks],
+        input_columns=["_candidate_rank"],
+        batched=True,
+        batch_size=args.preprocessing_batch_size,
+        num_proc=args.num_preprocessing_workers,
+        keep_in_memory=False,
+        desc="Selecting ranked records after assistant-turn fan-out",
+    )
+
+    train_records = int(args.ranked_target_samples * args.token_freq_train_ratio)
+    if train_records <= 0:
+        raise ValueError("token_freq_train_ratio leaves an empty training prefix")
+    train_cutoff = selected_ranks[train_records - 1]
+    token_frequency_rows = selected.filter(
+        lambda ranks: [rank <= train_cutoff for rank in ranks],
+        input_columns=["_candidate_rank"],
+        batched=True,
+        batch_size=args.preprocessing_batch_size,
+        num_proc=args.num_preprocessing_workers,
+        keep_in_memory=False,
+        desc="Selecting record prefix for token frequencies",
+    )
+
     selected = selected.rename_columns(
         {
             "_id": "id",
@@ -178,22 +192,24 @@ def prepare_ranked_dataset(args: argparse.Namespace) -> Dataset:
     selected.info.description = json.dumps(
         {
             "ranked_preprocessing": {
-                "dataset_order": "candidate_rank_ascending",
+                "dataset_order": "candidate_rank_ascending_assistant_turn",
                 "eligible_records": eligible_records,
+                "eligible_training_rows": len(processed),
                 "generation_config_sha256": generation_sha256,
                 "sample_manifest_sha256": sample_sha256,
+                "selected_records": args.ranked_target_samples,
+                "selected_training_rows": len(selected),
             }
         },
         sort_keys=True,
     )
 
-    train_records = int(args.ranked_target_samples * args.token_freq_train_ratio)
-    if train_records <= 0:
-        raise ValueError("token_freq_train_ratio leaves an empty training prefix")
+    token_frequency_rows.set_format(type="torch")
     save_token_frequency_distribution(
-        dataset=selected.select(range(train_records)),
+        dataset=token_frequency_rows,
         output_path=Path(args.output) / "token_freq.pt",
     )
+    selected.set_format(type="torch")
     return selected
 
 
@@ -208,6 +224,31 @@ def _ranked_metadata(dataset: Dataset) -> dict[str, Any]:
     return metadata
 
 
+def _unique_selection_rows(dataset: Dataset) -> list[tuple[int, int, str]]:
+    """Collapse contiguous assistant-turn rows back to their source records."""
+    plain = dataset.with_format(None)
+    rows: list[tuple[int, int, str]] = []
+    previous: tuple[int, int, str] | None = None
+    for source_index, candidate_rank, record_id in zip(
+        plain["source_line_index"],
+        plain["candidate_rank"],
+        plain["id"],
+        strict=True,
+    ):
+        current = (int(source_index), int(candidate_rank), str(record_id))
+        if previous is not None and current[1] == previous[1]:
+            if current != previous:
+                raise ValueError(
+                    "assistant-turn rows disagree on source record metadata"
+                )
+            continue
+        if previous is not None and current[1] < previous[1]:
+            raise ValueError("prepared rows are not ordered by candidate rank")
+        rows.append(current)
+        previous = current
+    return rows
+
+
 def stage_selection(
     dataset: Dataset,
     *,
@@ -215,9 +256,10 @@ def stage_selection(
     target_samples: int,
 ) -> tuple[Path, dict[str, Any]]:
     """Write the selection payload to a partial file before dataset publish."""
-    if len(dataset) != target_samples:
+    rows = _unique_selection_rows(dataset)
+    if len(rows) != target_samples:
         raise ValueError(
-            f"selected dataset has {len(dataset)} rows, expected {target_samples}"
+            f"selected dataset has {len(rows)} records, expected {target_samples}"
         )
     metadata = _ranked_metadata(dataset)
     sample_sha256 = _require_sha256(
@@ -228,19 +270,15 @@ def stage_selection(
         metadata.get("generation_config_sha256"),
         "generation_config_sha256",
     )
+    if metadata.get("selected_records") != target_samples:
+        raise ValueError("dataset metadata has a different selected record count")
+    if metadata.get("selected_training_rows") != len(dataset):
+        raise ValueError("dataset metadata has a different training row count")
 
     output.mkdir(parents=True, exist_ok=True)
     staged = output / f".{SELECTION_NAME}.{os.getpid()}.partial"
     staged.unlink(missing_ok=True)
-    plain = dataset.with_format(None)
-    rows = sorted(
-        zip(
-            plain["source_line_index"],
-            plain["candidate_rank"],
-            plain["id"],
-            strict=True,
-        )
-    )
+    rows.sort()
     with staged.open("wt", encoding="utf-8") as handle:
         for source_index, candidate_rank, record_id in rows:
             handle.write(
@@ -260,6 +298,7 @@ def stage_selection(
     manifest = {
         "complete": True,
         "target_records": target_samples,
+        "training_rows": len(dataset),
         "sample_manifest_sha256": sample_sha256,
         "generation_config_sha256": generation_sha256,
         "selection": {
@@ -301,9 +340,12 @@ def validate_existing_output(args: argparse.Namespace) -> None:
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"cannot read selection manifest: {manifest_path}") from exc
     selection = manifest.get("selection")
+    training_rows = manifest.get("training_rows")
     if (
         manifest.get("complete") is not True
         or manifest.get("target_records") != args.ranked_target_samples
+        or type(training_rows) is not int
+        or training_rows < args.ranked_target_samples
         or not isinstance(selection, dict)
         or selection.get("path") != SELECTION_NAME
         or selection.get("records") != args.ranked_target_samples
@@ -319,8 +361,14 @@ def validate_existing_output(args: argparse.Namespace) -> None:
         raise ValueError("existing selection has a different record count")
 
     dataset = load_from_disk(output)
-    if len(dataset) != args.ranked_target_samples:
-        raise ValueError("existing dataset has a different record count")
+    if len(dataset) != training_rows:
+        raise ValueError("existing dataset has a different training row count")
+    metadata = _ranked_metadata(dataset)
+    if (
+        metadata.get("selected_records") != args.ranked_target_samples
+        or metadata.get("selected_training_rows") != training_rows
+    ):
+        raise ValueError("existing dataset metadata has different record counts")
 
 
 def _assert_safe_to_overwrite(output: Path) -> None:
@@ -351,7 +399,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seq-length", type=int, default=20480)
     parser.add_argument("--ranked-target-samples", type=int, required=True)
     parser.add_argument("--token-freq-train-ratio", type=float, default=0.99)
-    parser.add_argument("--assistant-pattern")
+    parser.add_argument("--render-endpoint", required=True)
     parser.add_argument("--minimum-valid-tokens", type=int)
     parser.add_argument("--num-preprocessing-workers", type=int, default=8)
     parser.add_argument("--preprocessing-batch-size", type=int, default=1000)
@@ -390,7 +438,10 @@ def main() -> int:
     except Exception:
         staged_selection.unlink(missing_ok=True)
         raise
-    print(f"prepared {len(dataset)} ranked rows: {output}")
+    print(
+        f"prepared {len(dataset)} assistant-turn rows from "
+        f"{args.ranked_target_samples} ranked records: {output}"
+    )
     return 0
 
 

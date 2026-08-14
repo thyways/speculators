@@ -23,9 +23,9 @@ def test_pretokenized_rows_are_truncated_instead_of_dropped():
             "input_ids": [[1, 2, 3], [1, 2, 3, 4, 5]],
             "loss_mask": [[0, 1, 1], [0, 0, 1, 1, 1]],
         },
-        processor=None,  # type: ignore[arg-type]
+        is_multimodal=False,
+        render_endpoint=None,
         max_length=4,
-        assistant_pattern=None,
     )
 
     assert [row.tolist() for row in results["input_ids"]] == [

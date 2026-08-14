@@ -10,13 +10,13 @@ from speculators import (
     SpeculatorsConfig,
     VerifierConfig,
 )
+from speculators.losses import resolve_loss_config
 from speculators.model import SpeculatorModel
 from speculators.models.domino import (
     DominoDraftModel,
     DominoSpeculatorConfig,
     linear_lambda_base,
 )
-from speculators.models.metrics import resolve_loss_config
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 from speculators.train.optimizers import split_named_params_for_muon
 
@@ -25,6 +25,7 @@ VOCAB_SIZE = 64
 BLOCK_SIZE = 6
 GRU_HIDDEN = 8
 EMB_DIM = 5
+_EAGER_LOSS_CONFIG = resolve_loss_config("kl_div", "eager")
 
 
 def _config(
@@ -61,9 +62,7 @@ def _config(
         speculators_config=SpeculatorsConfig(
             algorithm="domino",
             proposal_methods=[
-                GreedyTokenProposalConfig(
-                    speculative_tokens=speculative_tokens
-                )
+                GreedyTokenProposalConfig(speculative_tokens=speculative_tokens)
             ],
             default_proposal_method="greedy",
             verifier=VerifierConfig(
@@ -83,15 +82,14 @@ def _initialized_model(**kwargs) -> DominoDraftModel:
     return model
 
 
-def _batch(sequence_length: int = 24) -> dict:
+def _batch(sequence_length: int = 24, *, loss_config=None) -> dict:
     return {
         "hidden_states": torch.randn(1, sequence_length, 3 * HIDDEN_SIZE),
         "input_ids": torch.randint(1, VOCAB_SIZE, (1, sequence_length)),
         "loss_mask": torch.ones(1, sequence_length),
-        "verifier_last_hidden_states": torch.randn(
-            1, sequence_length, HIDDEN_SIZE
-        ),
+        "verifier_last_hidden_states": torch.randn(1, sequence_length, HIDDEN_SIZE),
         "document_ids": torch.zeros(1, sequence_length, dtype=torch.long),
+        "loss_config": loss_config or _EAGER_LOSS_CONFIG,
     }
 
 
@@ -155,9 +153,7 @@ def test_fresh_head_changes_the_corrected_suffix_only():
     base_logits = model.lm_head(hidden)
     block_tokens = torch.randint(1, VOCAB_SIZE, (2, BLOCK_SIZE))
 
-    final_logits = model._correct_suffix_logits(
-        hidden, base_logits, block_tokens, 2
-    )
+    final_logits = model._correct_suffix_logits(hidden, base_logits, block_tokens, 2)
     torch.testing.assert_close(
         final_logits.view(2, BLOCK_SIZE, -1)[:, : model.suffix_start],
         base_logits.view(2, BLOCK_SIZE, -1)[:, : model.suffix_start],
@@ -185,9 +181,7 @@ def test_correction_is_causal_within_the_block(sample_from_anchor):
     base_logits = model.lm_head(hidden)
     block_tokens = torch.arange(1, BLOCK_SIZE + 1).view(1, BLOCK_SIZE)
     with torch.no_grad():
-        reference = model._correct_suffix_logits(
-            hidden, base_logits, block_tokens, 1
-        )
+        reference = model._correct_suffix_logits(hidden, base_logits, block_tokens, 1)
 
     # Uncorrected prefix stays exactly at the DFlash logits.
     torch.testing.assert_close(
@@ -199,24 +193,18 @@ def test_correction_is_causal_within_the_block(sample_from_anchor):
         perturbed = block_tokens.clone()
         perturbed[0, position] = VOCAB_SIZE - 1
         with torch.no_grad():
-            actual = model._correct_suffix_logits(
-                hidden, base_logits, perturbed, 1
-            )
+            actual = model._correct_suffix_logits(hidden, base_logits, perturbed, 1)
         changed = [
             slot
             for slot in range(BLOCK_SIZE)
-            if not torch.allclose(
-                reference[0, slot], actual[0, slot], atol=1e-7
-            )
+            if not torch.allclose(reference[0, slot], actual[0, slot], atol=1e-7)
         ]
         expected = [
             slot
             for slot in range(model.suffix_start, BLOCK_SIZE)
             if slot - anchor_offset >= position
         ]
-        assert (
-            changed == expected
-        ), f"token {position} affected slots {changed}"
+        assert changed == expected, f"token {position} affected slots {changed}"
 
 
 @pytest.mark.parametrize("sample_from_anchor", [True, False])
@@ -239,9 +227,7 @@ def test_correction_matches_the_upstream_logit_head(sample_from_anchor):
         bias=False,
     ).double()
     # Loading straight across also re-asserts that the key names match.
-    upstream_gru.load_state_dict(
-        model.logits_correction.prefix_gru.state_dict()
-    )
+    upstream_gru.load_state_dict(model.logits_correction.prefix_gru.state_dict())
     embed_proj = model.logits_correction.embed_proj
     suffix_start = model.suffix_start
 
@@ -274,9 +260,7 @@ def test_correction_matches_the_upstream_logit_head(sample_from_anchor):
         )
 
     num_blocks = 3
-    hidden = torch.randn(
-        1, num_blocks * BLOCK_SIZE, HIDDEN_SIZE, dtype=torch.float64
-    )
+    hidden = torch.randn(1, num_blocks * BLOCK_SIZE, HIDDEN_SIZE, dtype=torch.float64)
     base_logits = model.lm_head(hidden)
     block_tokens = torch.randint(1, VOCAB_SIZE, (num_blocks, BLOCK_SIZE))
 
@@ -320,9 +304,7 @@ def test_forward_blends_the_base_objective_while_lambda_is_live():
     _, loss, metrics = model(**_batch(), max_anchors=3)
 
     assert float(metrics["lambda_base"]) == pytest.approx(0.5)
-    assert {"base_loss_sum", "base_full_acc_sum", "base_eal_sum"} <= set(
-        metrics
-    )
+    assert {"base_loss_sum", "base_full_acc_sum", "base_eal_sum"} <= set(metrics)
     expected = 0.5 * metrics["final_loss_sum"] + 0.5 * metrics["base_loss_sum"]
     torch.testing.assert_close(metrics["loss_sum"], expected)
     # The reported headline loss must be the blend that is actually optimized.
@@ -335,17 +317,14 @@ def test_multi_term_losses_do_not_collide_with_the_base_metrics():
     model.on_training_step(25, 100)  # lambda_base = 0.5, both terms live
 
     _, _, metrics = model(
-        **_batch(),
+        **_batch(loss_config=resolve_loss_config('{"ce": 0.1, "tv": 0.9}', "eager")),
         max_anchors=3,
-        loss_config=resolve_loss_config('{"ce": 0.1, "tv": 0.9}'),
     )
 
     # The per-term keys belong to the final pass; the base pass contributes only
     # its three renamed keys, so nothing is silently overwritten.
     assert {"ce_loss_sum", "tv_loss_sum"} <= set(metrics)
-    assert {"base_loss_sum", "base_full_acc_sum", "base_eal_sum"} <= set(
-        metrics
-    )
+    assert {"base_loss_sum", "base_full_acc_sum", "base_eal_sum"} <= set(metrics)
     assert not any(key.startswith(("base_ce", "base_tv")) for key in metrics)
     expected = 0.5 * metrics["final_loss_sum"] + 0.5 * metrics["base_loss_sum"]
     torch.testing.assert_close(metrics["loss_sum"], expected)
@@ -426,9 +405,7 @@ def test_dpace_weighting_is_rejected():
     ],
 )
 def test_linear_lambda_base_schedule(global_step, total_steps, expected):
-    assert linear_lambda_base(global_step, total_steps) == pytest.approx(
-        expected
-    )
+    assert linear_lambda_base(global_step, total_steps) == pytest.approx(expected)
 
 
 def test_linear_lambda_base_honours_start_and_ratio():

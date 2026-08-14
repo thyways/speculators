@@ -9,6 +9,7 @@ from speculators import (
     SpeculatorsConfig,
     VerifierConfig,
 )
+from speculators.losses import resolve_loss_config
 from speculators.model import SpeculatorModel
 from speculators.models.dfly import DFlyDraftModel, DFlySpeculatorConfig
 from speculators.proposals.greedy import GreedyTokenProposalConfig
@@ -17,6 +18,7 @@ from speculators.train.optimizers import split_named_params_for_muon
 HIDDEN_SIZE = 16
 VOCAB_SIZE = 64
 BLOCK_SIZE = 4
+_EAGER_LOSS_CONFIG = resolve_loss_config("kl_div", "eager")
 
 
 def _config(
@@ -227,6 +229,7 @@ def test_dfly_full_forward_backpropagates_through_new_paths():
         loss_mask=loss_mask,
         verifier_last_hidden_states=verifier_last_hidden_states,
         document_ids=document_ids,
+        loss_config=_EAGER_LOSS_CONFIG,
         max_anchors=3,
     )
     loss.backward()

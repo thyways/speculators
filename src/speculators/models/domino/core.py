@@ -3,6 +3,7 @@ from typing import ClassVar
 import torch
 from transformers import PretrainedConfig
 
+from speculators.losses import LossConfig
 from speculators.model import SpeculatorModel
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.domino.config import (
@@ -13,7 +14,6 @@ from speculators.models.domino.config import (
 )
 from speculators.models.domino.metrics import compute_metrics
 from speculators.models.domino.model_definitions import DominoLogitsCorrection
-from speculators.models.metrics import LossConfig
 from speculators.models.utils import conditional_torch_compile
 
 __all__ = [
@@ -104,12 +104,8 @@ class DominoDraftModel(DFlashDraftModel):
     ) -> "DominoDraftModel":
         """Create a Domino model from training arguments (mirrors DFlash)."""
         config = DominoSpeculatorConfig(
-            **cls._build_base_config_kwargs(
-                "domino", verifier_config, **kwargs
-            ),
-            gru_hidden_dim=kwargs.get(
-                "gru_hidden_dim", DEFAULT_GRU_HIDDEN_DIM
-            ),
+            **cls._build_base_config_kwargs("domino", verifier_config, **kwargs),
+            gru_hidden_dim=kwargs.get("gru_hidden_dim", DEFAULT_GRU_HIDDEN_DIM),
             logits_correction_emb_dim=kwargs.get(
                 "logits_correction_emb_dim", DEFAULT_LOGITS_CORRECTION_EMB_DIM
             ),
@@ -168,9 +164,7 @@ class DominoDraftModel(DFlashDraftModel):
         is correct for a memoryless bias but would shift the whole recurrent
         state sequence by one position.
         """
-        return input_ids[0, anchored_block_indices].view(
-            num_blocks, self.block_size
-        )
+        return input_ids[0, anchored_block_indices].view(num_blocks, self.block_size)
 
     def _correct_suffix_logits(
         self,
@@ -183,9 +177,7 @@ class DominoDraftModel(DFlashDraftModel):
         block = self.block_size
         suffix_start = self.suffix_start
 
-        states = self.logits_correction.block_states(
-            self.embed_tokens(block_tokens)
-        )
+        states = self.logits_correction.block_states(self.embed_tokens(block_tokens))
         # Slot k reads the state that has consumed tokens up to its predecessor:
         # index k when the anchor slot also predicts, else k-1. Running the scan
         # over all block_size positions and offsetting the slice is equivalent
@@ -202,9 +194,9 @@ class DominoDraftModel(DFlashDraftModel):
         # In place on the correction (never on base_logits, whose graph the base
         # loss still needs) so the suffix logits are materialized once.
         correction.add_(base_blocks[:, suffix_start:])
-        return torch.cat(
-            [base_blocks[:, :suffix_start], correction], dim=1
-        ).view(1, num_blocks * block, -1)
+        return torch.cat([base_blocks[:, :suffix_start], correction], dim=1).view(
+            1, num_blocks * block, -1
+        )
 
     @conditional_torch_compile
     def forward(
@@ -254,9 +246,7 @@ class DominoDraftModel(DFlashDraftModel):
         final_logits = self._correct_suffix_logits(
             hidden,
             base_logits,
-            self._block_token_ids(
-                input_ids, anchored_block_indices, num_blocks
-            ),
+            self._block_token_ids(input_ids, anchored_block_indices, num_blocks),
             num_blocks,
         )
 
@@ -266,9 +256,7 @@ class DominoDraftModel(DFlashDraftModel):
         # training-time lambda.
         include_base = self.training and self._base_loss_active
         lambda_base = (
-            self.lambda_base
-            if include_base
-            else torch.zeros_like(self.lambda_base)
+            self.lambda_base if include_base else torch.zeros_like(self.lambda_base)
         )
 
         loss, metrics = compute_metrics(

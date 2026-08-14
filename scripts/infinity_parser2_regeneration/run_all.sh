@@ -48,6 +48,7 @@ TEACHER_ENDPOINTS="${PARSER2_ENDPOINTS:-}"
 
 declare -a TEACHER_PIDS=()
 declare -a ENDPOINTS=()
+RENDER_ENDPOINT=""
 
 usage() {
     cat <<EOF
@@ -73,29 +74,43 @@ require_executable() {
     [[ -x "$1" ]] || die "missing executable: $1"
 }
 
-stop_teachers() {
+stop_teacher_pids() {
+    local -a pids=("$@")
     local pid
     local alive
     local attempt
 
-    for pid in "${TEACHER_PIDS[@]}"; do
+    for pid in "${pids[@]}"; do
         kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
     done
     for attempt in {1..30}; do
         alive=0
-        for pid in "${TEACHER_PIDS[@]}"; do
+        for pid in "${pids[@]}"; do
             kill -0 "$pid" 2>/dev/null && alive=1
         done
         (( alive == 0 )) && break
         sleep 1
     done
-    for pid in "${TEACHER_PIDS[@]}"; do
+    for pid in "${pids[@]}"; do
         if kill -0 "$pid" 2>/dev/null; then
             kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
         fi
         wait "$pid" 2>/dev/null || true
     done
+}
+
+stop_teachers() {
+    stop_teacher_pids "${TEACHER_PIDS[@]}"
     TEACHER_PIDS=()
+}
+
+retain_first_local_teacher() {
+    local -a extra_pids=()
+    (( ${#TEACHER_PIDS[@]} <= 1 )) && return 0
+    extra_pids=("${TEACHER_PIDS[@]:1}")
+    stop_teacher_pids "${extra_pids[@]}"
+    TEACHER_PIDS=("${TEACHER_PIDS[0]}")
+    ENDPOINTS=("${ENDPOINTS[0]}")
 }
 
 cleanup() {
@@ -127,6 +142,7 @@ sample_data() {
 }
 
 start_teachers() {
+    local teacher_count="${1:-0}"
     local -a gpus=()
     local -a extra_args=()
     local gpu
@@ -140,6 +156,11 @@ start_teachers() {
     command -v setsid >/dev/null || die "setsid is required"
     IFS=',' read -r -a gpus <<< "$TEACHER_GPU_IDS"
     [[ ${#gpus[@]} -gt 0 ]] || die "PARSER2_TEACHER_GPU_IDS is empty"
+    if (( teacher_count > 0 )); then
+        (( teacher_count <= ${#gpus[@]} )) || \
+            die "requested ${teacher_count} teachers from only ${#gpus[@]} GPUs"
+        gpus=("${gpus[@]:0:teacher_count}")
+    fi
     [[ -n "${PARSER2_VLLM_EXTRA_ARGS:-}" ]] && \
         read -r -a extra_args <<< "$PARSER2_VLLM_EXTRA_ARGS"
     mkdir -p "$log_dir"
@@ -187,6 +208,7 @@ start_teachers() {
 }
 
 resolve_endpoints() {
+    local local_teacher_count="${1:-0}"
     local endpoint
     if [[ -n "$TEACHER_ENDPOINTS" ]]; then
         IFS=',' read -r -a ENDPOINTS <<< "$TEACHER_ENDPOINTS"
@@ -194,8 +216,25 @@ resolve_endpoints() {
             ENDPOINTS[$endpoint]="${ENDPOINTS[$endpoint]//[[:space:]]/}"
         done
     else
-        start_teachers
+        start_teachers "$local_teacher_count"
     fi
+}
+
+render_endpoint_from_chat_endpoint() {
+    local endpoint="${1%/}"
+    case "$endpoint" in
+        */v1/chat/completions/render)
+            endpoint="${endpoint%/v1/chat/completions/render}"
+            ;;
+        */v1/chat/completions)
+            endpoint="${endpoint%/v1/chat/completions}"
+            ;;
+        */v1)
+            endpoint="${endpoint%/v1}"
+            ;;
+    esac
+    [[ -n "$endpoint" ]] || die "cannot derive render endpoint from $1"
+    printf '%s\n' "$endpoint"
 }
 
 generate_stage() {
@@ -264,6 +303,7 @@ prepare_stage() {
         --seq-length "$SEQ_LENGTH"
         --ranked-target-samples "$target_records"
         --token-freq-train-ratio "$token_freq_ratio"
+        --render-endpoint "$RENDER_ENDPOINT"
         --minimum-valid-tokens "$MINIMUM_VALID_TOKENS"
         --num-preprocessing-workers "$PREPROCESSING_WORKERS"
         --preprocessing-batch-size "$PREPROCESSING_BATCH_SIZE"
@@ -309,7 +349,6 @@ case "$action" in
                 --require-complete >/dev/null; then
                 resolve_endpoints
                 generate_stage "$action"
-                stop_teachers
             fi
         else
             "$PYTHON_BIN" "$PIPELINE" status \
@@ -320,6 +359,12 @@ case "$action" in
         "$PYTHON_BIN" "$PIPELINE" status \
             --output-root "$OUTPUT_ROOT" \
             --stage "$action"
+        if (( ${#ENDPOINTS[@]} == 0 )); then
+            # Completed generations still need one target-model server for /render.
+            resolve_endpoints 1
+        fi
+        retain_first_local_teacher
+        RENDER_ENDPOINT="$(render_endpoint_from_chat_endpoint "${ENDPOINTS[0]}")"
         prepare_stage "$action"
         ;;
     *)
