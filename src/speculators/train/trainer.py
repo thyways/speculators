@@ -387,6 +387,19 @@ class Trainer:
         for scheduler in self.schedulers:
             scheduler.step()
 
+    def _pop_batch_valid(self, batch: dict) -> bool:
+        valid = batch.pop("batch_valid", None)
+        if valid is None:
+            return True
+        valid = valid.to(
+            device=self.local_rank,
+            dtype=torch.uint8,
+            non_blocking=True,
+        )
+        if self.is_distributed:
+            dist.all_reduce(valid, op=dist.ReduceOp.MIN)
+        return bool(valid.item())
+
     def _prepare_resume_skip(self, epoch: int) -> int:
         """Prepare fast-skip state for mid-epoch resume and return skipped steps."""
         skip_steps = 0
@@ -455,6 +468,13 @@ class Trainer:
                 else v
                 for k, v in batch.items()
             }
+            if not self._pop_batch_valid(gpu_batch):
+                root_logger.warning(
+                    "Skipping packed batch because at least one rank received no "
+                    "valid online verifier payloads."
+                )
+                t_before_fetch = time.perf_counter()
+                continue
 
             with torch.autocast(
                 self.device_type, dtype=self.config.hidden_states_dtype
@@ -540,7 +560,7 @@ class Trainer:
             val_loader = tqdm(val_loader, desc=f"Epoch {epoch}")  # type: ignore[assignment]
 
         accumulated: dict[str, torch.Tensor] = {}
-        num_batches = len(val_loader)
+        num_batches = 0
         for i, batch in enumerate(val_loader):
             self._maybe_val_sync(i)
             gpu_batch = {
@@ -549,6 +569,13 @@ class Trainer:
                 else v
                 for k, v in batch.items()
             }
+            if not self._pop_batch_valid(gpu_batch):
+                root_logger.warning(
+                    "Skipping validation batch because at least one rank received "
+                    "no valid online verifier payloads."
+                )
+                continue
+            num_batches += 1
 
             with torch.autocast(
                 self.device_type, dtype=self.config.hidden_states_dtype
@@ -569,7 +596,8 @@ class Trainer:
             val_metrics = dict(zip(accumulated, stacked.tolist(), strict=True))
 
         world_size = dist.get_world_size() if self.is_distributed else 1
-        val_metrics = {k: v / num_batches for k, v in val_metrics.items()}
+        denominator = max(num_batches, 1)
+        val_metrics = {k: v / denominator for k, v in val_metrics.items()}
         val_metrics = normalize_counted_metrics(val_metrics, world_size)
         val_metrics = {f"{k}_epoch": v for k, v in val_metrics.items()}
 

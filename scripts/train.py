@@ -646,6 +646,10 @@ def main(cfg: TrainConfig):  # noqa: C901
         prefetch_factor=args.prefetch_factor,
         preprocess=preprocess,
         train_data_ratio=args.train_data_ratio,
+        verifier_kv_shape=getattr(draft_model, "verifier_kv_shape", None),
+        verifier_kv_layer_ids=getattr(
+            draft_model.config, "verifier_kv_layer_ids", None
+        ),
     )
 
     # Get trainer kwargs from model class

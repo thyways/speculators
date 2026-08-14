@@ -52,7 +52,7 @@ def _worker_init_fn(worker_id: int) -> None:  # noqa: ARG001
     torch.set_num_threads(1)
 
 
-def _setup_dataloader(
+def _setup_dataloader(  # noqa: PLR0917
     dataset: BaseDataset,
     total_seq_len: int,
     hidden_size: int,
@@ -60,6 +60,8 @@ def _setup_dataloader(
     num_target_layers: int = 3,
     prefetch_factor: int | None = 4,
     preprocess: Callable[[BatchType], BatchType] | None = None,
+    verifier_kv_shape: tuple[int, int, int] | None = None,
+    verifier_kv_layer_ids: list[int] | None = None,
 ) -> DataLoader:
     batch_sampler = MultipackDistributedBatchSamplerV2(
         batch_max_length=total_seq_len,
@@ -80,6 +82,8 @@ def _setup_dataloader(
             num_target_layers=num_target_layers,
             dtype=dataset.hidden_states_dtype,
             preprocess=preprocess,
+            verifier_kv_shape=verifier_kv_shape,
+            verifier_kv_layer_ids=verifier_kv_layer_ids,
         ),
         persistent_workers=use_workers,
         multiprocessing_context="spawn" if use_workers else None,
@@ -107,6 +111,8 @@ def create_train_val_loaders(
     prefetch_factor: int,
     preprocess: Callable[[BatchType], BatchType] | None,
     train_data_ratio: float = 0.9,
+    verifier_kv_shape: tuple[int, int, int] | None = None,
+    verifier_kv_layer_ids: list[int] | None = None,
 ) -> tuple[DataLoader, DataLoader]:
     """Create training and validation DataLoaders.
 
@@ -154,6 +160,9 @@ def create_train_val_loaders(
             hidden_states_dtype=hidden_states_dtype,
             request_timeout=request_timeout,
             max_retries=max_retries,
+            require_verifier_kv=verifier_kv_shape is not None,
+            verifier_kv_shape=verifier_kv_shape,
+            verifier_kv_layer_ids=verifier_kv_layer_ids,
         )
         val_dataset = ArrowDataset(
             datapath=data_path,
@@ -168,6 +177,9 @@ def create_train_val_loaders(
             hidden_states_dtype=hidden_states_dtype,
             request_timeout=request_timeout,
             max_retries=max_retries,
+            require_verifier_kv=verifier_kv_shape is not None,
+            verifier_kv_shape=verifier_kv_shape,
+            verifier_kv_layer_ids=verifier_kv_layer_ids,
         )
 
     train_loader = _setup_dataloader(
@@ -178,6 +190,8 @@ def create_train_val_loaders(
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
         preprocess=preprocess,
+        verifier_kv_shape=verifier_kv_shape,
+        verifier_kv_layer_ids=verifier_kv_layer_ids,
     )
     val_loader = _setup_dataloader(
         val_dataset,
@@ -187,6 +201,8 @@ def create_train_val_loaders(
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
         preprocess=preprocess,
+        verifier_kv_shape=verifier_kv_shape,
+        verifier_kv_layer_ids=verifier_kv_layer_ids,
     )
 
     return train_loader, val_loader

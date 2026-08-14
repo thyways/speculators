@@ -11,7 +11,10 @@ import pytest
 from speculators.train.config import TrainConfig
 from speculators.train.config.schema import (
     CONFIG_DESTS,
+    DataArgs,
     DraftArgs,
+    GenerationArgs,
+    KVNativeDSparkArgs,
     OptimizerArgs,
 )
 
@@ -74,3 +77,67 @@ def test_from_flat_accepts_partial_working_dict():
     assert recovered.draft.num_layers == 6
     # Untouched fields fall back to their schema defaults.
     assert recovered.trainer.epochs == 20
+
+
+def _kv_native_config(**kv_kwargs):
+    return TrainConfig(
+        speculator_type="kv_native_dspark",
+        draft=DraftArgs(num_layers=6),
+        data=DataArgs(hidden_states_backend="file"),
+        generation=GenerationArgs(on_missing="generate", on_generate="delete"),
+        kv_native_dspark=KVNativeDSparkArgs(**kv_kwargs),
+    )
+
+
+def test_kv_native_config_is_online_only():
+    cfg = _kv_native_config()
+    assert cfg.generation.on_missing == "generate"
+    assert cfg.generation.on_generate == "delete"
+
+
+@pytest.mark.parametrize(
+    ("generation", "match"),
+    [
+        (GenerationArgs(on_missing="raise"), "on-missing=generate"),
+        (GenerationArgs(on_generate="cache"), "on-generate=delete"),
+    ],
+)
+def test_kv_native_rejects_non_online_generation(generation, match):
+    with pytest.raises(ValueError, match=match):
+        TrainConfig(
+            speculator_type="kv_native_dspark",
+            draft=DraftArgs(num_layers=6),
+            data=DataArgs(hidden_states_backend="file"),
+            generation=generation,
+        )
+
+
+def test_kv_native_rejects_pretrained_initialization():
+    with pytest.raises(ValueError, match="from-scratch training only"):
+        TrainConfig(
+            speculator_type="kv_native_dspark",
+            draft=DraftArgs(num_layers=6, from_pretrained="checkpoint"),
+            data=DataArgs(hidden_states_backend="file"),
+            generation=GenerationArgs(on_missing="generate", on_generate="delete"),
+        )
+
+
+def test_kv_native_rejects_auxiliary_hidden_layers():
+    with pytest.raises(ValueError, match="omit --target-layer-ids"):
+        TrainConfig(
+            speculator_type="kv_native_dspark",
+            draft=DraftArgs(num_layers=6, target_layer_ids=[2, 20, 37]),
+            data=DataArgs(hidden_states_backend="file"),
+            generation=GenerationArgs(on_missing="generate", on_generate="delete"),
+        )
+
+
+def test_kv_native_defaults_to_spec7():
+    cfg = _kv_native_config()
+    assert cfg.kv_native_dspark.num_speculative_tokens == 7
+    assert cfg.kv_native_dspark.verifier_kv_layer_ids == [3, 11, 19, 27, 35, 39]
+
+
+def test_kv_native_rejects_speculative_length_beyond_block():
+    with pytest.raises(ValueError, match="num-speculative-tokens exceeds"):
+        _kv_native_config(num_speculative_tokens=9)

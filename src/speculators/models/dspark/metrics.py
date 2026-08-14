@@ -11,7 +11,7 @@ from functools import partial
 from typing import Any
 
 import torch
-from torch.nn.functional import binary_cross_entropy_with_logits, softmax
+from torch.nn.functional import binary_cross_entropy_with_logits
 
 from speculators.models.metrics import (
     LossConfig,
@@ -19,11 +19,10 @@ from speculators.models.metrics import (
     compute_accuracy_multi_step,
     dflash_loss_decay,
     dpace_loss_decay,
+    tv_loss_fused_or_eager,
 )
 
-__all__ = [
-    "compute_metrics",
-]
+__all__ = ["compute_metrics"]
 
 _EPS = 1e-8
 
@@ -45,7 +44,7 @@ def _masked_decayed_mean(
     return (weighted.sum(dim=1) / denominator).mean()
 
 
-def compute_metrics(
+def compute_metrics(  # noqa: PLR0917
     logits: torch.Tensor,  # [1, T, draft_vocab_size] (Markov-corrected)
     targets: torch.Tensor,  # [1, T, draft_vocab_size]
     confidence_logits: torch.Tensor | None,  # [1, T] or None
@@ -60,6 +59,35 @@ def compute_metrics(
 ) -> tuple[torch.Tensor, dict]:
     """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs)."""
 
+    return _compute_metrics_impl(
+        logits,
+        targets,
+        confidence_logits,
+        loss_mask,
+        block_size,
+        loss_config,
+        gamma=gamma,
+        confidence_head_alpha=confidence_head_alpha,
+        per_position_loss_weight=per_position_loss_weight,
+        dpace_alpha=dpace_alpha,
+        sample_from_anchor=sample_from_anchor,
+    )
+
+
+def _compute_metrics_impl(  # noqa: PLR0917
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    confidence_logits: torch.Tensor | None,
+    loss_mask: torch.Tensor,
+    block_size: int,
+    loss_config: LossConfig,
+    *,
+    gamma: float,
+    confidence_head_alpha: float,
+    per_position_loss_weight: str,
+    dpace_alpha: float,
+    sample_from_anchor: bool,
+) -> tuple[torch.Tensor, dict]:
     device = logits.device
     seq_len = logits.shape[1]
     pos_idx = (torch.arange(seq_len, device=device) % block_size).unsqueeze(0)
@@ -80,23 +108,25 @@ def compute_metrics(
         logits, targets, loss_mask, pos_idx, loss_config=loss_config, decay_fn=decay_fn
     )
 
-    # Analytical per-position acceptance rate = distributional overlap.
+    # Analytical per-position acceptance rate = distributional overlap. It is a
+    # detached metric/confidence target and does not alter the draft loss graph.
     with torch.no_grad():
-        draft_p = softmax(logits.float(), dim=-1)
-        target_p = softmax(targets.float(), dim=-1)
-        accept_rate = torch.minimum(draft_p, target_p).sum(dim=-1)  # [1, T]
-        # Per-block cumulative acceptance product over the draft slots (slot 0
-        # is the anchor), shared by the accept-length and calibration metrics.
-        num_blocks = seq_len // block_size
-        accept_blocks = accept_rate.view(num_blocks, block_size)
-        draft_mask = loss_mask.to(accept_rate.dtype).view(num_blocks, block_size)[
-            :, start_pos:
-        ]
-        accept_prefix = (accept_blocks[:, start_pos:] * draft_mask).cumprod(dim=-1)
+        accept_rate = 1.0 - tv_loss_fused_or_eager(logits, targets)
+    metric_accept_rate = accept_rate.detach()
+    num_blocks = seq_len // block_size
+    accept_blocks = metric_accept_rate.view(num_blocks, block_size)[:, start_pos:]
+    draft_mask = loss_mask.to(metric_accept_rate.dtype).view(num_blocks, block_size)[
+        :, start_pos:
+    ]
+    # A masked slot is absent, not a rejected proposal: use multiplicative
+    # identity inside cumprod, then exclude it from the length sum.
+    accept_prefix = (accept_blocks * draft_mask + (1.0 - draft_mask)).cumprod(
+        dim=-1
+    ) * draft_mask
 
     metrics: dict[str, Any] = {}
     if confidence_logits is not None:
-        c_star = accept_rate.detach().to(confidence_logits.dtype)
+        c_star = metric_accept_rate.to(confidence_logits.dtype)
         bce = binary_cross_entropy_with_logits(
             confidence_logits, c_star, reduction="none"
         )  # [1, T]
@@ -104,13 +134,13 @@ def compute_metrics(
         loss = loss + confidence_head_alpha * conf_loss
 
         with torch.no_grad():
-            mask_f = loss_mask.to(accept_rate.dtype)
+            mask_f = loss_mask.to(metric_accept_rate.dtype)
             mask_total = mask_f.sum().clamp_min(1.0)
             conf_prob = confidence_logits.float().sigmoid()
             metrics["confidence_loss_sum"] = conf_loss.detach().clone()
             metrics["confidence_loss_total"] = torch.ones((), device=device)
             metrics["confidence_abs_error_sum"] = (
-                (conf_prob - accept_rate).abs() * mask_f
+                (conf_prob - metric_accept_rate).abs() * mask_f
             ).sum()
             metrics["confidence_abs_error_total"] = mask_total
             # Mean predicted vs. observed acceptance — a calibration sanity check.
@@ -135,15 +165,15 @@ def compute_metrics(
 
     # Mean acceptance rate of the (Markov-corrected) drafter.
     with torch.no_grad():
-        mask_f = loss_mask.to(accept_rate.dtype)
-        metrics["accept_rate_sum"] = (accept_rate * mask_f).sum()
+        mask_f = loss_mask.to(metric_accept_rate.dtype)
+        metrics["accept_rate_sum"] = (metric_accept_rate * mask_f).sum()
         metrics["accept_rate_total"] = mask_f.sum().clamp_min(1.0)
 
     # Expected accepted draft length per block (DSpark's tau): the cumulative
     # acceptance product summed over draft slots, plus the always-emitted anchor.
     with torch.no_grad():
         per_block_len = accept_prefix.sum(dim=-1) + 1.0
-        block_valid = (draft_mask.sum(dim=-1) > 0).to(accept_rate.dtype)
+        block_valid = (draft_mask.sum(dim=-1) > 0).to(metric_accept_rate.dtype)
         metrics["accept_len_sum"] = (per_block_len * block_valid).sum()
         metrics["accept_len_total"] = block_valid.sum().clamp_min(1.0)
 

@@ -47,6 +47,7 @@ _CLI_REQUIRED: dict[str, JsonValue] = {"cli_required": True}
 # string key the resolution layer maps to the live registry -- so the schema keeps no
 # runtime dependency on the backends and stays purely declarative.
 _CLI_CHOICES: dict[str, JsonValue] = {"cli_choices": "hidden_states_backends"}
+_MROPE_COORDINATES = 3
 
 
 class _Group(BaseModel):
@@ -278,7 +279,8 @@ class GenerationArgs(_Group):
         default="delete",
         description="Behaviour after generating a hidden state (only if "
         "--on-missing=generate). 'delete' discards it once loaded; 'cache' stores it "
-        "in the hidden states path, enabling hybrid online/offline training.",
+        "in the hidden states path. KV-native DSpark rejects 'cache' and always uses "
+        "fresh online payloads.",
     )
     request_timeout: float = Field(
         default=DEFAULT_REQUEST_TIMEOUT,
@@ -481,6 +483,37 @@ class DSparkArgs(_Group):
     )
 
 
+class KVNativeDSparkArgs(_Group):
+    """Online real-K/V training settings for KV-native DSpark."""
+
+    verifier_kv_layer_ids: list[int] = Field(
+        default_factory=lambda: [3, 11, 19, 27, 35, 39],
+        description=(
+            "Full-attention verifier layers exported by the online vLLM service."
+        ),
+    )
+    verifier_kv_layer_mapping: list[int] = Field(
+        default_factory=lambda: [3, 11, 19, 27, 35, 39],
+        description="One exported verifier layer selected for every draft layer.",
+    )
+    verifier_num_key_value_heads: int = Field(default=2, gt=0)
+    verifier_head_dim: int = Field(default=256, gt=0)
+    verifier_partial_rotary_factor: float = Field(default=0.25, gt=0.0, le=1.0)
+    verifier_rope_theta: float = Field(default=10_000_000.0, gt=0.0)
+    verifier_mrope_section: list[int] = Field(default_factory=lambda: [11, 11, 10])
+    local_kv_loss_alpha: float = Field(default=0.1, ge=0.0)
+    query_key_loss_alpha: float = Field(default=1.0, ge=0.0)
+    attention_value_loss_alpha: float = Field(default=1.0, ge=0.0)
+    num_speculative_tokens: int = Field(
+        default=7,
+        gt=0,
+        description=(
+            "Number of proposal slots used for formal speculative evaluation; "
+            "spec-7 uses 7 with verification width 8."
+        ),
+    )
+
+
 class PEagleArgs(_Group):
     num_depths: int = Field(
         default=8,
@@ -519,6 +552,7 @@ _GROUPS: dict[str, type[_Group]] = {
     "logging": LoggingArgs,
     "dflash": DFlashArgs,
     "dspark": DSparkArgs,
+    "kv_native_dspark": KVNativeDSparkArgs,
     "peagle": PEagleArgs,
     "mtp": MTPArgs,
 }
@@ -602,7 +636,7 @@ class TrainConfig(BaseSettings):
     speculator_type: str = Field(
         default="eagle3",
         description="Type of speculator model to train "
-        "(eagle3, dflash, dspark, peagle, mtp).",
+        "(eagle3, dflash, dspark, kv_native_dspark, peagle, mtp).",
     )
     dry_run: bool = Field(
         default=False,
@@ -628,6 +662,7 @@ class TrainConfig(BaseSettings):
     logging: LoggingArgs = Field(default_factory=LoggingArgs)
     dflash: DFlashArgs = Field(default_factory=DFlashArgs)
     dspark: DSparkArgs = Field(default_factory=DSparkArgs)
+    kv_native_dspark: KVNativeDSparkArgs = Field(default_factory=KVNativeDSparkArgs)
     peagle: PEagleArgs = Field(default_factory=PEagleArgs)
     mtp: MTPArgs = Field(default_factory=MTPArgs)
 
@@ -666,6 +701,87 @@ class TrainConfig(BaseSettings):
                 raise ValueError(
                     f"--dpace-alpha must be in (0, 1], got {self.dflash.dpace_alpha}"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_kv_native_online(self) -> "TrainConfig":  # noqa: C901
+        if self.speculator_type != "kv_native_dspark":
+            return self
+        if self.data.legacy_data:
+            raise ValueError("KV-native DSpark supports online Arrow data only")
+        if self.generation.on_missing != "generate":
+            raise ValueError(
+                "KV-native DSpark requires --on-missing=generate for online K/V"
+            )
+        if self.generation.on_generate != "delete":
+            raise ValueError(
+                "KV-native DSpark requires --on-generate=delete; persistent/offline "
+                "K/V caching is intentionally unsupported"
+            )
+        if self.data.hidden_states_backend != "file":
+            raise ValueError(
+                "KV-native DSpark currently requires --hidden-states-backend=file"
+            )
+        if self.draft.from_pretrained:
+            raise ValueError(
+                "KV-native DSpark in this checkout supports from-scratch training "
+                "only; use the trainer checkpoint resume path after the run starts"
+            )
+        if self.draft.target_layer_ids is not None:
+            raise ValueError(
+                "KV-native DSpark does not consume auxiliary hidden states; omit "
+                "--target-layer-ids"
+            )
+        exported_ids = self.kv_native_dspark.verifier_kv_layer_ids
+        if not exported_ids:
+            raise ValueError("--verifier-kv-layer-ids must not be empty")
+        if len(exported_ids) != len(set(exported_ids)):
+            raise ValueError("--verifier-kv-layer-ids must not contain duplicates")
+        if any(layer_id < 0 for layer_id in exported_ids):
+            raise ValueError("--verifier-kv-layer-ids must be non-negative")
+        if (
+            len(self.kv_native_dspark.verifier_kv_layer_mapping)
+            != self.draft.num_layers
+        ):
+            raise ValueError(
+                "--verifier-kv-layer-mapping must contain exactly --num-layers IDs"
+            )
+        exported = set(exported_ids)
+        unknown = sorted(
+            set(self.kv_native_dspark.verifier_kv_layer_mapping) - exported
+        )
+        if unknown:
+            raise ValueError(
+                f"--verifier-kv-layer-mapping references non-exported layers: {unknown}"
+            )
+        rotary_dim = int(
+            self.kv_native_dspark.verifier_head_dim
+            * self.kv_native_dspark.verifier_partial_rotary_factor
+        )
+        if rotary_dim <= 0 or rotary_dim % 2:
+            raise ValueError(
+                "Verifier partial rotary dimension must be positive and even"
+            )
+        if len(self.kv_native_dspark.verifier_mrope_section) != _MROPE_COORDINATES:
+            raise ValueError("--verifier-mrope-section must contain exactly 3 values")
+        if sum(self.kv_native_dspark.verifier_mrope_section) != rotary_dim // 2:
+            raise ValueError(
+                "--verifier-mrope-section must sum to half the partial rotary dimension"
+            )
+        sample_from_anchor = self.dflash.sample_from_anchor
+        if sample_from_anchor is None:
+            sample_from_anchor = True
+        trained_tokens = (
+            self.dflash.block_size
+            if sample_from_anchor
+            else self.dflash.block_size - 1
+        )
+        if self.kv_native_dspark.num_speculative_tokens > trained_tokens:
+            raise ValueError(
+                "--num-speculative-tokens exceeds the proposal slots represented "
+                f"by --block-size: {self.kv_native_dspark.num_speculative_tokens} "
+                f"> {trained_tokens}"
+            )
         return self
 
     def flatten(self) -> dict[str, Any]:

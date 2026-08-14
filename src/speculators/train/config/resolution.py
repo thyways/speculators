@@ -93,8 +93,9 @@ REQUIRED_FLAGS: dict[str, str] = _required_flags()
 # warns. DSpark is-a DFlash, so a dspark run reads the dflash group too; the
 # dspark-exclusive heads belong only to dspark. eagle3 uses no group.
 _ALGORITHM_GROUP_USERS: dict[str, frozenset[str]] = {
-    "dflash": frozenset({"dflash", "dspark"}),
-    "dspark": frozenset({"dspark"}),
+    "dflash": frozenset({"dflash", "dspark", "kv_native_dspark"}),
+    "dspark": frozenset({"dspark", "kv_native_dspark"}),
+    "kv_native_dspark": frozenset({"kv_native_dspark"}),
     "peagle": frozenset({"peagle"}),
     "mtp": frozenset({"mtp"}),
 }

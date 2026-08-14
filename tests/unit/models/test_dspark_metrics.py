@@ -190,3 +190,34 @@ class TestComputeMetrics:
             assert key in metrics
         # all metric values must be tensors (so dist.reduce works in the trainer)
         assert all(torch.is_tensor(v) for v in metrics.values())
+
+    def test_masked_middle_slot_does_not_reject_later_slot(self):
+        ids = torch.tensor([[0, 1, 2]])
+        logits = _ids_to_logits(ids, 8)
+        targets = logits.clone()
+        loss_mask = torch.tensor([[1, 0, 1]], dtype=torch.float32)
+        _, metrics = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=3,
+            loss_config=_DEFAULT_LOSS,
+        )
+        accept_len = metrics["accept_len_sum"] / metrics["accept_len_total"]
+        assert abs(float(accept_len) - 3.0) < 1e-2
+
+    def test_plain_compute_metrics_never_builds_a_backward_graph(self):
+        logits = torch.randn(1, 4, 8, requires_grad=True)
+        targets = torch.randn(1, 4, 8)
+        loss_mask = torch.ones(1, 4)
+        _, metrics = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+        )
+        assert not metrics["accept_rate_sum"].requires_grad
+        assert not metrics["accept_len_sum"].requires_grad
