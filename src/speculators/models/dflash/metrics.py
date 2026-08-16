@@ -105,4 +105,5 @@ def compute_metrics(
         eal = eal + cum
     metrics["eal_sum"] = eal
     metrics["eal_total"] = ones.clone()
+
     return loss, metrics

@@ -1,39 +1,43 @@
 #!/usr/bin/env bash
 # Full-data online Eagle3 training for Qwen3.6-35B-A3B on one 8-GPU node.
 # Reuses the prepared PerfectBlend data and vocabulary mapping from DFlash, but
-# uses the current Eagle 3.1 recipe: three verifier features, a one-layer Llama
-# draft, pre-FC/output normalization, and three teacher-forced TTT steps.
+# uses three verifier features, five full-attention draft layers,
+# pre-FC/output normalization, and teacher-forced TTT steps.
 # Run this script as the cluster job command; do not wrap it in nohup.
 # The prepared data in DATA_DIR must use this model's tokenizer.
 
 set -Eeuo pipefail
 
-REPO="/inspire/sfs/project/inf-multimodal/public/wumengke/speculators"
-MODEL="/inspire/sfs/project/inf-multimodal/public/share_base_models/Qwen3.6/Qwen3.6-35B-A3B"
-# Eagle3 and DFlash can share the tokenized data and vocabulary-map artifacts.
-DATA_DIR="${DATA_DIR:-$REPO/output/dflash_qwen3_6_35b_a3b_perfectblend_online_500k/data}"
-RUN_DIR="$REPO/output/eagle3_qwen3_6_35b_a3b_perfectblend_online_500k"
-CHECKPOINT_DIR="$RUN_DIR/checkpoints"
-TENSORBOARD_DIR="$RUN_DIR/tensorboard"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_REPO="$(cd -- "$SCRIPT_DIR/../../.." && pwd)"
+
+export REPO="${REPO:-$DEFAULT_REPO}"
+export ROOT="${ROOT:-$(dirname -- "$REPO")}"
+export ENV_REPO="${ENV_REPO:-$ROOT/speculators}"
+
+MODEL="${MODEL:-$ROOT/model_weights/Qwen/Qwen3.6-35B-A3B}"
+DATA_DIR="${DATA_DIR:-$ROOT/datasets/qwen3_6_35b_500k}"
+export RUN_DIR="${RUN_DIR:-$ROOT/model_weights/eagle3_1_qwen3_6_35b_a3b_5full}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-$RUN_DIR/checkpoints}"
+TENSORBOARD_DIR="${TENSORBOARD_DIR:-$RUN_DIR/tensorboard}"
+
 VLLM_PORT="${VLLM_PORT:-8100}"
+VLLM_ENDPOINT="${VLLM_ENDPOINT:-http://localhost:${VLLM_PORT}/v1}"
+VLLM_HEALTH_ENDPOINT="${VLLM_HEALTH_ENDPOINT:-http://localhost:${VLLM_PORT}/health}"
 DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-32000}"
 MASK_TOKEN_ID="${MASK_TOKEN_ID:-248077}"
-NUM_LAYERS=1
 TTT_STEPS="${TTT_STEPS:-7}"
 LR="${LR:-1e-4}"
-# The single Eagle3 draft layer uses full attention; SWA is disabled.
-FULL_ATTENTION_INDICES=(0)
-# For a 40-layer verifier these are Eagle3's standard early/middle/late hidden
-# states. launch_vllm.py appends layer 40 automatically as the KL-loss target;
-# only the three auxiliary indices are passed to the trainer.
-TARGET_LAYER_IDS=(2 20 37)
 JOB_TAG="${SLURM_JOB_ID:-${JOB_ID:-$$}}"
-HIDDEN_STATES_DIR="${TMPDIR:-/tmp}/eagle3_qwen3_6_35b_a3b_${JOB_TAG}_hidden_states"
-VLLM_LOG="$RUN_DIR/vllm_${JOB_TAG}.log"
+HIDDEN_STATES_DIR="${HIDDEN_STATES_DIR:-/tmp/eagle3_qwen3_6_35b_a3b_hidden_states}"
+VLLM_LOG="${VLLM_LOG:-$RUN_DIR/vllm_${JOB_TAG}.log}"
 
-SPEC_PYTHON="$REPO/speculators_venv/bin/python"
-TORCHRUN="$REPO/speculators_venv/bin/torchrun"
-VLLM_PYTHON="$REPO/vllm_venv/bin/python"
+SPEC_PYTHON="${SPEC_PYTHON:-$ENV_REPO/speculators_venv/bin/python}"
+TORCHRUN="${TORCHRUN:-$ENV_REPO/speculators_venv/bin/torchrun}"
+VLLM_PYTHON="${VLLM_PYTHON:-$ENV_REPO/vllm_venv/bin/python}"
+LAUNCH_VLLM="${LAUNCH_VLLM:-$REPO/scripts/launch_vllm.py}"
+TRAIN_SCRIPT="${TRAIN_SCRIPT:-$REPO/scripts/train.py}"
+LOCAL_PYTHONPATH="${LOCAL_PYTHONPATH:-$REPO/src:$REPO/hs_connectors/src}"
 
 mkdir -p "$RUN_DIR" "$CHECKPOINT_DIR" "$TENSORBOARD_DIR" "$HIDDEN_STATES_DIR"
 
@@ -125,12 +129,12 @@ echo "Model:             $MODEL"
 echo "Data:              $DATA_DIR"
 echo "Checkpoints:       $CHECKPOINT_DIR"
 echo "TensorBoard:       $TENSORBOARD_DIR/$JOB_TAG"
-echo "Eagle3 layers:     $NUM_LAYERS"
+echo "Eagle3 layers:     5"
 echo "TTT steps:         $TTT_STEPS"
-echo "Target layers:     ${TARGET_LAYER_IDS[*]}"
+echo "Target layers:     2 20 37"
 echo "Mask token ID:     $MASK_TOKEN_ID"
 echo "Learning rate:     $LR"
-echo "Full-attn layers:  ${FULL_ATTENTION_INDICES[*]}"
+echo "Full-attn layers:  0 1 2 3 4"
 echo "vLLM GPUs:         $VLLM_GPUS"
 echo "Training GPUs:     $TRAIN_GPUS"
 echo "vLLM log:          $VLLM_LOG"
@@ -149,14 +153,17 @@ PY
 echo "=== Launching vLLM ==="
 setsid env \
     CUDA_VISIBLE_DEVICES="$VLLM_GPUS" \
+    PYTHONPATH="$LOCAL_PYTHONPATH" \
     PYTHONUNBUFFERED=1 \
-    "$VLLM_PYTHON" "$REPO/scripts/launch_vllm.py" "$MODEL" \
-    --target-layer-ids "${TARGET_LAYER_IDS[@]}" \
+    "$VLLM_PYTHON" \
+    "$LAUNCH_VLLM" \
+    "$MODEL" \
+    --target-layer-ids 2 20 37 \
     --hidden-states-path "$HIDDEN_STATES_DIR" \
     -- \
     --tensor-parallel-size 1 \
     --data-parallel-size 2 \
-    --max-model-len 8200 \
+    --max-model-len 10000 \
     --gpu-memory-utilization 0.92 \
     --port "$VLLM_PORT" \
     >"$VLLM_LOG" 2>&1 &
@@ -164,7 +171,7 @@ VLLM_PID=$!
 
 echo "Waiting for vLLM on port $VLLM_PORT (PID/PGID $VLLM_PID)..."
 deadline=$((SECONDS + 1800))
-until curl -sf "http://localhost:${VLLM_PORT}/health" >/dev/null 2>&1; do
+until curl -sf "$VLLM_HEALTH_ENDPOINT" >/dev/null 2>&1; do
     if ! kill -0 "$VLLM_PID" 2>/dev/null; then
         echo "vLLM exited before becoming healthy. Last log lines:" >&2
         tail -n 100 "$VLLM_LOG" >&2 || true
@@ -181,11 +188,12 @@ echo "vLLM is healthy."
 echo "=== Launching Eagle3 training ==="
 setsid env \
     CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" \
+    PYTHONPATH="$LOCAL_PYTHONPATH" \
     PYTHONUNBUFFERED=1 \
     "$TORCHRUN" \
     --standalone \
     --nproc_per_node 6 \
-    "$REPO/scripts/train.py" \
+    "$TRAIN_SCRIPT" \
     --verifier-name-or-path "$MODEL" \
     --data-path "$DATA_DIR" \
     --save-path "$CHECKPOINT_DIR" \
@@ -205,7 +213,9 @@ setsid env \
     --draft-hidden-act silu \
     --draft-mrope-full-head-hack \
     --draft-attn-impl simple_flex_attention \
-    --num-layers "$NUM_LAYERS" \
+    --num-layers 5 \
+    --block-size 16 \
+    --max-anchors 1024 \
     --mask-token-id "$MASK_TOKEN_ID" \
     --ttt-steps "$TTT_STEPS" \
     --ttt-step-loss-decay 1.0 \
@@ -215,11 +225,11 @@ setsid env \
     --no-norm-before-fc \
     --fc-norm \
     --norm-output \
-    --full-attention-indices "${FULL_ATTENTION_INDICES[@]}" \
-    --target-layer-ids "${TARGET_LAYER_IDS[@]}" \
+    --full-attention-indices 0 1 2 3 4 \
+    --target-layer-ids 2 20 37 \
     --hidden-states-backend file \
     --hidden-states-path "$HIDDEN_STATES_DIR" \
-    --vllm-endpoint "http://localhost:${VLLM_PORT}/v1" \
+    --vllm-endpoint "$VLLM_ENDPOINT" \
     --request-timeout 300 \
     --max-retries 5 \
     --on-missing generate \
@@ -228,7 +238,7 @@ setsid env \
     --seed 42 \
     --logger tensorboard \
     --log-dir "$TENSORBOARD_DIR" \
-    --run-name "$JOB_TAG" &
+    --run-name eagle3_qwen3_6_35b_a3b_5full &
 TRAIN_PID=$!
 
 # Keep the cluster job attached to training. Its stdout/stderr is therefore

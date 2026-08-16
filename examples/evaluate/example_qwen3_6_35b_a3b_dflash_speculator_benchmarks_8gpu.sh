@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Run RedHatAI/speculator_benchmarks on eight independent single-GPU vLLM
-# replicas. Each replica serves one request at a time; the benchmark subsets
-# are sharded across replicas to reduce wall-clock time without changing the
-# single-replica model topology.
+# Run the five-layer Qwen3.6-35B-A3B DFlash checkpoint on eight independent
+# single-GPU vLLM replicas. Nine benchmark subsets are sharded across the eight
+# workers, then acceptance and latency CSVs are merged.
 
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-WORKSPACE="/inspire/sfs/project/inf-multimodal/public/wumengke"
-REPO="$WORKSPACE/speculators"
-SINGLE_GPU_SCRIPT="$SCRIPT_DIR/example_qwen3_6_35b_a3b_domino_speculator_benchmarks.sh"
-MODEL="${MODEL:-$WORKSPACE/model_weights/domino_qwen3_6_35b_a3b_5full/checkpoints/0}"
+REPO="${REPO:-$(cd -- "$SCRIPT_DIR/../.." && pwd)}"
+WORKSPACE="${WORKSPACE:-$(dirname -- "$REPO")}"
+RUNTIME_REPO="${RUNTIME_REPO:-$WORKSPACE/speculators}"
+SINGLE_GPU_SCRIPT="$REPO/examples/evaluate/example_qwen3_6_35b_a3b_dflash_speculator_benchmarks.sh"
+MODEL="${MODEL:-$WORKSPACE/model_weights/dflash_qwen3_6_35b_a3b_5full/checkpoints/0}"
 VERIFIER_MODEL="${VERIFIER_MODEL:-$WORKSPACE/model_weights/Qwen/Qwen3.6-35B-A3B}"
 
 GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
@@ -18,7 +18,10 @@ BASE_PORT="${BASE_PORT:-8108}"
 BASE_INTERNAL_PORT="${BASE_INTERNAL_PORT:-20000}"
 MAX_REQUESTS="${MAX_REQUESTS:-200}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-12288}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-15}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-4096}"
 TEMPERATURE="${TEMPERATURE:-0}"
 HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
@@ -29,7 +32,7 @@ if [[ -z "${GEN_KWARGS+x}" ]]; then
 fi
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-OUTPUT_ROOT="${OUTPUT_ROOT:-$WORKSPACE/evaluation_results/domino_qwen3_6_35b_a3b_ckpt0_spec${NUM_SPECULATIVE_TOKENS}_8gpu_${TIMESTAMP}}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$WORKSPACE/evaluation_results/dflash_qwen3_6_35b_a3b_5full_ckpt0_spec${NUM_SPECULATIVE_TOKENS}_8gpu_${TIMESTAMP}}"
 
 IFS=',' read -r -a GPU_ARRAY <<< "$GPU_IDS"
 WORKLOADS=(
@@ -55,6 +58,15 @@ if [[ ! -x "$SINGLE_GPU_SCRIPT" ]]; then
     echo "Missing executable script: $SINGLE_GPU_SCRIPT" >&2
     exit 1
 fi
+for path in \
+    "$MODEL/config.json" \
+    "$MODEL/model.safetensors" \
+    "$VERIFIER_MODEL/config.json"; do
+    if [[ ! -f "$path" ]]; then
+        echo "Missing required file: $path" >&2
+        exit 1
+    fi
+done
 
 for index in "${!GPU_ARRAY[@]}"; do
     gpu="${GPU_ARRAY[$index]}"
@@ -103,18 +115,19 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-echo "=== Eight-GPU evaluation ==="
+echo "=== Eight-GPU DFlash evaluation ==="
 echo "Draft model:         $MODEL"
 echo "Verifier model:      $VERIFIER_MODEL"
 echo "Speculative tokens:  $NUM_SPECULATIVE_TOKENS"
-echo "GPUs:              $GPU_IDS"
+echo "GPUs:                $GPU_IDS"
 echo "Per-GPU concurrency: $MAX_CONCURRENCY"
 echo "Global concurrency:  ${#GPU_ARRAY[@]}"
-echo "Max output tokens: $MAX_OUTPUT_TOKENS"
-echo "Generation kwargs: $GEN_KWARGS"
-echo "Request endpoint:  /v1/chat/completions"
-echo "HF endpoint:       $HF_ENDPOINT"
-echo "Output root:       $OUTPUT_ROOT"
+echo "Max model length:    $MAX_MODEL_LEN"
+echo "Max output tokens:   $MAX_OUTPUT_TOKENS"
+echo "Generation kwargs:   $GEN_KWARGS"
+echo "Request endpoint:    /v1/chat/completions"
+echo "HF endpoint:         $HF_ENDPOINT"
+echo "Output root:         $OUTPUT_ROOT"
 
 for index in "${!GPU_ARRAY[@]}"; do
     gpu="${GPU_ARRAY[$index]}"
@@ -128,16 +141,22 @@ for index in "${!GPU_ARRAY[@]}"; do
 
     echo "Launching GPU $gpu on API port $port (internal $internal_port) for: $subsets"
     setsid env \
-        CUDA_VISIBLE_DEVICES="$gpu" \
+        REPO="$REPO" \
+        WORKSPACE="$WORKSPACE" \
+        RUNTIME_REPO="$RUNTIME_REPO" \
         MODEL="$MODEL" \
         VERIFIER_MODEL="$VERIFIER_MODEL" \
         NUM_SPECULATIVE_TOKENS="$NUM_SPECULATIVE_TOKENS" \
+        CUDA_VISIBLE_DEVICES="$gpu" \
         VLLM_PORT="$port" \
         VLLM_INTERNAL_PORT="$internal_port" \
         SUBSETS="$subsets" \
         OUTPUT_DIR="$worker_dir" \
         MAX_REQUESTS="$MAX_REQUESTS" \
         MAX_CONCURRENCY="$MAX_CONCURRENCY" \
+        MAX_MODEL_LEN="$MAX_MODEL_LEN" \
+        MAX_NUM_SEQS="$MAX_NUM_SEQS" \
+        GPU_MEMORY_UTILIZATION="$GPU_MEMORY_UTILIZATION" \
         MAX_OUTPUT_TOKENS="$MAX_OUTPUT_TOKENS" \
         TEMPERATURE="$TEMPERATURE" \
         GEN_KWARGS="$GEN_KWARGS" \

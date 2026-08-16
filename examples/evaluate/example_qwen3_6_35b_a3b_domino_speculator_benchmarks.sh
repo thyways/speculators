@@ -15,7 +15,8 @@ set -Eeuo pipefail
 
 WORKSPACE="/inspire/sfs/project/inf-multimodal/public/wumengke"
 REPO="$WORKSPACE/speculators"
-MODEL="$WORKSPACE/model_weights/domino_qwen3_6_35b_a3b_perfectblend_online_500k/checkpoints/0"
+MODEL="${MODEL:-$WORKSPACE/model_weights/domino_qwen3_6_35b_a3b_5full/checkpoints/0}"
+VERIFIER_MODEL="${VERIFIER_MODEL:-$WORKSPACE/model_weights/Qwen/Qwen3.6-35B-A3B}"
 DATASET="RedHatAI/speculator_benchmarks"
 HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 
@@ -30,6 +31,7 @@ MAX_REQUESTS="${MAX_REQUESTS:-200}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-12288}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
+NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-15}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-4096}"
 TEMPERATURE="${TEMPERATURE:-1}"
@@ -38,7 +40,7 @@ if [[ -z "${GEN_KWARGS+x}" ]]; then
 fi
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-OUTPUT_DIR="${OUTPUT_DIR:-$WORKSPACE/evaluation_results/domino_qwen3_6_35b_a3b_ckpt0_${TIMESTAMP}}"
+OUTPUT_DIR="${OUTPUT_DIR:-$WORKSPACE/evaluation_results/domino_qwen3_6_35b_a3b_ckpt0_spec${NUM_SPECULATIVE_TOKENS}_${TIMESTAMP}}"
 VLLM_LOG="$OUTPUT_DIR/vllm.log"
 
 VLLM_PYTHON="$REPO/vllm_venv/bin/python"
@@ -46,10 +48,10 @@ EVAL_PYTHON="$REPO/speculators_venv/bin/python"
 GUIDELLM="$REPO/speculators_venv/bin/guidellm"
 EVALUATE_PY="$REPO/scripts/evaluate/evaluate.py"
 
-# The checkpoint was trained from the Domino integration branch. The main
-# worktree may be on another branch, so materialize the matching serving source
-# without switching or modifying that worktree.
-DOMINO_SOURCE_COMMIT="${DOMINO_SOURCE_COMMIT:-231dd13fbac522d4a675fe822f726d74eb6c659c}"
+# Use the current worktree by default so serving fixes are not silently bypassed
+# by an archived source snapshot. Set DOMINO_SOURCE_COMMIT explicitly only when
+# reproducing an older revision.
+DOMINO_SOURCE_COMMIT="${DOMINO_SOURCE_COMMIT:-}"
 DOMINO_SOURCE_DIR=""
 VLLM_PID=""
 
@@ -88,7 +90,11 @@ for executable in "$VLLM_PYTHON" "$EVAL_PYTHON" "$GUIDELLM"; do
     fi
 done
 
-for path in "$MODEL/config.json" "$MODEL/model.safetensors" "$EVALUATE_PY"; do
+for path in \
+    "$MODEL/config.json" \
+    "$MODEL/model.safetensors" \
+    "$VERIFIER_MODEL/config.json" \
+    "$EVALUATE_PY"; do
     if [[ ! -f "$path" ]]; then
         echo "Missing required file: $path" >&2
         exit 1
@@ -99,22 +105,34 @@ if [[ "$MODE" != "throughput" && "$MODE" != "sweep" ]]; then
     echo "MODE must be 'throughput' or 'sweep', got: $MODE" >&2
     exit 1
 fi
-
-if ! git -C "$REPO" cat-file -e "${DOMINO_SOURCE_COMMIT}^{commit}"; then
-    echo "Domino source commit is unavailable: $DOMINO_SOURCE_COMMIT" >&2
+if [[ ! "$NUM_SPECULATIVE_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "NUM_SPECULATIVE_TOKENS must be a positive integer, got: $NUM_SPECULATIVE_TOKENS" >&2
     exit 1
 fi
 
-DOMINO_SOURCE_DIR="$(mktemp -d /tmp/speculators-domino-eval.XXXXXX)"
-git -C "$REPO" archive "$DOMINO_SOURCE_COMMIT" \
-    src/speculators hs_connectors/src/hs_connectors \
-    | tar -x -C "$DOMINO_SOURCE_DIR"
-PLUGIN_PYTHONPATH="$DOMINO_SOURCE_DIR/src:$DOMINO_SOURCE_DIR/hs_connectors/src"
+if [[ -n "$DOMINO_SOURCE_COMMIT" ]]; then
+    if ! git -C "$REPO" cat-file -e "${DOMINO_SOURCE_COMMIT}^{commit}"; then
+        echo "Domino source commit is unavailable: $DOMINO_SOURCE_COMMIT" >&2
+        exit 1
+    fi
+    DOMINO_SOURCE_DIR="$(mktemp -d /tmp/speculators-domino-eval.XXXXXX)"
+    git -C "$REPO" archive "$DOMINO_SOURCE_COMMIT" \
+        src/speculators hs_connectors/src/hs_connectors \
+        | tar -x -C "$DOMINO_SOURCE_DIR"
+    PLUGIN_PYTHONPATH="$DOMINO_SOURCE_DIR/src:$DOMINO_SOURCE_DIR/hs_connectors/src"
+    DOMINO_SOURCE_LABEL="commit $DOMINO_SOURCE_COMMIT"
+else
+    PLUGIN_PYTHONPATH="$REPO/src:$REPO/hs_connectors/src"
+    DOMINO_SOURCE_LABEL="current worktree"
+fi
 
 mkdir -p "$OUTPUT_DIR"
 
 echo "=== Configuration ==="
-echo "Model:             $MODEL"
+echo "Draft model:       $MODEL"
+echo "Verifier model:    $VERIFIER_MODEL"
+echo "Serving source:    $DOMINO_SOURCE_LABEL"
+echo "Speculative tokens: $NUM_SPECULATIVE_TOKENS"
 echo "Dataset:           $DATASET"
 echo "HF endpoint:       $HF_ENDPOINT"
 echo "Subsets:           $SUBSETS"
@@ -137,11 +155,14 @@ setsid env \
     VLLM_USE_V2_MODEL_RUNNER=1 \
     VLLM_PORT="$VLLM_INTERNAL_PORT" \
     TOKENIZERS_PARALLELISM=false \
-    "$VLLM_PYTHON" -m vllm.entrypoints.cli.main serve "$MODEL" \
+    "$VLLM_PYTHON" -m vllm.entrypoints.cli.main serve "$VERIFIER_MODEL" \
         --host 127.0.0.1 \
         --port "$VLLM_PORT" \
         --tensor-parallel-size 1 \
         --data-parallel-size 1 \
+        --spec-model "$MODEL" \
+        --spec-method dspark \
+        --spec-tokens "$NUM_SPECULATIVE_TOKENS" \
         --max-model-len "$MAX_MODEL_LEN" \
         --max-num-seqs "$MAX_NUM_SEQS" \
         --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \

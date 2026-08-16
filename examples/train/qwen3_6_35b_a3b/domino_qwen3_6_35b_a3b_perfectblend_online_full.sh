@@ -2,33 +2,40 @@
 
 set -Eeuo pipefail
 
-REPO="/inspire/sfs/project/inf-multimodal/public/wumengke/speculators"
-MODEL="/inspire/sfs/project/inf-multimodal/public/wumengke/model_weights/Qwen/Qwen3.6-35B-A3B"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_REPO="$(cd -- "$SCRIPT_DIR/../../.." && pwd)"
 
-DATA_DIR="/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/qwen3_6_35b_500k"
-RUN_DIR="$REPO/output/domino_qwen3_6_35b_a3b_perfectblend_online_500k"
-CHECKPOINT_DIR="$RUN_DIR/checkpoints"
-TENSORBOARD_DIR="$RUN_DIR/tensorboard"
+export REPO="${REPO:-$DEFAULT_REPO}"
+export ROOT="${ROOT:-$(dirname -- "$REPO")}"
+export ENV_REPO="${ENV_REPO:-$ROOT/speculators}"
+
+MODEL="${MODEL:-$ROOT/model_weights/Qwen/Qwen3.6-35B-A3B}"
+DATA_DIR="${DATA_DIR:-$ROOT/datasets/qwen3_6_35b_500k}"
+export RUN_DIR="${RUN_DIR:-$ROOT/model_weights/domino_qwen3_6_35b_a3b_5full}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-$RUN_DIR/checkpoints}"
+TENSORBOARD_DIR="${TENSORBOARD_DIR:-$RUN_DIR/tensorboard}"
+
 VLLM_PORT="${VLLM_PORT:-8300}"
-DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-32000}"
+VLLM_ENDPOINT="${VLLM_ENDPOINT:-http://localhost:${VLLM_PORT}/v1}"
+VLLM_HEALTH_ENDPOINT="${VLLM_HEALTH_ENDPOINT:-http://localhost:${VLLM_PORT}/health}"
 
-BLOCK_SIZE="${BLOCK_SIZE:-8}"
 GRU_HIDDEN_DIM="${GRU_HIDDEN_DIM:-1024}"
 LOGITS_CORRECTION_EMB_DIM="${LOGITS_CORRECTION_EMB_DIM:-256}"
 PURE_DRAFT_PREFIX_LEN="${PURE_DRAFT_PREFIX_LEN:-1}"
 LAMBDA_BASE_START="${LAMBDA_BASE_START:-1.0}"
 LAMBDA_BASE_DECAY_RATIO="${LAMBDA_BASE_DECAY_RATIO:-1.0}"
-DECAY_GAMMA="${DECAY_GAMMA:-7.0}"
 DEFAULT_LOSS_FN='kl_div'
 LOSS_FN="${LOSS_FN:-$DEFAULT_LOSS_FN}"
-TARGET_LAYER_IDS=(2 7 12 17 23 28 33 38)
 JOB_TAG="${SLURM_JOB_ID:-${JOB_ID:-$$}}"
-HIDDEN_STATES_DIR="${TMPDIR:-/tmp}/domino_qwen3_6_35b_a3b_${JOB_TAG}_hidden_states"
-VLLM_LOG="$RUN_DIR/vllm_${JOB_TAG}.log"
+HIDDEN_STATES_DIR="${HIDDEN_STATES_DIR:-/tmp/domino_qwen3_6_35b_a3b_hidden_states}"
+VLLM_LOG="${VLLM_LOG:-$RUN_DIR/vllm_${JOB_TAG}.log}"
 
-SPEC_PYTHON="$REPO/speculators_venv/bin/python"
-TORCHRUN="$REPO/speculators_venv/bin/torchrun"
-VLLM_PYTHON="$REPO/vllm_venv/bin/python"
+SPEC_PYTHON="${SPEC_PYTHON:-$ENV_REPO/speculators_venv/bin/python}"
+TORCHRUN="${TORCHRUN:-$ENV_REPO/speculators_venv/bin/torchrun}"
+VLLM_PYTHON="${VLLM_PYTHON:-$ENV_REPO/vllm_venv/bin/python}"
+LAUNCH_VLLM="${LAUNCH_VLLM:-$REPO/scripts/launch_vllm.py}"
+TRAIN_SCRIPT="${TRAIN_SCRIPT:-$REPO/scripts/train.py}"
+LOCAL_PYTHONPATH="${LOCAL_PYTHONPATH:-$REPO/src:$REPO/hs_connectors/src}"
 
 mkdir -p "$RUN_DIR" "$CHECKPOINT_DIR" "$TENSORBOARD_DIR" "$HIDDEN_STATES_DIR"
 
@@ -124,7 +131,6 @@ echo "vLLM GPUs:        $VLLM_GPUS"
 echo "Training GPUs:    $TRAIN_GPUS"
 echo "GRU head:         hidden $GRU_HIDDEN_DIM, emb $LOGITS_CORRECTION_EMB_DIM"
 echo "Base anchoring:   lambda $LAMBDA_BASE_START over $LAMBDA_BASE_DECAY_RATIO of the run"
-echo "Decay gamma:      $DECAY_GAMMA"
 echo "Domino loss:      $LOSS_FN"
 echo "vLLM log:         $VLLM_LOG"
 
@@ -142,14 +148,17 @@ PY
 echo "=== Launching vLLM ==="
 setsid env \
     CUDA_VISIBLE_DEVICES="$VLLM_GPUS" \
+    PYTHONPATH="$LOCAL_PYTHONPATH" \
     PYTHONUNBUFFERED=1 \
-    "$VLLM_PYTHON" "$REPO/scripts/launch_vllm.py" "$MODEL" \
-    --target-layer-ids "${TARGET_LAYER_IDS[@]}" \
+    "$VLLM_PYTHON" \
+    "$LAUNCH_VLLM" \
+    "$MODEL" \
+    --target-layer-ids 2 7 12 17 23 28 33 38 \
     --hidden-states-path "$HIDDEN_STATES_DIR" \
     -- \
     --tensor-parallel-size 1 \
     --data-parallel-size 2 \
-    --max-model-len 8200 \
+    --max-model-len 10000 \
     --gpu-memory-utilization 0.92 \
     --port "$VLLM_PORT" \
     >"$VLLM_LOG" 2>&1 &
@@ -157,7 +166,7 @@ VLLM_PID=$!
 
 echo "Waiting for vLLM on port $VLLM_PORT (PID/PGID $VLLM_PID)..."
 deadline=$((SECONDS + 1800))
-until curl -sf "http://localhost:${VLLM_PORT}/health" >/dev/null 2>&1; do
+until curl -sf "$VLLM_HEALTH_ENDPOINT" >/dev/null 2>&1; do
     if ! kill -0 "$VLLM_PID" 2>/dev/null; then
         echo "vLLM exited before becoming healthy. Last log lines:" >&2
         tail -n 100 "$VLLM_LOG" >&2 || true
@@ -174,15 +183,16 @@ echo "vLLM is healthy."
 echo "=== Launching Domino training ==="
 setsid env \
     CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" \
+    PYTHONPATH="$LOCAL_PYTHONPATH" \
     PYTHONUNBUFFERED=1 \
     "$TORCHRUN" \
     --standalone \
     --nproc_per_node 6 \
-    "$REPO/scripts/train.py" \
+    "$TRAIN_SCRIPT" \
     --verifier-name-or-path "$MODEL" \
     --data-path "$DATA_DIR" \
     --save-path "$CHECKPOINT_DIR" \
-    --draft-vocab-size "$DRAFT_VOCAB_SIZE" \
+    --draft-vocab-size 32000 \
     --epochs 1 \
     --train-data-ratio 0.98 \
     --optimizer adamw \
@@ -193,28 +203,25 @@ setsid env \
     --scheduler-warmup-ratio 0.04 \
     --total-seq-len 4096 \
     --speculator-type domino \
-    --block-size "$BLOCK_SIZE" \
+    --block-size 16 \
     --sample-from-anchor \
     --max-anchors 1024 \
-    --dflash-decay-gamma "$DECAY_GAMMA" \
-    --num-layers 6 \
-    --sliding-window 2048 \
-    --full-attention-indices 5 \
-    --sliding-window-non-causal \
-    --target-layer-ids "${TARGET_LAYER_IDS[@]}" \
+    --num-layers 5 \
+    --full-attention-indices 0 1 2 3 4 \
+    --target-layer-ids 2 7 12 17 23 28 33 38 \
     --gru-hidden-dim "$GRU_HIDDEN_DIM" \
     --logits-correction-emb-dim "$LOGITS_CORRECTION_EMB_DIM" \
     --pure-draft-prefix-len "$PURE_DRAFT_PREFIX_LEN" \
     --lambda-base-start "$LAMBDA_BASE_START" \
     --lambda-base-decay-ratio "$LAMBDA_BASE_DECAY_RATIO" \
     --loss-fn "$LOSS_FN" \
-    --vllm-endpoint "http://localhost:${VLLM_PORT}/v1" \
+    --vllm-endpoint "$VLLM_ENDPOINT" \
     --request-timeout 300 \
     --on-missing generate \
     --on-generate delete \
     --logger tensorboard \
     --log-dir "$TENSORBOARD_DIR" \
-    --run-name "$JOB_TAG" &
+    --run-name domino_qwen3_6_35b_a3b_5full &
 TRAIN_PID=$!
 
 # Keep the cluster job attached to training. Its stdout/stderr is therefore

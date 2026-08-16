@@ -16,6 +16,7 @@ Algorithms therefore register into this module and let it patch vLLM once:
 * :func:`register_config_updater` -- Speculators-config -> vLLM draft config.
 * :func:`register_speculative_method_alias` -- route ``method`` to a runtime.
 * :func:`register_init_hook` -- adjust a constructed speculator in place.
+* :func:`register_speculative_config_updater` -- finalize the vLLM proposal config.
 * :func:`install_config_patches` / :func:`install_speculator_patches` --
   idempotent, safe to call from every plugin's ``register()``.
 
@@ -57,6 +58,11 @@ _SPECULATOR_PATCH_MARKER = "_speculators_family_speculator_patched"
 _METHOD_ALIASES: dict[str, str] = {}
 # hooks run after DSparkSpeculator.__init__, in registration order
 _INIT_HOOKS: list[Callable[[Any, torch.device], None]] = []
+# algorithm name -> final mutation of vLLM's speculative-config dictionary
+_SPECULATIVE_CONFIG_UPDATERS: dict[
+    str,
+    Callable[[dict[str, Any], dict[str, Any]], None],
+] = {}
 
 
 def register_speculative_method_alias(method: str, runtime: str) -> None:
@@ -72,6 +78,14 @@ def register_init_hook(hook: Callable[[Any, torch.device], None]) -> None:
     """
     if hook not in _INIT_HOOKS:
         _INIT_HOOKS.append(hook)
+
+
+def register_speculative_config_updater(
+    algorithm: str,
+    updater: Callable[[dict[str, Any], dict[str, Any]], None],
+) -> None:
+    """Finalize one algorithm's vLLM speculative config after translation."""
+    _SPECULATIVE_CONFIG_UPDATERS[algorithm] = updater
 
 
 def register_config_updater(
@@ -95,6 +109,24 @@ def map_speculative_method(config: dict[str, Any]) -> dict[str, Any]:
     config = dict(config)
     config["method"] = runtime
     return config
+
+
+def finalize_speculative_config(
+    config_dict: dict[str, Any],
+    speculative_config: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply the shared method alias and an algorithm-specific finalizer."""
+    speculative_config = map_speculative_method(speculative_config)
+    algorithm = config_dict.get("speculators_model_type")
+    updater = (
+        _SPECULATIVE_CONFIG_UPDATERS.get(algorithm)
+        if isinstance(algorithm, str)
+        else None
+    )
+    if updater is not None:
+        speculative_config = dict(speculative_config)
+        updater(config_dict, speculative_config)
+    return speculative_config
 
 
 def normalize_rope(pre_trained_config: dict[str, Any]) -> None:
@@ -136,9 +168,7 @@ def resolve_dspark_target_hidden_size(
     if target_hidden_size is None:
         target_hidden_size = pre_trained_config.get("hidden_size")
     if not isinstance(target_hidden_size, int) or target_hidden_size <= 0:
-        raise ValueError(
-            "DSpark target_hidden_size must be a positive integer."
-        )
+        raise ValueError("DSpark target_hidden_size must be a positive integer.")
     pre_trained_config["target_hidden_size"] = target_hidden_size
 
 
@@ -147,16 +177,19 @@ def propagate_intra_block_causality(
     pre_trained_config: dict[str, Any],
     default: bool | None = None,
 ) -> None:
-    """Carry the checkpoint's intra-block causality onto the draft config.
+    """Match vLLM's per-layer draft mask to the training-time mask.
 
-    Without ``dflash_config.causal`` vLLM falls back to "sliding-window layers
-    are causal, full-attention layers are not" (see ``_dflash_layer_causal`` in
-    ``qwen3_dflash.py``). vLLM's own DFlash updater sets the key from
-    ``sliding_window_non_causal``, but its DSpark updater never writes
-    ``dflash_config`` at all -- so a DSpark draft trained with
-    ``--sliding-window-non-causal`` gets served with its sliding-window layers
-    made causal, a train/serve mismatch on every such layer that quietly costs
-    acceptance length.
+    Training always makes full-attention draft layers non-causal. The
+    ``sliding_window_non_causal`` flag only controls sliding-window layers.
+    vLLM's ``dflash_config.causal`` is instead a *global* override, so writing
+    ``causal=True`` when the flag is false incorrectly turns full-attention
+    layers causal too. That is the train/serve mismatch that hurts acceptance
+    for all-full checkpoints.
+
+    When sliding-window attention was trained non-causally, set the global
+    override to ``False``. Otherwise remove the override and let vLLM's
+    per-layer fallback keep full-attention layers non-causal and sliding-window
+    layers causal.
 
     ``default`` is the ``sliding_window_non_causal`` value to assume when the
     checkpoint omits the field. Leave it ``None`` to skip untouched -- correct
@@ -170,9 +203,15 @@ def propagate_intra_block_causality(
     if not isinstance(non_causal, bool):
         raise TypeError("sliding_window_non_causal must be a boolean.")
 
+    had_dflash_config = "dflash_config" in pre_trained_config
     dflash_config = dict(pre_trained_config.get("dflash_config") or {})
-    dflash_config["causal"] = not non_causal
-    pre_trained_config["dflash_config"] = dflash_config
+    if non_causal:
+        dflash_config["causal"] = False
+    else:
+        dflash_config.pop("causal", None)
+
+    if dflash_config or had_dflash_config:
+        pre_trained_config["dflash_config"] = dflash_config
 
 
 def _emit_step_token(
@@ -259,9 +298,7 @@ def sample_sequential_block(
             state = model.advance_recurrent_state(prev, state)
 
         if has_hidden_correction:
-            corrected = model.apply_hidden_correction(
-                hidden_per_step[:, step], prev
-            )
+            corrected = model.apply_hidden_correction(hidden_per_step[:, step], prev)
             logits_step = model.compute_draft_logits(corrected)
         else:
             if base_logits is None:
@@ -306,7 +343,17 @@ def install_config_patches() -> None:
     if getattr(SpeculatorsConfig, _CONFIG_PATCH_MARKER, False):
         return
 
+    original_dflash_updater = SUPPORTED_SPECULATORS_TYPES["dflash"]
     original_dspark_updater = SUPPORTED_SPECULATORS_TYPES["dspark"]
+
+    def update_dflash(
+        config_dict: dict[str, Any],
+        pre_trained_config: dict[str, Any],
+    ) -> None:
+        original_dflash_updater(config_dict, pre_trained_config)
+        # Upstream currently translates ``False`` into global ``causal=True``.
+        # Repair that override after running the rest of its config mapping.
+        propagate_intra_block_causality(config_dict, pre_trained_config)
 
     def update_dspark(
         config_dict: dict[str, Any],
@@ -317,6 +364,7 @@ def install_config_patches() -> None:
         resolve_dspark_target_hidden_size(config_dict, pre_trained_config)
         propagate_intra_block_causality(config_dict, pre_trained_config)
 
+    SUPPORTED_SPECULATORS_TYPES["dflash"] = update_dflash
     SUPPORTED_SPECULATORS_TYPES["dspark"] = update_dspark
 
     original = SpeculatorsConfig.build_vllm_speculative_config.__func__
@@ -326,11 +374,12 @@ def install_config_patches() -> None:
         cls: type,
         config_dict: dict[str, Any],
     ) -> dict[str, Any]:
-        return map_speculative_method(original(cls, config_dict))
+        return finalize_speculative_config(
+            config_dict,
+            original(cls, config_dict),
+        )
 
-    SpeculatorsConfig.build_vllm_speculative_config = (
-        build_vllm_speculative_config
-    )
+    SpeculatorsConfig.build_vllm_speculative_config = build_vllm_speculative_config
     setattr(SpeculatorsConfig, _CONFIG_PATCH_MARKER, True)
 
 

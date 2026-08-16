@@ -5,15 +5,19 @@
 
 set -Eeuo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="/inspire/sfs/project/inf-multimodal/public/wumengke"
 REPO="$WORKSPACE/speculators"
-SINGLE_GPU_SCRIPT="$REPO/examples/evaluate/example_qwen3_6_35b_a3b_dspark_speculator_benchmarks.sh"
+SINGLE_GPU_SCRIPT="$SCRIPT_DIR/example_qwen3_6_35b_a3b_dspark_speculator_benchmarks.sh"
+MODEL="${MODEL:-$WORKSPACE/model_weights/dspark_qwen3_6_35b_a3b_perfectblend_online_500k/checkpoints/0}"
+VERIFIER_MODEL="${VERIFIER_MODEL:-$WORKSPACE/model_weights/Qwen/Qwen3.6-35B-A3B}"
 
 GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
 BASE_PORT="${BASE_PORT:-8108}"
 BASE_INTERNAL_PORT="${BASE_INTERNAL_PORT:-20000}"
 MAX_REQUESTS="${MAX_REQUESTS:-200}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
+NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-8}"
 MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-4096}"
 TEMPERATURE="${TEMPERATURE:-0}"
 HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
@@ -24,7 +28,7 @@ if [[ -z "${GEN_KWARGS+x}" ]]; then
 fi
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-OUTPUT_ROOT="${OUTPUT_ROOT:-$WORKSPACE/evaluation_results/dspark_qwen3_6_35b_a3b_ckpt0_8gpu_${TIMESTAMP}}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$WORKSPACE/evaluation_results/dspark_qwen3_6_35b_a3b_ckpt0_spec${NUM_SPECULATIVE_TOKENS}_8gpu_${TIMESTAMP}}"
 
 IFS=',' read -r -a GPU_ARRAY <<< "$GPU_IDS"
 WORKLOADS=(
@@ -40,6 +44,10 @@ WORKLOADS=(
 
 if [[ "${#GPU_ARRAY[@]}" -ne "${#WORKLOADS[@]}" ]]; then
     echo "Expected 8 comma-separated GPU IDs, got: $GPU_IDS" >&2
+    exit 1
+fi
+if [[ ! "$NUM_SPECULATIVE_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "NUM_SPECULATIVE_TOKENS must be a positive integer, got: $NUM_SPECULATIVE_TOKENS" >&2
     exit 1
 fi
 if [[ ! -x "$SINGLE_GPU_SCRIPT" ]]; then
@@ -95,6 +103,9 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 echo "=== Eight-GPU DSpark evaluation ==="
+echo "Draft model:         $MODEL"
+echo "Verifier model:      $VERIFIER_MODEL"
+echo "Speculative tokens:  $NUM_SPECULATIVE_TOKENS"
 echo "GPUs:                $GPU_IDS"
 echo "Per-GPU concurrency: $MAX_CONCURRENCY"
 echo "Global concurrency:  ${#GPU_ARRAY[@]}"
@@ -117,6 +128,9 @@ for index in "${!GPU_ARRAY[@]}"; do
     echo "Launching GPU $gpu on API port $port (internal $internal_port) for: $subsets"
     setsid env \
         CUDA_VISIBLE_DEVICES="$gpu" \
+        MODEL="$MODEL" \
+        VERIFIER_MODEL="$VERIFIER_MODEL" \
+        NUM_SPECULATIVE_TOKENS="$NUM_SPECULATIVE_TOKENS" \
         VLLM_PORT="$port" \
         VLLM_INTERNAL_PORT="$internal_port" \
         SUBSETS="$subsets" \

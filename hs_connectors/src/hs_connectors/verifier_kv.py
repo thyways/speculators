@@ -38,14 +38,34 @@ _STANDARD_KV_CACHE_NDIM = 4
 
 @dataclass(frozen=True)
 class SelectedVerifierKV:
-    """Resolved selected verifier cache metadata."""
+    """Resolved selected verifier cache metadata in checkpoint layer order."""
 
     layer_ids: tuple[int, ...]
     layer_names: tuple[str, ...]
-    cache_group_id: int
+    cache_group_ids: tuple[int, ...]
     block_size: int
     num_kv_heads: int
     head_dim: int
+
+    def __post_init__(self) -> None:
+        if not (
+            len(self.layer_ids) == len(self.layer_names) == len(self.cache_group_ids)
+        ):
+            raise ValueError(
+                "verifier layer IDs, names, and cache-group IDs must have "
+                "matching lengths"
+            )
+
+    @property
+    def cache_group_id(self) -> int:
+        """Return the unique group used by single-block-table consumers."""
+        group_ids = set(self.cache_group_ids)
+        if len(group_ids) != 1:
+            raise ValueError(
+                "selected verifier KV layers span multiple cache groups: "
+                f"{self.cache_group_ids}"
+            )
+        return next(iter(group_ids))
 
 
 def _extract_layer_id(layer_name: str) -> int | None:
@@ -85,11 +105,10 @@ def discover_selected_verifier_kv(
     kv_cache_config: KVCacheConfig,
     selected_layer_ids: list[int] | tuple[int, ...],
 ) -> SelectedVerifierKV:
-    """Resolve full-attention cache layer names and their shared cache group.
+    """Resolve selected attention-cache layers and their cache groups.
 
-    The selected layers must all be present in one attention cache group.  This
-    is true for Qwen3.5's ten full-attention layers and is required because the
-    scheduler supplies one block table per cache group.
+    Selected groups may differ at serving time because hybrid cache grouping
+    also includes draft layers. Their block/head geometry must remain identical.
     """
 
     requested = tuple(int(layer_id) for layer_id in selected_layer_ids)
@@ -110,28 +129,43 @@ def discover_selected_verifier_kv(
             f"cache groups; available attention layer IDs: {available}"
         )
 
-    group_ids = {found[layer_id][0] for layer_id in requested}
-    if len(group_ids) != 1:
-        raise ValueError(
-            "selected verifier KV layers must share one cache group, got group IDs "
-            f"{sorted(group_ids)} for layers {requested}"
+    cache_group_ids = tuple(found[layer_id][0] for layer_id in requested)
+    geometry: tuple[int, int, int] | None = None
+    geometry_by_group: dict[int, tuple[int, int, int]] = {}
+    for group_id in dict.fromkeys(cache_group_ids):
+        spec = kv_cache_config.kv_cache_groups[group_id].kv_cache_spec
+        for attribute in ("block_size", "num_kv_heads", "head_size"):
+            if not hasattr(spec, attribute):
+                raise TypeError(
+                    f"selected verifier cache group {group_id} is not a standard "
+                    "attention KV cache: missing "
+                    f"{attribute!r} on {type(spec).__name__}"
+                )
+        group_geometry = (
+            int(spec.block_size),
+            int(spec.num_kv_heads),
+            int(spec.head_size),
         )
-    group_id = group_ids.pop()
-    spec = kv_cache_config.kv_cache_groups[group_id].kv_cache_spec
-    for attribute in ("block_size", "num_kv_heads", "head_size"):
-        if not hasattr(spec, attribute):
-            raise TypeError(
-                f"selected verifier cache group {group_id} is not a standard "
-                f"attention KV cache: missing {attribute!r} on {type(spec).__name__}"
+        geometry_by_group[group_id] = group_geometry
+        if geometry is None:
+            geometry = group_geometry
+        elif group_geometry != geometry:
+            raise ValueError(
+                "selected verifier cache groups must use matching "
+                "block/head geometry, got "
+                f"{geometry_by_group}"
             )
 
+    if geometry is None:
+        raise RuntimeError("selected verifier KV geometry was not resolved")
+    block_size, num_kv_heads, head_dim = geometry
     return SelectedVerifierKV(
         layer_ids=requested,
         layer_names=tuple(found[layer_id][1] for layer_id in requested),
-        cache_group_id=group_id,
-        block_size=int(spec.block_size),
-        num_kv_heads=int(spec.num_kv_heads),
-        head_dim=int(spec.head_size),
+        cache_group_ids=cache_group_ids,
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
     )
 
 
@@ -209,6 +243,9 @@ def extract_selected_verifier_kv(
 
     if not metadata.layer_names:
         raise ValueError("no selected verifier KV layer names were resolved")
+    # The training connector supplies one block table. Fail closed if a future
+    # training topology splits the selected verifier layers across groups.
+    _ = metadata.cache_group_id
     missing = [name for name in metadata.layer_names if name not in kv_caches]
     if missing:
         raise KeyError(f"selected verifier KV cache tensors are missing: {missing}")

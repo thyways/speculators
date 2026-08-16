@@ -315,7 +315,7 @@ class MooncakeBackend(HiddenStatesBackend):
             raise NotImplementedError(
                 "Exporting verifier K/V is currently supported only by the file "
                 "hidden-states backend. Use '--hidden-states-backend file' for "
-                "KV-native DSpark training; Mooncake support has not been wired yet."
+                "KV-native DFlash training; Mooncake support has not been wired yet."
             )
         return {
             "kv_connector": "MooncakeHiddenStatesConnector",

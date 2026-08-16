@@ -15,7 +15,7 @@ def _metadata() -> SelectedVerifierKV:
     return SelectedVerifierKV(
         layer_ids=(3, 11),
         layer_names=("model.layers.3.self_attn", "model.layers.11.self_attn"),
-        cache_group_id=1,
+        cache_group_ids=(1, 1),
         block_size=3,
         num_kv_heads=2,
         head_dim=3,
@@ -65,7 +65,8 @@ def test_discover_layers_and_missing_layer():
     config = SimpleNamespace(
         kv_cache_groups=[
             SimpleNamespace(
-                layer_names=["model.layers.0.linear_attn"], kv_cache_spec=object()
+                layer_names=["model.layers.0.linear_attn"],
+                kv_cache_spec=object(),
             ),
             SimpleNamespace(
                 layer_names=[
@@ -78,9 +79,81 @@ def test_discover_layers_and_missing_layer():
     )
     selected = discover_selected_verifier_kv(config, [3, 11])
     assert selected.cache_group_id == 1
+    assert selected.cache_group_ids == (1, 1)
     assert selected.block_size == 16
     with pytest.raises(ValueError, match="were not found"):
         discover_selected_verifier_kv(config, [7])
+
+
+def test_discover_preserves_requested_order_across_cache_groups():
+    spec = SimpleNamespace(block_size=16, num_kv_heads=2, head_size=256)
+    groups = [SimpleNamespace(layer_names=[], kv_cache_spec=object()) for _ in range(9)]
+    groups[6] = SimpleNamespace(
+        layer_names=[
+            "model.layers.3.self_attn",
+            "model.layers.27.self_attn",
+            "model.layers.39.self_attn",
+        ],
+        kv_cache_spec=spec,
+    )
+    groups[7] = SimpleNamespace(
+        layer_names=[
+            "model.layers.19.self_attn",
+            "model.layers.31.self_attn",
+        ],
+        kv_cache_spec=spec,
+    )
+    groups[8] = SimpleNamespace(
+        layer_names=["model.layers.11.self_attn"],
+        kv_cache_spec=spec,
+    )
+
+    selected = discover_selected_verifier_kv(
+        SimpleNamespace(kv_cache_groups=groups),
+        [3, 11, 19, 27, 31, 39],
+    )
+
+    assert selected.layer_ids == (3, 11, 19, 27, 31, 39)
+    assert selected.cache_group_ids == (6, 8, 7, 6, 7, 6)
+    assert selected.layer_names == (
+        "model.layers.3.self_attn",
+        "model.layers.11.self_attn",
+        "model.layers.19.self_attn",
+        "model.layers.27.self_attn",
+        "model.layers.31.self_attn",
+        "model.layers.39.self_attn",
+    )
+    with pytest.raises(ValueError, match="multiple cache groups"):
+        _ = selected.cache_group_id
+    with pytest.raises(ValueError, match="multiple cache groups"):
+        extract_selected_verifier_kv({}, selected, block_ids=[], num_tokens=0)
+
+
+def test_discover_rejects_mismatched_cross_group_geometry():
+    groups = [
+        SimpleNamespace(
+            layer_names=["model.layers.3.self_attn"],
+            kv_cache_spec=SimpleNamespace(
+                block_size=16,
+                num_kv_heads=2,
+                head_size=256,
+            ),
+        ),
+        SimpleNamespace(
+            layer_names=["model.layers.11.self_attn"],
+            kv_cache_spec=SimpleNamespace(
+                block_size=16,
+                num_kv_heads=2,
+                head_size=128,
+            ),
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="matching block/head geometry"):
+        discover_selected_verifier_kv(
+            SimpleNamespace(kv_cache_groups=groups),
+            [3, 11],
+        )
 
 
 def test_file_backend_builds_out_of_tree_connector_config():
@@ -91,7 +164,10 @@ def test_file_backend_builds_out_of_tree_connector_config():
     config = FileBackend.build_kv_transfer_config(args)  # type: ignore[arg-type]
     assert config["kv_connector"] == "VerifierKVConnector"
     assert config["kv_connector_module_path"] == "hs_connectors.verifier_kv_connector"
-    assert config["kv_connector_extra_config"]["verifier_kv_layer_ids"] == [3, 11]
+    assert config["kv_connector_extra_config"]["verifier_kv_layer_ids"] == [
+        3,
+        11,
+    ]
     assert config["kv_connector_extra_config"]["online_only"] is True
 
 

@@ -5,7 +5,11 @@ from functools import partial
 import pytest
 import torch
 
-from speculators.losses import dflash_loss_decay, loss_function, resolve_loss_config
+from speculators.losses import (
+    dflash_loss_decay,
+    loss_function,
+    resolve_loss_config,
+)
 from speculators.losses.eager import ce_loss
 from speculators.models.dflash.metrics import compute_metrics as _compute_metrics
 from speculators.models.metrics import compute_accuracy_multi_step

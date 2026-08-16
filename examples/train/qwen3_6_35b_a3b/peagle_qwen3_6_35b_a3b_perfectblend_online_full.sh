@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Full-data online P-EAGLE training for Qwen3.6-35B-A3B on one 8-GPU node.
-# Reuses the prepared PerfectBlend data, target-feature layout, six-layer draft
-# shape, and vocabulary mapping from DFlash, while using P-EAGLE's parallel
+# Reuses the prepared PerfectBlend data, target-feature layout, five-layer
+# full-attention draft shape, and vocabulary mapping from DFlash, while using P-EAGLE's parallel
 # multi-depth prediction and COD sampling.
 # Keeps the AdamW + cosine recipe (4% linear warmup, then cosine decay).
 # Run this script as the cluster job command; do not wrap it in nohup.
@@ -9,36 +9,36 @@
 
 set -Eeuo pipefail
 
-REPO="/inspire/sfs/project/inf-multimodal/public/wumengke/speculators"
-MODEL="/inspire/sfs/project/inf-multimodal/public/share_base_models/Qwen3.6/Qwen3.6-35B-A3B"
-# P-EAGLE and DFlash use the same tokenized-data and vocabulary-map artifacts.
-DATA_DIR="${DATA_DIR:-$REPO/output/dflash_qwen3_6_35b_a3b_perfectblend_online_500k/data}"
-RUN_DIR="$REPO/output/peagle_qwen3_6_35b_a3b_perfectblend_online_500k"
-CHECKPOINT_DIR="$RUN_DIR/checkpoints"
-TENSORBOARD_DIR="$RUN_DIR/tensorboard"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_REPO="$(cd -- "$SCRIPT_DIR/../../.." && pwd)"
+
+export REPO="${REPO:-$DEFAULT_REPO}"
+export ROOT="${ROOT:-$(dirname -- "$REPO")}"
+export ENV_REPO="${ENV_REPO:-$ROOT/speculators}"
+
+MODEL="${MODEL:-$ROOT/model_weights/Qwen/Qwen3.6-35B-A3B}"
+DATA_DIR="${DATA_DIR:-$ROOT/datasets/qwen3_6_35b_500k}"
+export RUN_DIR="${RUN_DIR:-$ROOT/model_weights/peagle_qwen3_6_35b_a3b_5full}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-$RUN_DIR/checkpoints}"
+TENSORBOARD_DIR="${TENSORBOARD_DIR:-$RUN_DIR/tensorboard}"
+
 VLLM_PORT="${VLLM_PORT:-8100}"
+VLLM_ENDPOINT="${VLLM_ENDPOINT:-http://localhost:${VLLM_PORT}/v1}"
+VLLM_HEALTH_ENDPOINT="${VLLM_HEALTH_ENDPOINT:-http://localhost:${VLLM_PORT}/health}"
 DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-32000}"
-NUM_LAYERS=6
 NUM_DEPTHS="${NUM_DEPTHS:-8}"
-# COD sampling reduces deeper positions geometrically, so retain P-EAGLE's
-# canonical 3072-anchor budget rather than DFlash block expansion's 1024.
-MAX_ANCHORS="${MAX_ANCHORS:-3072}"
 DOWN_SAMPLE_RATIO="${DOWN_SAMPLE_RATIO:-0.8}"
 DOWN_SAMPLE_RATIO_MIN="${DOWN_SAMPLE_RATIO_MIN:-0.2}"
-# Match DFlash's eight Qwen3.6 target hidden-state inputs exactly. The vLLM
-# launcher appends layer 40 automatically as the verifier's final hidden state
-# for the loss; only these eight auxiliary indices are passed to the trainer.
-TARGET_LAYER_IDS=(2 7 12 17 23 28 33 38)
-# Match DFlash's six-layer attention layout: layers 0-4 use SWA, layer 5 uses
-# full attention.
-FULL_ATTENTION_INDICES=(5)
 JOB_TAG="${SLURM_JOB_ID:-${JOB_ID:-$$}}"
-HIDDEN_STATES_DIR="${TMPDIR:-/tmp}/peagle_qwen3_6_35b_a3b_${JOB_TAG}_hidden_states"
-VLLM_LOG="$RUN_DIR/vllm_${JOB_TAG}.log"
+HIDDEN_STATES_DIR="${HIDDEN_STATES_DIR:-/tmp/peagle_qwen3_6_35b_a3b_hidden_states}"
+VLLM_LOG="${VLLM_LOG:-$RUN_DIR/vllm_${JOB_TAG}.log}"
 
-SPEC_PYTHON="$REPO/speculators_venv/bin/python"
-TORCHRUN="$REPO/speculators_venv/bin/torchrun"
-VLLM_PYTHON="$REPO/vllm_venv/bin/python"
+SPEC_PYTHON="${SPEC_PYTHON:-$ENV_REPO/speculators_venv/bin/python}"
+TORCHRUN="${TORCHRUN:-$ENV_REPO/speculators_venv/bin/torchrun}"
+VLLM_PYTHON="${VLLM_PYTHON:-$ENV_REPO/vllm_venv/bin/python}"
+LAUNCH_VLLM="${LAUNCH_VLLM:-$REPO/scripts/launch_vllm.py}"
+TRAIN_SCRIPT="${TRAIN_SCRIPT:-$REPO/scripts/train.py}"
+LOCAL_PYTHONPATH="${LOCAL_PYTHONPATH:-$REPO/src:$REPO/hs_connectors/src}"
 
 mkdir -p "$RUN_DIR" "$CHECKPOINT_DIR" "$TENSORBOARD_DIR" "$HIDDEN_STATES_DIR"
 
@@ -130,12 +130,11 @@ echo "Model:            $MODEL"
 echo "Data:             $DATA_DIR"
 echo "Checkpoints:      $CHECKPOINT_DIR"
 echo "TensorBoard:      $TENSORBOARD_DIR/$JOB_TAG"
-echo "P-EAGLE layers:   $NUM_LAYERS"
+echo "P-EAGLE layers:   5"
 echo "P-EAGLE depths:   $NUM_DEPTHS"
-echo "Max anchors:      $MAX_ANCHORS"
 echo "COD ratios:       $DOWN_SAMPLE_RATIO / $DOWN_SAMPLE_RATIO_MIN"
-echo "Target layers:    ${TARGET_LAYER_IDS[*]}"
-echo "Full-attn layers: ${FULL_ATTENTION_INDICES[*]}"
+echo "Target layers:    2 7 12 17 23 28 33 38"
+echo "Full-attn layers: 0 1 2 3 4"
 echo "vLLM GPUs:        $VLLM_GPUS"
 echo "Training GPUs:    $TRAIN_GPUS"
 echo "vLLM log:         $VLLM_LOG"
@@ -154,14 +153,17 @@ PY
 echo "=== Launching vLLM ==="
 setsid env \
     CUDA_VISIBLE_DEVICES="$VLLM_GPUS" \
+    PYTHONPATH="$LOCAL_PYTHONPATH" \
     PYTHONUNBUFFERED=1 \
-    "$VLLM_PYTHON" "$REPO/scripts/launch_vllm.py" "$MODEL" \
-    --target-layer-ids "${TARGET_LAYER_IDS[@]}" \
+    "$VLLM_PYTHON" \
+    "$LAUNCH_VLLM" \
+    "$MODEL" \
+    --target-layer-ids 2 7 12 17 23 28 33 38 \
     --hidden-states-path "$HIDDEN_STATES_DIR" \
     -- \
     --tensor-parallel-size 1 \
     --data-parallel-size 2 \
-    --max-model-len 8200 \
+    --max-model-len 10000 \
     --gpu-memory-utilization 0.92 \
     --port "$VLLM_PORT" \
     >"$VLLM_LOG" 2>&1 &
@@ -169,7 +171,7 @@ VLLM_PID=$!
 
 echo "Waiting for vLLM on port $VLLM_PORT (PID/PGID $VLLM_PID)..."
 deadline=$((SECONDS + 1800))
-until curl -sf "http://localhost:${VLLM_PORT}/health" >/dev/null 2>&1; do
+until curl -sf "$VLLM_HEALTH_ENDPOINT" >/dev/null 2>&1; do
     if ! kill -0 "$VLLM_PID" 2>/dev/null; then
         echo "vLLM exited before becoming healthy. Last log lines:" >&2
         tail -n 100 "$VLLM_LOG" >&2 || true
@@ -186,11 +188,12 @@ echo "vLLM is healthy."
 echo "=== Launching P-EAGLE training ==="
 setsid env \
     CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" \
+    PYTHONPATH="$LOCAL_PYTHONPATH" \
     PYTHONUNBUFFERED=1 \
     "$TORCHRUN" \
     --standalone \
     --nproc_per_node 6 \
-    "$REPO/scripts/train.py" \
+    "$TRAIN_SCRIPT" \
     --verifier-name-or-path "$MODEL" \
     --data-path "$DATA_DIR" \
     --save-path "$CHECKPOINT_DIR" \
@@ -206,22 +209,20 @@ setsid env \
     --total-seq-len 4096 \
     --speculator-type peagle \
     --draft-arch qwen3 \
-    --num-layers "$NUM_LAYERS" \
+    --num-layers 5 \
     --num-depths "$NUM_DEPTHS" \
     --down-sample-ratio "$DOWN_SAMPLE_RATIO" \
     --down-sample-ratio-min "$DOWN_SAMPLE_RATIO_MIN" \
-    --max-anchors "$MAX_ANCHORS" \
     --no-norm-before-residual \
-    --sliding-window 2048 \
-    --full-attention-indices "${FULL_ATTENTION_INDICES[@]}" \
-    --target-layer-ids "${TARGET_LAYER_IDS[@]}" \
-    --vllm-endpoint "http://localhost:${VLLM_PORT}/v1" \
+    --full-attention-indices 0 1 2 3 4 \
+    --target-layer-ids 2 7 12 17 23 28 33 38 \
+    --vllm-endpoint "$VLLM_ENDPOINT" \
     --request-timeout 300 \
     --on-missing generate \
     --on-generate delete \
     --logger tensorboard \
     --log-dir "$TENSORBOARD_DIR" \
-    --run-name "$JOB_TAG" &
+    --run-name peagle_qwen3_6_35b_a3b_5full &
 TRAIN_PID=$!
 
 # Keep the cluster job attached to training. Its stdout/stderr is therefore

@@ -55,9 +55,7 @@ def _update_domino(
         DSPARK_COMPAT_ARCH,
     ]
     pre_trained_config["model_arch"] = "domino"
-    pre_trained_config["draft_vocab_size"] = config_dict.get(
-        "draft_vocab_size"
-    )
+    pre_trained_config["draft_vocab_size"] = config_dict.get("draft_vocab_size")
     pre_trained_config["target_hidden_size"] = config_dict.get(
         "target_hidden_size"
     ) or pre_trained_config.get("hidden_size")
@@ -104,9 +102,9 @@ def _update_domino(
         "target_layer_ids": [layer_id - 1 for layer_id in aux_layer_ids],
         "linear_position_ids": True,
     }
-    # Adds dflash_config["causal"]; shared with the DSpark path so both families
-    # resolve intra-block causality identically. The default mirrors
-    # DFlashSpeculatorConfig.sliding_window_non_causal.
+    # Resolve the attention mask exactly as training does. In particular, a
+    # false sliding-window flag must not become a global causal override: full
+    # attention layers are always bidirectional during training.
     propagate_intra_block_causality(
         config_dict,
         pre_trained_config,

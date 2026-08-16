@@ -23,6 +23,7 @@ from speculators.vllm._dflash_family import (
     install_config_patches,
     install_speculator_patches,
     normalize_rope,
+    propagate_intra_block_causality,
     register_config_updater,
     register_init_hook,
     register_speculative_method_alias,
@@ -81,8 +82,12 @@ def _update_dfly(
         "mask_token_id": config_dict["mask_token_id"],
         "target_layer_ids": [layer_id - 1 for layer_id in aux_layer_ids],
         "linear_position_ids": True,
-        "causal": not config_dict.get("sliding_window_non_causal", True),
     }
+    propagate_intra_block_causality(
+        config_dict,
+        pre_trained_config,
+        default=False,
+    )
 
 
 def _dfly_context_width(config: Any) -> int:

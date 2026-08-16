@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Full-data online DFly training for Qwen3.6-35B-A3B on one 8-GPU node.
-# Reuses the Qwen3.6-35B-A3B DFlash target-feature and six-layer draft layout,
+# Reuses the Qwen3.6-35B-A3B DFlash target features with five full-attention
+# draft layers,
 # adding DFly per-layer target fusion and previous-token hidden correction.
 # Keeps the AdamW + cosine recipe (4% linear warmup, then cosine decay).
 # Run this script as the cluster job command; do not wrap it in nohup.
@@ -8,30 +9,36 @@
 
 set -Eeuo pipefail
 
-REPO="/inspire/sfs/project/inf-multimodal/public/wumengke/speculators"
-MODEL="/inspire/sfs/project/inf-multimodal/public/share_base_models/Qwen3.6/Qwen3.6-35B-A3B"
-# DFly and DFlash share the prepared-data format, so reuse it by default.
-DATA_DIR="${DATA_DIR:-$REPO/output/dflash_qwen3_6_35b_a3b_perfectblend_online_500k/data}"
-RUN_DIR="$REPO/output/dfly_qwen3_6_35b_a3b_perfectblend_online_500k"
-CHECKPOINT_DIR="$RUN_DIR/checkpoints"
-TENSORBOARD_DIR="$RUN_DIR/tensorboard"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_REPO="$(cd -- "$SCRIPT_DIR/../../.." && pwd)"
+
+export REPO="${REPO:-$DEFAULT_REPO}"
+export ROOT="${ROOT:-$(dirname -- "$REPO")}"
+export ENV_REPO="${ENV_REPO:-$ROOT/speculators}"
+
+MODEL="${MODEL:-$ROOT/model_weights/Qwen/Qwen3.6-35B-A3B}"
+DATA_DIR="${DATA_DIR:-$ROOT/datasets/qwen3_6_35b_500k}"
+export RUN_DIR="${RUN_DIR:-$ROOT/model_weights/dfly_qwen3_6_35b_a3b_5full}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-$RUN_DIR/checkpoints}"
+TENSORBOARD_DIR="${TENSORBOARD_DIR:-$RUN_DIR/tensorboard}"
+
 VLLM_PORT="${VLLM_PORT:-8100}"
+VLLM_ENDPOINT="${VLLM_ENDPOINT:-http://localhost:${VLLM_PORT}/v1}"
+VLLM_HEALTH_ENDPOINT="${VLLM_HEALTH_ENDPOINT:-http://localhost:${VLLM_PORT}/health}"
 DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-32000}"
 # Train all 16 official block positions. Runtime block-4/block-8 benchmarks
 # then use trained prefixes instead of extrapolating an 8-position checkpoint.
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
-# z-lab's official target_layer_ids are 0-based transformer-layer indices:
-#   1 6 11 16 22 27 32 37
-# It reads hidden_states[layer_id + 1], whereas speculators/vLLM captures the
-# hidden-state index directly, so the CLI values below must all be offset by 1.
-TARGET_LAYER_IDS=(2 7 12 17 23 28 33 38)
 JOB_TAG="${SLURM_JOB_ID:-${JOB_ID:-$$}}"
-HIDDEN_STATES_DIR="${TMPDIR:-/tmp}/dfly_qwen3_6_35b_a3b_${JOB_TAG}_hidden_states"
-VLLM_LOG="$RUN_DIR/vllm_${JOB_TAG}.log"
+HIDDEN_STATES_DIR="${HIDDEN_STATES_DIR:-/tmp/dfly_qwen3_6_35b_a3b_hidden_states}"
+VLLM_LOG="${VLLM_LOG:-$RUN_DIR/vllm_${JOB_TAG}.log}"
 
-SPEC_PYTHON="$REPO/speculators_venv/bin/python"
-TORCHRUN="$REPO/speculators_venv/bin/torchrun"
-VLLM_PYTHON="$REPO/vllm_venv/bin/python"
+SPEC_PYTHON="${SPEC_PYTHON:-$ENV_REPO/speculators_venv/bin/python}"
+TORCHRUN="${TORCHRUN:-$ENV_REPO/speculators_venv/bin/torchrun}"
+VLLM_PYTHON="${VLLM_PYTHON:-$ENV_REPO/vllm_venv/bin/python}"
+LAUNCH_VLLM="${LAUNCH_VLLM:-$REPO/scripts/launch_vllm.py}"
+TRAIN_SCRIPT="${TRAIN_SCRIPT:-$REPO/scripts/train.py}"
+LOCAL_PYTHONPATH="${LOCAL_PYTHONPATH:-$REPO/src:$REPO/hs_connectors/src}"
 
 mkdir -p "$RUN_DIR" "$CHECKPOINT_DIR" "$TENSORBOARD_DIR" "$HIDDEN_STATES_DIR"
 
@@ -141,14 +148,17 @@ PY
 echo "=== Launching vLLM ==="
 setsid env \
     CUDA_VISIBLE_DEVICES="$VLLM_GPUS" \
+    PYTHONPATH="$LOCAL_PYTHONPATH" \
     PYTHONUNBUFFERED=1 \
-    "$VLLM_PYTHON" "$REPO/scripts/launch_vllm.py" "$MODEL" \
-    --target-layer-ids "${TARGET_LAYER_IDS[@]}" \
+    "$VLLM_PYTHON" \
+    "$LAUNCH_VLLM" \
+    "$MODEL" \
+    --target-layer-ids 2 7 12 17 23 28 33 38 \
     --hidden-states-path "$HIDDEN_STATES_DIR" \
     -- \
     --tensor-parallel-size 1 \
     --data-parallel-size 2 \
-    --max-model-len 8200 \
+    --max-model-len 10000 \
     --gpu-memory-utilization 0.92 \
     --port "$VLLM_PORT" \
     >"$VLLM_LOG" 2>&1 &
@@ -156,7 +166,7 @@ VLLM_PID=$!
 
 echo "Waiting for vLLM on port $VLLM_PORT (PID/PGID $VLLM_PID)..."
 deadline=$((SECONDS + 1800))
-until curl -sf "http://localhost:${VLLM_PORT}/health" >/dev/null 2>&1; do
+until curl -sf "$VLLM_HEALTH_ENDPOINT" >/dev/null 2>&1; do
     if ! kill -0 "$VLLM_PID" 2>/dev/null; then
         echo "vLLM exited before becoming healthy. Last log lines:" >&2
         tail -n 100 "$VLLM_LOG" >&2 || true
@@ -173,11 +183,12 @@ echo "vLLM is healthy."
 echo "=== Launching DFly training ==="
 setsid env \
     CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" \
+    PYTHONPATH="$LOCAL_PYTHONPATH" \
     PYTHONUNBUFFERED=1 \
     "$TORCHRUN" \
     --standalone \
     --nproc_per_node 6 \
-    "$REPO/scripts/train.py" \
+    "$TRAIN_SCRIPT" \
     --verifier-name-or-path "$MODEL" \
     --data-path "$DATA_DIR" \
     --save-path "$CHECKPOINT_DIR" \
@@ -195,18 +206,16 @@ setsid env \
     --enable-hidden-correction \
     --block-size "$BLOCK_SIZE" \
     --max-anchors 1024 \
-    --num-layers 6 \
-    --sliding-window 2048 \
-    --full-attention-indices 5 \
-    --sliding-window-non-causal \
-    --target-layer-ids "${TARGET_LAYER_IDS[@]}" \
-    --vllm-endpoint "http://localhost:${VLLM_PORT}/v1" \
+    --num-layers 5 \
+    --full-attention-indices 0 1 2 3 4 \
+    --target-layer-ids 2 7 12 17 23 28 33 38 \
+    --vllm-endpoint "$VLLM_ENDPOINT" \
     --request-timeout 300 \
     --on-missing generate \
     --on-generate delete \
     --logger tensorboard \
     --log-dir "$TENSORBOARD_DIR" \
-    --run-name "$JOB_TAG" &
+    --run-name dfly_qwen3_6_35b_a3b_5full &
 TRAIN_PID=$!
 
 # Keep the cluster job attached to training. Its stdout/stderr is therefore

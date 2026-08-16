@@ -41,9 +41,7 @@ def _source(**overrides):
 
 def test_domino_config_is_mapped_to_sequential_runtime():
     register_speculative_method_alias("domino", "dspark")
-    mapped = map_speculative_method(
-        {"method": "domino", "num_speculative_tokens": 16}
-    )
+    mapped = map_speculative_method({"method": "domino", "num_speculative_tokens": 16})
 
     assert mapped == {"method": "dspark", "num_speculative_tokens": 16}
 
@@ -132,18 +130,15 @@ def test_a_minimal_config_serves_the_slots_it_was_trained_with(
         sample_from_anchor=sample_from_anchor,
     )
     assert translated["gru_hidden_dim"] == trained.gru_hidden_dim
-    assert (
-        translated["logits_correction_emb_dim"]
-        == trained.logits_correction_emb_dim
-    )
+    assert translated["logits_correction_emb_dim"] == trained.logits_correction_emb_dim
     assert translated["pure_draft_prefix_len"] == trained.pure_draft_prefix_len
     served_suffix_start = resolve_suffix_start(
         sample_from_anchor=translated["sample_from_anchor"],
         pure_draft_prefix_len=translated["pure_draft_prefix_len"],
     )
     assert served_suffix_start == trained.suffix_start
-    # DFlashSpeculatorConfig defaults sliding_window_non_causal to False.
-    assert translated["dflash_config"]["causal"] is True
+    # A false sliding-window flag must not globally make full layers causal.
+    assert "causal" not in translated["dflash_config"]
 
 
 def test_cli_config_and_serving_defaults_all_agree():
@@ -151,11 +146,7 @@ def test_cli_config_and_serving_defaults_all_agree():
     cli = TrainConfig(speculator_type="domino").flatten()
     config = DominoSpeculatorConfig(draft_vocab_size=128, block_size=16)
 
-    assert (
-        cli["gru_hidden_dim"]
-        == config.gru_hidden_dim
-        == DEFAULT_GRU_HIDDEN_DIM
-    )
+    assert cli["gru_hidden_dim"] == config.gru_hidden_dim == DEFAULT_GRU_HIDDEN_DIM
     assert (
         cli["logits_correction_emb_dim"]
         == config.logits_correction_emb_dim

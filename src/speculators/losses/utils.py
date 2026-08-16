@@ -61,6 +61,32 @@ def exp_loss_decay(pos_idx: torch.Tensor, gamma: float, **_kwargs):
     return gamma**pos_idx
 
 
+def _dpace_confidence_and_raw_weight(
+    elementwise_loss: torch.Tensor,
+    loss_mask: torch.Tensor,
+    block_size: int,
+    dpace_alpha: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return D-PACE token confidence and its unnormalized raw weight."""
+
+    q = torch.exp(-elementwise_loss).float()
+    if q.shape[1] % block_size != 0:
+        raise ValueError(
+            f"q.shape[1] ({q.shape[1]}) must be divisible by block_size ({block_size})"
+        )
+    num_anchors = q.shape[1] // block_size
+    q_blocks = q.reshape(num_anchors, block_size)
+    mask = loss_mask.reshape(num_anchors, block_size).to(q.dtype)
+    smooth = (1.0 - dpace_alpha) * q_blocks + dpace_alpha
+    smooth = torch.where(mask > 0, smooth, torch.ones_like(smooth))
+    prefix = torch.cumprod(smooth, dim=-1)
+    raw_weight = torch.flip(
+        torch.cumsum(torch.flip(prefix * mask, dims=[-1]), dim=-1), dims=[-1]
+    )
+    raw_weight = raw_weight * mask
+    return q, raw_weight.reshape_as(q)
+
+
 def dpace_loss_decay(
     pos_idx: torch.Tensor,  # noqa: ARG001
     loss_mask: torch.Tensor,
@@ -81,35 +107,13 @@ def dpace_loss_decay(
         Decay multiplier tensor with same shape as pos_idx.
     """
     with torch.no_grad():
-        # convert CE to per-position confidence
-        q = torch.exp(-elementwise_loss).float()
-
-        # reshape loss to [num_anchors, block_size]
-        # for intra-block cumulative multiplication
-        if q.shape[1] % block_size != 0:
-            raise ValueError(
-                f"q.shape[1] ({q.shape[1]}) must be divisible by "
-                f"block_size ({block_size})"
-            )
-        num_anchors = q.shape[1] // block_size
-        q = q.reshape(num_anchors, block_size)
-        mask = loss_mask.reshape(num_anchors, block_size).to(q.dtype)
-
-        # smoothed confidence for numerical stability
-        smooth = (1.0 - dpace_alpha) * q + dpace_alpha
-        smooth = torch.where(mask > 0, smooth, torch.ones_like(smooth))
-
-        # prefix cumulative production
-        prefix = torch.cumprod(smooth, dim=-1)
-
-        # suffix summation: flip -> cumsum -> flip
-        weight = torch.flip(
-            torch.cumsum(torch.flip(prefix * mask, dims=[-1]), dim=-1), dims=[-1]
+        _, weight = _dpace_confidence_and_raw_weight(
+            elementwise_loss,
+            loss_mask,
+            block_size,
+            dpace_alpha,
         )
-        weight = weight * mask
-
-    # reshape weight
-    return weight.reshape(1, -1)
+    return weight
 
 
 def _fused_kernel(name: str):
@@ -237,6 +241,7 @@ def compound_loss(
     pos_idx: torch.Tensor,
     loss_config: LossConfig,
     decay_fn: Callable[..., torch.Tensor] | None = None,
+    normalize_by_weight_sum: bool = False,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute a weighted sum of loss terms.
 
@@ -259,6 +264,7 @@ def compound_loss(
             pos_idx,
             loss_fn=fn,
             decay_fn=decay_fn,
+            normalize_by_weight_sum=normalize_by_weight_sum,
         )
         if multi:
             term_losses[f"{name}_loss"] = term.detach()
@@ -273,6 +279,7 @@ def loss_function(
     pos_idx: torch.Tensor,  # shape: [1, seq_len]
     loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = kl_div_loss,
     decay_fn: Callable[..., torch.Tensor] | None = None,
+    normalize_by_weight_sum: bool = False,
 ):
     """Compute masked, optionally position-decayed training loss.
 
@@ -292,13 +299,16 @@ def loss_function(
     loss_mask = loss_mask.to(elementwise_loss.dtype)
     elementwise_loss = elementwise_loss * loss_mask
 
+    reduction_weight = loss_mask
     if decay_fn is not None:
         decay_mult = decay_fn(
             pos_idx.to(elementwise_loss.dtype), elementwise_loss=elementwise_loss
         )
         elementwise_loss = elementwise_loss * decay_mult
+        if normalize_by_weight_sum:
+            reduction_weight = loss_mask * decay_mult.to(loss_mask.dtype)
 
-    denominator = loss_mask.sum(dim=1) + _LOSS_REDUCTION_EPS
+    denominator = reduction_weight.sum(dim=1) + _LOSS_REDUCTION_EPS
 
     batch_loss = torch.sum(elementwise_loss, dim=1) / denominator  # shape: [1]
     return batch_loss.mean()  # shape: []

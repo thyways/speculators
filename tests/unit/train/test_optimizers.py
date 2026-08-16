@@ -11,6 +11,7 @@ class _ToyBridgeModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.base = nn.Linear(4, 4)
+        self.kv_bridge_source_compressor = nn.Linear(4, 4)
         self.layer = nn.Module()
         self.layer.kv_bridge = nn.Linear(4, 4)
 
@@ -37,7 +38,10 @@ def test_adamw_uses_independent_kv_bridge_parameter_group():
     assert [group["lr"] for group in optimizer.param_groups] == pytest.approx(
         [6e-4, 6e-5]
     )
-    bridge_params = set(model.layer.kv_bridge.parameters())
+    bridge_params = {
+        *model.layer.kv_bridge.parameters(),
+        *model.kv_bridge_source_compressor.parameters(),
+    }
     assert set(optimizer.param_groups[1]["params"]) == bridge_params
     assert not set(optimizer.param_groups[0]["params"]) & bridge_params
 
@@ -58,5 +62,5 @@ def test_scheduler_preserves_base_to_bridge_lr_ratio():
 
 
 def test_kv_bridge_lr_rejects_a_model_without_bridge_parameters():
-    with pytest.raises(ValueError, match="no trainable '.kv_bridge.' parameters"):
+    with pytest.raises(ValueError, match="no trainable KV-bridge parameters"):
         build_optimizers(nn.Linear(4, 4), _config())

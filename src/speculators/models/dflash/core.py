@@ -102,7 +102,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         rotary_config = flatten_rope_parameters(config.transformer_layer_config)
         self.rotary_emb = Qwen3RotaryEmbedding(rotary_config)  # type: ignore[arg-type]
 
-        if config.speculators_model_type != "kv_native_dspark":
+        if config.speculators_model_type != "kv_native_dflash":
             self.fc = nn.Linear(
                 len(self.target_layer_ids)
                 * config.transformer_layer_config.hidden_size,
@@ -192,7 +192,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         target_layer_ids = (
             []
-            if algorithm == "kv_native_dspark"
+            if algorithm == "kv_native_dflash"
             else resolve_target_layer_ids(
                 kwargs.get("target_layer_ids"), kwargs["verifier_name_or_path"]
             )
@@ -202,11 +202,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         )
         block_size = kwargs.get("block_size", 8)
 
-        default_sample_from_anchor = algorithm in {
-            "domino",
-            "dspark",
-            "kv_native_dspark",
-        }
+        default_sample_from_anchor = algorithm in {"domino", "dspark"}
         sample_from_anchor_arg = kwargs.get("sample_from_anchor")
         sample_from_anchor = (
             default_sample_from_anchor

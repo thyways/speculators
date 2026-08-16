@@ -4,6 +4,7 @@ from typing import Any
 import pytest
 
 from speculators.vllm._dflash_family import (
+    install_config_patches,
     map_speculative_method,
     preserve_dspark_anchor_mode,
     propagate_intra_block_causality,
@@ -125,28 +126,45 @@ def test_dspark_config_translation_requires_a_target_hidden_size():
         resolve_dspark_target_hidden_size({}, {})
 
 
+def _runtime_causal_by_layer(translated: dict[str, Any]) -> list[bool]:
+    from vllm.model_executor.models.qwen3_dflash import (  # noqa: PLC0415
+        _dflash_layer_causal,
+    )
+
+    config = SimpleNamespace(**translated)
+    return [
+        _dflash_layer_causal(config, layer_idx)
+        for layer_idx in range(config.num_hidden_layers)
+    ]
+
+
 @pytest.mark.parametrize(
-    ("non_causal", "expected_causal"),
-    [(True, False), (False, True)],
+    ("non_causal", "expected_override", "expected_causal_by_layer"),
+    [
+        (True, False, [False, False]),
+        (False, None, [True, False]),
+    ],
 )
 def test_dspark_intra_block_causality_follows_the_checkpoint(
     non_causal,
-    expected_causal,
+    expected_override,
+    expected_causal_by_layer,
 ):
-    """vLLM's own DSpark updater never writes dflash_config.
-
-    Without this propagation a DSpark draft trained with
-    --sliding-window-non-causal is served with its sliding-window layers made
-    causal (vLLM's fallback), a train/serve mismatch that costs acceptance.
-    """
-    translated: dict[str, Any] = {"hidden_size": 16}
+    """The serving mask must match training for both layer types."""
+    translated: dict[str, Any] = {
+        "num_hidden_layers": 2,
+        "layer_types": ["sliding_attention", "full_attention"],
+        # Simulate the incorrect global override written by upstream DFlash.
+        "dflash_config": {"causal": True},
+    }
 
     propagate_intra_block_causality(
         {"sliding_window_non_causal": non_causal},
         translated,
     )
 
-    assert translated["dflash_config"]["causal"] is expected_causal
+    assert translated["dflash_config"].get("causal") is expected_override
+    assert _runtime_causal_by_layer(translated) == expected_causal_by_layer
 
 
 def test_intra_block_causality_preserves_existing_dflash_config_keys():
@@ -174,7 +192,30 @@ def test_intra_block_causality_honours_an_explicit_default():
 
     propagate_intra_block_causality({}, translated, default=False)
 
-    assert translated["dflash_config"]["causal"] is True
+    assert "dflash_config" not in translated
+
+
+def test_config_patch_repairs_upstream_dflash_all_full_attention():
+    from vllm.transformers_utils.configs.speculators.algos import (  # noqa: PLC0415
+        SUPPORTED_SPECULATORS_TYPES,
+    )
+
+    install_config_patches()
+    translated: dict[str, Any] = {
+        "num_hidden_layers": 5,
+        "layer_types": ["full_attention"] * 5,
+    }
+    SUPPORTED_SPECULATORS_TYPES["dflash"](
+        {
+            "aux_hidden_state_layer_ids": [2, 7, 12],
+            "mask_token_id": 7,
+            "sliding_window_non_causal": False,
+        },
+        translated,
+    )
+
+    assert "causal" not in translated["dflash_config"]
+    assert _runtime_causal_by_layer(translated) == [False] * 5
 
 
 def test_intra_block_causality_rejects_a_non_boolean():
@@ -202,3 +243,4 @@ def test_dfly_keeps_sample_from_anchor_out_of_dflash_config():
 
     assert translated["sample_from_anchor"] is True
     assert "sample_from_anchor" not in translated["dflash_config"]
+    assert "causal" not in translated["dflash_config"]

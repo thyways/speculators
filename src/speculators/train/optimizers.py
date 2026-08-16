@@ -48,9 +48,8 @@ def split_named_params_for_kv_bridge(
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        target = (
-            bridge_params if ".kv_bridge." in f".{name}." else base_params
-        )
+        is_bridge = any(part.startswith("kv_bridge") for part in name.split("."))
+        target = bridge_params if is_bridge else base_params
         target.append((name, param))
     return base_params, bridge_params
 
@@ -112,7 +111,7 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
             if not bridge_params:
                 raise ValueError(
                     "kv_bridge_lr was set, but the model has no trainable "
-                    "'.kv_bridge.' parameters."
+                    "KV-bridge parameters."
                 )
             param_groups = []
             if base_params:
