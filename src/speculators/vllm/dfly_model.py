@@ -11,6 +11,7 @@ Runtime dispatch uses ``method="dspark"``. Checkpoint config should set
 """
 
 from collections.abc import Iterable
+from typing import Any
 
 import torch
 from torch import nn
@@ -172,7 +173,7 @@ class Qwen3DFlyModel(DFlashQwen3Model):
                 f"{target_hidden_size} and {config.hidden_size}."
             )
 
-        drafter_config = {}
+        drafter_config: dict[str, Any] = {}
         drafter_config.update(getattr(config, "dflash_config", None) or {})
         drafter_config.update(getattr(config, "dflare_config", None) or {})
         target_layer_ids = (
@@ -344,6 +345,9 @@ class Qwen3DFlyModel(DFlashQwen3Model):
 
 class Qwen3DFlyForCausalLM(Qwen3DSparkForCausalLM):
     """Top-level DFly draft model."""
+
+    # None for full-vocabulary drafts, where the remap is the identity.
+    draft_id_to_target_id: nn.Parameter | None
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         nn.Module.__init__(self)

@@ -1,6 +1,6 @@
+import argparse
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from datasets import Dataset
@@ -86,8 +86,8 @@ def _patch_pipeline(
     )
 
 
-def _args(tmp_path: Path, target_samples: int) -> SimpleNamespace:
-    return SimpleNamespace(
+def _args(tmp_path: Path, target_samples: int) -> argparse.Namespace:
+    return argparse.Namespace(
         model="target-model",
         data=tmp_path / "success-pool.jsonl",
         output=tmp_path,
@@ -231,7 +231,7 @@ def test_selection_manifest_is_minimal_and_published_last(tmp_path: Path):
     assert [row["source_line_index"] for row in rows] == [1, 3]
     assert not list(output.glob("*.partial"))
 
-    args = SimpleNamespace(output=output, ranked_target_samples=2)
+    args = argparse.Namespace(output=output, ranked_target_samples=2)
     prepare_module.validate_existing_output(args)
     args.ranked_target_samples = 3
     with pytest.raises(ValueError, match="different settings"):
