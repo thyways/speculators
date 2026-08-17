@@ -82,9 +82,7 @@ class Qwen3DominoModel(DFlashQwen3Model):
             gru_hidden_dim=int(gru_hidden_dim),
             emb_dim=int(emb_dim),
             draft_vocab_size=int(draft_vocab_size),
-            initializer_range=float(
-                getattr(config, "initializer_range", None) or 0.02
-            ),
+            initializer_range=float(getattr(config, "initializer_range", None) or 0.02),
         ).to(dtype=vllm_config.model_config.dtype)
         self.logits_correction.requires_grad_(False)
 
@@ -102,14 +100,10 @@ class Qwen3DominoForCausalLM(Qwen3DSparkForCausalLM):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         nn.Module.__init__(self)
-        self.draft_model_config = (
-            vllm_config.speculative_config.draft_model_config
-        )
+        self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
         if getattr(self.config, "draft_vocab_size", None) is None:
-            self.config.draft_vocab_size = getattr(
-                self.config, "vocab_size", None
-            )
+            self.config.draft_vocab_size = getattr(self.config, "vocab_size", None)
         target_layer_num = vllm_config.model_config.get_num_layers(
             vllm_config.parallel_config
         )

@@ -21,9 +21,7 @@ EMB_DIM = 5
 BLOCK_SIZE = 4
 
 
-def _speculator_state(
-    model, num_steps: int, head_hidden: torch.Tensor, anchor: int
-):
+def _speculator_state(model, num_steps: int, head_hidden: torch.Tensor, anchor: int):
     return SimpleNamespace(
         num_speculative_steps=num_steps,
         sample_indices=torch.arange(num_steps),
@@ -109,9 +107,7 @@ def test_sampler_preserves_dspark_markov_path():
 class _FakeDominoModel:
     """Serving-side Domino hooks backed by the real training head module."""
 
-    def __init__(
-        self, *, sample_from_anchor: bool, pure_draft_prefix_len: int
-    ):
+    def __init__(self, *, sample_from_anchor: bool, pure_draft_prefix_len: int):
         torch.manual_seed(0)
         self.correction = DominoLogitsCorrection(
             hidden_size=HIDDEN_SIZE,
@@ -125,9 +121,7 @@ class _FakeDominoModel:
         self.embed = torch.nn.Embedding(VOCAB_SIZE, HIDDEN_SIZE)
         self.head = torch.nn.Linear(HIDDEN_SIZE, VOCAB_SIZE, bias=False)
         self.sample_from_anchor = sample_from_anchor
-        self.suffix_start = pure_draft_prefix_len + (
-            0 if sample_from_anchor else 1
-        )
+        self.suffix_start = pure_draft_prefix_len + (0 if sample_from_anchor else 1)
 
     def has_markov(self):
         return False
@@ -209,9 +203,9 @@ def test_domino_sequential_sampling_matches_the_training_scan(
 
     # The realized block: the anchor followed by every token sampled before the
     # last slot.
-    block_tokens = torch.cat(
-        [torch.tensor([anchor]), sampled[: BLOCK_SIZE - 1]]
-    ).view(1, BLOCK_SIZE)
+    block_tokens = torch.cat([torch.tensor([anchor]), sampled[: BLOCK_SIZE - 1]]).view(
+        1, BLOCK_SIZE
+    )
     with torch.no_grad():
         final = model.training_side_block_logits(block_hidden, block_tokens)
     expected = final[0].argmax(dim=-1)

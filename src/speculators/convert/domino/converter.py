@@ -106,9 +106,7 @@ class DominoConverter:
     ) -> None:
         logger.info(f"Converting Domino checkpoint: {input_path}")
 
-        local_checkpoint_path = ensure_checkpoint_is_local(
-            input_path, cache_dir
-        )
+        local_checkpoint_path = ensure_checkpoint_is_local(input_path, cache_dir)
         source_config = load_checkpoint_config(local_checkpoint_path)
         weights = load_checkpoint_weights(local_checkpoint_path)
         logger.info(f"Loaded {len(weights)} weights")
@@ -116,9 +114,7 @@ class DominoConverter:
         config = self._build_config(
             source_config, base_model, aux_hidden_state_layer_ids
         )
-        saved_path = self._save(
-            config, remap_domino_head_keys(weights), output_path
-        )
+        saved_path = self._save(config, remap_domino_head_keys(weights), output_path)
         logger.success(f"Saved to: {saved_path}")
 
         if validate:
@@ -139,18 +135,14 @@ class DominoConverter:
             )
         # block_size lives at the top level in older checkpoints and inside
         # dflash_config in newer ones.
-        block_size = source_config.get("block_size") or domino.get(
-            "block_size"
-        )
+        block_size = source_config.get("block_size") or domino.get("block_size")
         if block_size is None:
             raise ValueError(
                 "Checkpoint config has no `block_size` (checked both top-level "
                 "and `dflash_config`)"
             )
         transformer_config = {
-            k: v
-            for k, v in source_config.items()
-            if k not in _NON_TRANSFORMER_KEYS
+            k: v for k, v in source_config.items() if k not in _NON_TRANSFORMER_KEYS
         }
 
         verifier_config_dict, _ = PretrainedConfig.get_config_dict(base_model)
@@ -191,16 +183,12 @@ class DominoConverter:
         # Upstream's shift_label is speculators' sample_from_anchor: both decide
         # whether the anchor slot predicts a token or is the bonus token.
         sample_from_anchor = bool(domino.get("shift_label", False))
-        speculative_tokens = (
-            block_size if sample_from_anchor else block_size - 1
-        )
+        speculative_tokens = block_size if sample_from_anchor else block_size - 1
 
         speculators_config = SpeculatorsConfig(
             algorithm="domino",
             proposal_methods=[
-                GreedyTokenProposalConfig(
-                    speculative_tokens=speculative_tokens
-                )
+                GreedyTokenProposalConfig(speculative_tokens=speculative_tokens)
             ],
             default_proposal_method="greedy",
             verifier=VerifierConfig(
@@ -245,13 +233,9 @@ class DominoConverter:
                 "Unexpected keys in checkpoint -- the structure does not match "
                 f"DominoDraftModel. Unexpected keys: {unexpected}"
             )
-        critical_missing = [
-            k for k in missing if k not in _VERIFIER_FILLED_KEYS
-        ]
+        critical_missing = [k for k in missing if k not in _VERIFIER_FILLED_KEYS]
         if critical_missing:
-            raise ValueError(
-                f"Draft weights missing after load: {critical_missing}"
-            )
+            raise ValueError(f"Draft weights missing after load: {critical_missing}")
         logger.debug(f"Keys loaded from verifier at save time: {missing}")
 
         # embed_tokens / lm_head / verifier_lm_head / verifier_norm come from the

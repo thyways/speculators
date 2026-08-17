@@ -108,9 +108,7 @@ def test_schedule_survives_a_module_wide_dtype_cast():
     """
     model = _domino_model()
     model.to(torch.bfloat16)  # type: ignore[arg-type]
-    assert (
-        model.lambda_base.dtype == torch.bfloat16
-    )  # the cast really happened
+    assert model.lambda_base.dtype == torch.bfloat16  # the cast really happened
 
     model.on_training_step(1, 2000)
 

@@ -44,9 +44,7 @@ def _source_config(**overrides):
 
 
 class TestBuildConfig:
-    @patch(
-        "speculators.convert.domino.converter.PretrainedConfig.get_config_dict"
-    )
+    @patch("speculators.convert.domino.converter.PretrainedConfig.get_config_dict")
     def test_happy_path(self, mock_get_config):
         mock_get_config.return_value = (
             {
@@ -61,9 +59,7 @@ class TestBuildConfig:
         )
 
         assert config.speculators_config.algorithm == "domino"
-        assert (
-            config.speculators_config.verifier.name_or_path == "Qwen/Qwen3-8B"
-        )
+        assert config.speculators_config.verifier.name_or_path == "Qwen/Qwen3-8B"
         assert config.block_size == 16
         assert config.draft_vocab_size == 151936
         assert config.mask_token_id == 151669
@@ -80,12 +76,8 @@ class TestBuildConfig:
         assert not hasattr(config.transformer_layer_config, "dflash_config")
         assert not hasattr(config.transformer_layer_config, "emb_dim")
 
-    @patch(
-        "speculators.convert.domino.converter.PretrainedConfig.get_config_dict"
-    )
-    def test_shift_label_false_drops_the_anchor_from_the_draft(
-        self, mock_get_config
-    ):
+    @patch("speculators.convert.domino.converter.PretrainedConfig.get_config_dict")
+    def test_shift_label_false_drops_the_anchor_from_the_draft(self, mock_get_config):
         mock_get_config.return_value = ({"hidden_size": 4096}, None)
         source = _source_config()
         source["dflash_config"] = {
@@ -100,9 +92,7 @@ class TestBuildConfig:
         # slot 0 is the anchor, so the correction starts one slot later
         assert config.suffix_start == 2
 
-    @patch(
-        "speculators.convert.domino.converter.PretrainedConfig.get_config_dict"
-    )
+    @patch("speculators.convert.domino.converter.PretrainedConfig.get_config_dict")
     def test_explicit_aux_layer_ids_override(self, mock_get_config):
         mock_get_config.return_value = ({"hidden_size": 4096}, None)
         config = DominoConverter()._build_config(
@@ -111,9 +101,7 @@ class TestBuildConfig:
 
         assert config.aux_hidden_state_layer_ids == [3, 11, 19]
 
-    @patch(
-        "speculators.convert.domino.converter.PretrainedConfig.get_config_dict"
-    )
+    @patch("speculators.convert.domino.converter.PretrainedConfig.get_config_dict")
     def test_rejects_a_non_domino_projector(self, mock_get_config):
         mock_get_config.return_value = ({"hidden_size": 4096}, None)
         source = _source_config()
@@ -125,35 +113,25 @@ class TestBuildConfig:
         with pytest.raises(ValueError, match="not a Domino draft model"):
             DominoConverter()._build_config(source, "Qwen/Qwen3-8B", None)
 
-    @patch(
-        "speculators.convert.domino.converter.PretrainedConfig.get_config_dict"
-    )
+    @patch("speculators.convert.domino.converter.PretrainedConfig.get_config_dict")
     def test_requires_the_head_dimensions(self, mock_get_config):
         mock_get_config.return_value = ({"hidden_size": 4096}, None)
         source = _source_config()
         source["dflash_config"] = {
-            k: v
-            for k, v in source["dflash_config"].items()
-            if k != "gru_hidden_dim"
+            k: v for k, v in source["dflash_config"].items() if k != "gru_hidden_dim"
         }
 
         with pytest.raises(ValueError, match="head dimensions"):
             DominoConverter()._build_config(source, "Qwen/Qwen3-8B", None)
 
-    @patch(
-        "speculators.convert.domino.converter.PretrainedConfig.get_config_dict"
-    )
+    @patch("speculators.convert.domino.converter.PretrainedConfig.get_config_dict")
     def test_rejects_a_hidden_size_mismatch(self, mock_get_config):
         mock_get_config.return_value = ({"hidden_size": 2048}, None)
 
         with pytest.raises(ValueError, match="Architecture mismatch"):
-            DominoConverter()._build_config(
-                _source_config(), "Qwen/Qwen3-8B", None
-            )
+            DominoConverter()._build_config(_source_config(), "Qwen/Qwen3-8B", None)
 
-    @patch(
-        "speculators.convert.domino.converter.PretrainedConfig.get_config_dict"
-    )
+    @patch("speculators.convert.domino.converter.PretrainedConfig.get_config_dict")
     def test_rejects_a_vocab_size_mismatch(self, mock_get_config):
         """Conversion yields a full-vocabulary draft, so the vocabs must agree.
 
@@ -166,9 +144,7 @@ class TestBuildConfig:
         )
 
         with pytest.raises(ValueError, match="Vocabulary mismatch"):
-            DominoConverter()._build_config(
-                _source_config(), "Qwen/Qwen3-8B", None
-            )
+            DominoConverter()._build_config(_source_config(), "Qwen/Qwen3-8B", None)
 
 
 class TestRemapHeadKeys:
@@ -190,9 +166,7 @@ class TestRemapHeadKeys:
             "logits_correction.embed_proj.0.weight",
             "logits_correction.embed_proj.2.weight",
         }
-        assert (
-            remapped["logits_correction.prefix_gru.weight_hh_l0"].numel() == 3
-        )
+        assert remapped["logits_correction.prefix_gru.weight_hh_l0"].numel() == 3
 
     def test_legacy_logit_head_container_layout(self):
         """Early upstream checkpoints nested the head under ``logit_head``."""

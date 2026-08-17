@@ -54,9 +54,7 @@ def _model() -> DominoDraftModel:
         pure_draft_prefix_len=1,
         speculators_config=SpeculatorsConfig(
             algorithm="domino",
-            proposal_methods=[
-                GreedyTokenProposalConfig(speculative_tokens=BLOCK_SIZE)
-            ],
+            proposal_methods=[GreedyTokenProposalConfig(speculative_tokens=BLOCK_SIZE)],
             default_proposal_method="greedy",
             verifier=VerifierConfig(
                 name_or_path=None,
@@ -83,9 +81,7 @@ def _batch() -> dict:
         "hidden_states": torch.randn(
             1, SEQUENCE_LENGTH, 3 * HIDDEN_SIZE, device="cuda"
         ),
-        "input_ids": torch.randint(
-            1, VOCAB_SIZE, (1, SEQUENCE_LENGTH), device="cuda"
-        ),
+        "input_ids": torch.randint(1, VOCAB_SIZE, (1, SEQUENCE_LENGTH), device="cuda"),
         "loss_mask": torch.ones(1, SEQUENCE_LENGTH, device="cuda"),
         "verifier_last_hidden_states": torch.randn(
             1, SEQUENCE_LENGTH, HIDDEN_SIZE, device="cuda"
@@ -116,9 +112,7 @@ def test_changing_lambda_does_not_recompile_the_forward():
 
     _step(model, batch, 0)
     baseline = _unique_graphs()
-    assert (
-        baseline > 0
-    ), "the forward was never traced; compilation is not active"
+    assert baseline > 0, "the forward was never traced; compilation is not active"
 
     # Five more steps, each with a different live lambda value.
     for global_step in range(1, 6):

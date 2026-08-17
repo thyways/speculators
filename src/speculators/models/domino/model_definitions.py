@@ -58,9 +58,7 @@ class DominoGRU(nn.Module):
 
     def reset_parameters(self) -> None:
         """Match ``nn.RNNBase.reset_parameters``: U(-1/sqrt(H), 1/sqrt(H))."""
-        stdv = (
-            1.0 / math.sqrt(self.hidden_size) if self.hidden_size > 0 else 0.0
-        )
+        stdv = 1.0 / math.sqrt(self.hidden_size) if self.hidden_size > 0 else 0.0
         for weight in self.parameters():
             nn.init.uniform_(weight, -stdv, stdv)
 
@@ -81,18 +79,14 @@ class DominoGRU(nn.Module):
         state).
         """
         gates_hidden = functional.linear(state, self.weight_hh_l0)
-        reset_i, update_i, new_i = projected_input.chunk(
-            _NUM_GRU_GATES, dim=-1
-        )
+        reset_i, update_i, new_i = projected_input.chunk(_NUM_GRU_GATES, dim=-1)
         reset_h, update_h, new_h = gates_hidden.chunk(_NUM_GRU_GATES, dim=-1)
         reset = torch.sigmoid(reset_i + reset_h)
         update = torch.sigmoid(update_i + update_h)
         candidate = torch.tanh(new_i + reset * new_h)
         return (1.0 - update) * candidate + update * state
 
-    def initial_state(
-        self, reference: torch.Tensor, num_rows: int
-    ) -> torch.Tensor:
+    def initial_state(self, reference: torch.Tensor, num_rows: int) -> torch.Tensor:
         """Zero state shaped [num_rows, H], matching ``reference``'s dtype."""
         return reference.new_zeros(num_rows, self.hidden_size)
 
