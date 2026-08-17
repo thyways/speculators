@@ -17,15 +17,13 @@ python evaluate.py sweep --target http://localhost:8000/v1
 
 This runs all 9 subsets from `RedHatAI/speculator_benchmarks` and produces `perf_results_<timestamp>/perf_results.csv`.
 
-For a single max-throughput point with acceptance and latency metrics (skips
-the multi-rate sweep):
+For a single max-throughput point with acceptance and latency metrics (skips the multi-rate sweep):
 
 ```bash
 python evaluate.py throughput --target http://localhost:8000/v1
 ```
 
-This writes `acceptance.csv` and `perf_results.csv`. The latter includes median
-request latency, TTFT, ITL, output tokens/s, and requests/s for each subset.
+This writes `acceptance.csv` and `perf_results.csv`. The latter includes median request latency, TTFT, ITL, output tokens/s, and requests/s for each subset.
 
 See [`examples/evaluate/`](https://github.com/vllm-project/speculators/tree/main/examples/evaluate) for end-to-end examples that launch a vLLM server and run the pipeline.
 

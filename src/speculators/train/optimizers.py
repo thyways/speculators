@@ -149,7 +149,7 @@ def _build_adamw_optimizer(
             lr=config.lr,
             weight_decay=config.weight_decay,
         )
-    trainable = [
+    trainable: list[tuple[str, Tensor]] = [
         (name, param) for name, param in model.named_parameters() if param.requires_grad
     ]
     param_groups = _weight_decay_param_groups(
