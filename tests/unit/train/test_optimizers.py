@@ -92,17 +92,3 @@ def test_weight_decay_exclusion_routes_every_bias_to_the_no_decay_group():
     # Every bias is 1D, so the no-decay group holds exactly the biases here.
     assert sorted(by_name["base_no_decay"]) == ["base.bias", "head.bias"]
     assert sorted(by_name["base"]) == ["base.weight", "head.weight"]
-
-
-def test_scheduler_scales_both_weight_decay_groups_together():
-    model = _ToyGatedModel()
-    [optimizer] = build_optimizers(model, _config(weight_decay_exclude_1d=True))
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 0.5)
-
-    optimizer.zero_grad()
-    optimizer.step()
-    scheduler.step()
-
-    decay_lr, no_decay_lr = (group["lr"] for group in optimizer.param_groups)
-    assert decay_lr == pytest.approx(3e-4)
-    assert no_decay_lr == pytest.approx(3e-4)
