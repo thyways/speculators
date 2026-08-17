@@ -53,6 +53,7 @@ EVALUATE_PY="$REPO/scripts/evaluate/evaluate.py"
 # reproducing an older revision.
 DOMINO_SOURCE_COMMIT="${DOMINO_SOURCE_COMMIT:-}"
 DOMINO_SOURCE_DIR=""
+PLUGIN_METADATA_ROOT=""
 VLLM_PID=""
 
 cleanup() {
@@ -73,6 +74,11 @@ cleanup() {
     if [[ -n "$DOMINO_SOURCE_DIR" && -d "$DOMINO_SOURCE_DIR" ]]; then
         find "$DOMINO_SOURCE_DIR" -mindepth 1 -delete
         rmdir "$DOMINO_SOURCE_DIR" 2>/dev/null || true
+    fi
+
+    if [[ -n "$PLUGIN_METADATA_ROOT" && -d "$PLUGIN_METADATA_ROOT" ]]; then
+        find "$PLUGIN_METADATA_ROOT" -mindepth 1 -delete
+        rmdir "$PLUGIN_METADATA_ROOT" 2>/dev/null || true
     fi
     exit "$status"
 }
@@ -124,6 +130,34 @@ if [[ -n "$DOMINO_SOURCE_COMMIT" ]]; then
 else
     PLUGIN_PYTHONPATH="$REPO/src:$REPO/hs_connectors/src"
     DOMINO_SOURCE_LABEL="current worktree"
+fi
+
+# `$REPO/src` carries a stale `speculators.egg-info` that only declares the
+# console script, and importlib.metadata keeps the first distribution it finds
+# per name, so putting that directory on PYTHONPATH hides the installed
+# dist-info together with every `vllm.general_plugins` entry point. Probe with
+# the PYTHONPATH the server will actually use, and add a tiny metadata shim
+# under a different distribution name when the Domino plugin is invisible. The
+# environment itself is left untouched.
+if ! env PYTHONPATH="$PLUGIN_PYTHONPATH" "$VLLM_PYTHON" - <<'PY'
+from importlib.metadata import entry_points
+
+plugins = entry_points(group="vllm.general_plugins")
+raise SystemExit(not any(item.name == "speculators_domino" for item in plugins))
+PY
+then
+    PLUGIN_METADATA_ROOT="$(mktemp -d /tmp/speculators-domino-plugin.XXXXXX)"
+    DIST_INFO="$PLUGIN_METADATA_ROOT/speculators_domino_runtime-0.0.0.dist-info"
+    mkdir -p "$DIST_INFO"
+    printf '%s\n' \
+        'Metadata-Version: 2.1' \
+        'Name: speculators-domino-runtime' \
+        'Version: 0.0.0' > "$DIST_INFO/METADATA"
+    printf '%s\n' \
+        '[vllm.general_plugins]' \
+        'speculators_domino = speculators.vllm.domino:register' \
+        > "$DIST_INFO/entry_points.txt"
+    PLUGIN_PYTHONPATH="$PLUGIN_PYTHONPATH:$PLUGIN_METADATA_ROOT"
 fi
 
 mkdir -p "$OUTPUT_DIR"

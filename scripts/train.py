@@ -647,10 +647,6 @@ def main(cfg: TrainConfig):  # noqa: C901
         preprocess=preprocess,
         train_data_ratio=args.train_data_ratio,
         fail_on_hidden_state_error=args.fail_on_hidden_state_error,
-        verifier_kv_shape=getattr(draft_model, "verifier_kv_shape", None),
-        verifier_kv_layer_ids=getattr(
-            draft_model.config, "verifier_kv_layer_ids", None
-        ),
     )
 
     # Get trainer kwargs from model class
@@ -660,12 +656,12 @@ def main(cfg: TrainConfig):  # noqa: C901
         num_epochs=args.epochs,
         save_path=args.save_path,
         lr=args.lr,
-        kv_bridge_lr=args.kv_bridge_lr,
         resume_from_checkpoint=not args.no_resume_from_checkpoint,
         train_call_kwargs=train_call_kwargs,
         val_call_kwargs=val_call_kwargs,
         optimizer=args.optimizer,
         weight_decay=args.weight_decay,
+        weight_decay_exclude_1d=args.weight_decay_exclude_1d,
         muon_lr=args.muon_lr,
         muon_momentum=args.muon_momentum,
         muon_weight_decay=args.muon_weight_decay,

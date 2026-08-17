@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Full-data online Eagle3 training for Qwen3.6-35B-A3B on one 8-GPU node.
 # Reuses the prepared PerfectBlend data and vocabulary mapping from DFlash, but
-# uses three verifier features, five full-attention draft layers,
+# uses three verifier features, one full-attention draft layer,
 # pre-FC/output normalization, and teacher-forced TTT steps.
 # Run this script as the cluster job command; do not wrap it in nohup.
 # The prepared data in DATA_DIR must use this model's tokenizer.
@@ -17,7 +17,7 @@ export ENV_REPO="${ENV_REPO:-$ROOT/speculators}"
 
 MODEL="${MODEL:-$ROOT/model_weights/Qwen/Qwen3.6-35B-A3B}"
 DATA_DIR="${DATA_DIR:-$ROOT/datasets/qwen3_6_35b_500k}"
-export RUN_DIR="${RUN_DIR:-$ROOT/model_weights/eagle3_1_qwen3_6_35b_a3b_5full}"
+export RUN_DIR="${RUN_DIR:-$ROOT/model_weights/eagle3_1_qwen3_6_35b_a3b_1full}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-$RUN_DIR/checkpoints}"
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-$RUN_DIR/tensorboard}"
 
@@ -29,7 +29,7 @@ MASK_TOKEN_ID="${MASK_TOKEN_ID:-248077}"
 TTT_STEPS="${TTT_STEPS:-7}"
 LR="${LR:-1e-4}"
 JOB_TAG="${SLURM_JOB_ID:-${JOB_ID:-$$}}"
-HIDDEN_STATES_DIR="${HIDDEN_STATES_DIR:-/tmp/eagle3_qwen3_6_35b_a3b_hidden_states}"
+HIDDEN_STATES_DIR="${HIDDEN_STATES_DIR:-${TMPDIR:-/tmp}/eagle3_qwen3_6_35b_a3b_${JOB_TAG}_hidden_states}"
 VLLM_LOG="${VLLM_LOG:-$RUN_DIR/vllm_${JOB_TAG}.log}"
 
 SPEC_PYTHON="${SPEC_PYTHON:-$ENV_REPO/speculators_venv/bin/python}"
@@ -129,12 +129,12 @@ echo "Model:             $MODEL"
 echo "Data:              $DATA_DIR"
 echo "Checkpoints:       $CHECKPOINT_DIR"
 echo "TensorBoard:       $TENSORBOARD_DIR/$JOB_TAG"
-echo "Eagle3 layers:     5"
+echo "Eagle3 layers:     1"
 echo "TTT steps:         $TTT_STEPS"
 echo "Target layers:     2 20 37"
 echo "Mask token ID:     $MASK_TOKEN_ID"
 echo "Learning rate:     $LR"
-echo "Full-attn layers:  0 1 2 3 4"
+echo "Full-attn layers:  0"
 echo "vLLM GPUs:         $VLLM_GPUS"
 echo "Training GPUs:     $TRAIN_GPUS"
 echo "vLLM log:          $VLLM_LOG"
@@ -213,9 +213,7 @@ setsid env \
     --draft-hidden-act silu \
     --draft-mrope-full-head-hack \
     --draft-attn-impl simple_flex_attention \
-    --num-layers 5 \
-    --block-size 16 \
-    --max-anchors 1024 \
+    --num-layers 1 \
     --mask-token-id "$MASK_TOKEN_ID" \
     --ttt-steps "$TTT_STEPS" \
     --ttt-step-loss-decay 1.0 \
@@ -225,7 +223,7 @@ setsid env \
     --no-norm-before-fc \
     --fc-norm \
     --norm-output \
-    --full-attention-indices 0 1 2 3 4 \
+    --full-attention-indices 0 \
     --target-layer-ids 2 20 37 \
     --hidden-states-backend file \
     --hidden-states-path "$HIDDEN_STATES_DIR" \
@@ -238,7 +236,8 @@ setsid env \
     --seed 42 \
     --logger tensorboard \
     --log-dir "$TENSORBOARD_DIR" \
-    --run-name eagle3_qwen3_6_35b_a3b_5full &
+    --checkpoint-freq 0.1 \
+    --run-name eagle3_1_qwen3_6_35b_a3b_1full &
 TRAIN_PID=$!
 
 # Keep the cluster job attached to training. Its stdout/stderr is therefore

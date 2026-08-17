@@ -37,21 +37,28 @@ _ADAMW_NAME_HINTS = (
 # Muon only orthogonalizes 2D weight matrices.
 _MATRIX_NDIM = 2
 
+# Parameters at or below this rank have no weight matrix to regularize.
+_NO_DECAY_MAX_NDIM = 1
 
-def split_named_params_for_kv_bridge(
-    model: Module,
+
+def split_named_params_for_weight_decay(
+    named_params: list[tuple[str, Tensor]],
 ) -> tuple[list[tuple[str, Tensor]], list[tuple[str, Tensor]]]:
-    """Split trainable parameters into base and target-to-draft bridge groups."""
+    """Split a named parameter list into decayed and undecayed halves.
 
-    base_params: list[tuple[str, Tensor]] = []
-    bridge_params: list[tuple[str, Tensor]] = []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        is_bridge = any(part.startswith("kv_bridge") for part in name.split("."))
-        target = bridge_params if is_bridge else base_params
-        target.append((name, param))
-    return base_params, bridge_params
+    Parameters with ``ndim <= 1`` -- RMSNorm weights, biases, and scalar gates --
+    have no weight matrix to regularize. Decaying them only drags norms toward
+    zero and pins gates at whatever value corresponds to a zero parameter.
+
+    :param named_params: ``(name, parameter)`` pairs to partition.
+    :return: A ``(decay, no_decay)`` tuple of named parameter lists.
+    """
+    decay: list[tuple[str, Tensor]] = []
+    no_decay: list[tuple[str, Tensor]] = []
+    for entry in named_params:
+        target = no_decay if entry[1].ndim <= _NO_DECAY_MAX_NDIM else decay
+        target.append(entry)
+    return decay, no_decay
 
 
 def _named_param_group(
@@ -59,13 +66,46 @@ def _named_param_group(
     *,
     name: str,
     lr: float,
+    weight_decay: float | None = None,
 ) -> dict:
-    return {
+    group = {
         "params": [param for _, param in named_params],
         "param_names": [param_name for param_name, _ in named_params],
         "name": name,
         "lr": lr,
     }
+    if weight_decay is not None:
+        group["weight_decay"] = weight_decay
+    return group
+
+
+def _weight_decay_param_groups(
+    named_params: list[tuple[str, Tensor]],
+    *,
+    name: str,
+    lr: float,
+    weight_decay: float,
+    exclude_1d: bool,
+) -> list[dict]:
+    """Build one parameter group, or two when 1D params skip weight decay.
+
+    Returns an empty list for an empty input so callers never hand AdamW a
+    parameter group with no parameters.
+    """
+
+    if not named_params:
+        return []
+    if not exclude_1d:
+        return [_named_param_group(named_params, name=name, lr=lr)]
+    decay, no_decay = split_named_params_for_weight_decay(named_params)
+    return [
+        _named_param_group(entries, name=group_name, lr=lr, weight_decay=group_decay)
+        for group_name, entries, group_decay in (
+            (name, decay, weight_decay),
+            (f"{name}_no_decay", no_decay, 0.0),
+        )
+        if entries
+    ]
 
 
 def split_named_params_for_muon(
@@ -97,6 +137,43 @@ def split_named_params_for_muon(
     return muon_params, adamw_params
 
 
+def _build_adamw_optimizer(
+    model: Module, config, *, exclude_1d: bool
+) -> torch.optim.Optimizer:
+    """Build the single AdamW optimizer for ``--optimizer adamw``."""
+
+    if not exclude_1d:
+        # Historical path: one implicit group over every parameter.
+        return torch.optim.AdamW(
+            model.named_parameters(),
+            lr=config.lr,
+            weight_decay=config.weight_decay,
+        )
+    trainable = [
+        (name, param) for name, param in model.named_parameters() if param.requires_grad
+    ]
+    param_groups = _weight_decay_param_groups(
+        trainable,
+        name="base",
+        lr=config.lr,
+        weight_decay=config.weight_decay,
+        exclude_1d=True,
+    )
+    logger.info(
+        "AdamW optimizer: %s.",
+        ", ".join(
+            f"{len(group['params'])} params in {group['name']} at "
+            f"weight_decay={group['weight_decay']:.3g}"
+            for group in param_groups
+        ),
+    )
+    return torch.optim.AdamW(
+        param_groups,
+        lr=config.lr,
+        weight_decay=config.weight_decay,
+    )
+
+
 def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
     """Build the optimizer(s) for a training run based on ``config.optimizer``.
 
@@ -105,52 +182,13 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
     :return: A list of optimizers for the trainer to step in tandem. The default
         "adamw" returns a single optimizer; "muon" returns ``[Muon, AdamW]``.
     """
+    # Read directly rather than via getattr: a config that forgets to carry this
+    # field should raise here, not silently train without the exclusion.
+    exclude_1d = bool(config.weight_decay_exclude_1d)
     if config.optimizer == "adamw":
-        if config.kv_bridge_lr is not None:
-            base_params, bridge_params = split_named_params_for_kv_bridge(model)
-            if not bridge_params:
-                raise ValueError(
-                    "kv_bridge_lr was set, but the model has no trainable "
-                    "KV-bridge parameters."
-                )
-            param_groups = []
-            if base_params:
-                param_groups.append(
-                    _named_param_group(base_params, name="base", lr=config.lr)
-                )
-            param_groups.append(
-                _named_param_group(
-                    bridge_params,
-                    name="kv_bridge",
-                    lr=config.kv_bridge_lr,
-                )
-            )
-            logger.info(
-                "AdamW optimizer: %d base params at %.3g LR, %d KV-bridge params "
-                "at %.3g LR.",
-                len(base_params),
-                config.lr,
-                len(bridge_params),
-                config.kv_bridge_lr,
-            )
-            return [
-                torch.optim.AdamW(
-                    param_groups,
-                    lr=config.lr,
-                    weight_decay=config.weight_decay,
-                )
-            ]
-        return [
-            torch.optim.AdamW(
-                model.named_parameters(),
-                lr=config.lr,
-                weight_decay=config.weight_decay,
-            )
-        ]
+        return [_build_adamw_optimizer(model, config, exclude_1d=exclude_1d)]
 
     if config.optimizer == "muon":
-        if config.kv_bridge_lr is not None:
-            raise ValueError("kv_bridge_lr is currently supported only with AdamW.")
         muon_params, adamw_params = split_named_params_for_muon(model)
         logger.info(
             "Muon optimizer: %d 2D params via Muon, %d params via AdamW.",
@@ -173,7 +211,17 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
         if adamw_params:
             optimizers.append(
                 torch.optim.AdamW(
-                    adamw_params,
+                    (
+                        _weight_decay_param_groups(
+                            adamw_params,
+                            name="base",
+                            lr=config.lr,
+                            weight_decay=config.weight_decay,
+                            exclude_1d=True,
+                        )
+                        if exclude_1d
+                        else adamw_params
+                    ),
                     lr=config.lr,
                     weight_decay=config.weight_decay,
                 )

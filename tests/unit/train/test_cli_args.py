@@ -9,7 +9,6 @@ from speculators.losses import eager
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark.core import DSparkDraftModel
 from speculators.models.eagle3.core import Eagle3DraftModel
-from speculators.models.kv_native_dflash.core import KVNativeDFlashDraftModel
 from speculators.models.peagle.core import PEagleDraftModel
 from speculators.train.config import TrainConfig
 
@@ -137,34 +136,6 @@ def test_dspark_confidence_head_alpha(monkeypatch):
     train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
     assert train_kw["confidence_head_alpha"] == 0.5
     assert val_kw["confidence_head_alpha"] == 0.5
-
-
-def test_kv_native_dflash_uses_dflash_recipe_defaults(monkeypatch):
-    args = _parse(
-        monkeypatch,
-        [
-            "--speculator-type",
-            "kv_native_dflash",
-            "--hidden-states-backend",
-            "file",
-            "--on-missing",
-            "generate",
-            "--on-generate",
-            "delete",
-        ],
-    )
-    train_kw, val_kw = KVNativeDFlashDraftModel.get_trainer_kwargs(**vars(args))
-    assert args.num_layers == 5
-    assert args.block_size == 16
-    assert args.num_speculative_tokens == 15
-    assert args.loss_fn == "ce"
-    assert args.per_position_loss_weight == "dpace"
-    assert not hasattr(args, "verifier_partial_rotary_factor")
-    assert not hasattr(args, "verifier_rope_theta")
-    assert not hasattr(args, "verifier_" + "mrope_section")
-    assert "ce" in train_kw["loss_config"]
-    assert "tv_loss_fn" not in train_kw
-    assert "ce" in val_kw["loss_config"]
 
 
 # ---------------------------------------------------------------------------

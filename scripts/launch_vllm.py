@@ -101,16 +101,6 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--verifier-kv-layer-ids",
-        type=int,
-        nargs="+",
-        default=None,
-        help=(
-            "Selected verifier full-attention layer IDs whose real paged-cache "
-            "K/V should be exported alongside the final hidden state."
-        ),
-    )
-    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the command that would be executed without running it",
@@ -130,21 +120,7 @@ def main():
         config = config.text_config
     num_hidden_layers = config.num_hidden_layers
 
-    if args.verifier_kv_layer_ids:
-        if args.target_layer_ids:
-            raise ValueError(
-                "KV-native from-scratch training does not consume auxiliary hidden "
-                "states; omit --target-layer-ids"
-            )
-        if not args.include_last_layer:
-            raise ValueError(
-                "KV-native training requires the verifier's final hidden state; "
-                "do not pass --no-include-last-layer"
-            )
-        # The final hidden state is the only hidden tensor used by the KV-native
-        # objective. The real prefix context comes from the selected paged K/V.
-        target_layer_ids = [num_hidden_layers]
-    elif args.target_layer_ids:
+    if args.target_layer_ids:
         target_layer_ids = args.target_layer_ids
         if args.include_last_layer and num_hidden_layers not in target_layer_ids:
             target_layer_ids.append(num_hidden_layers)

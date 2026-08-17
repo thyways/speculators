@@ -11,11 +11,8 @@ import pytest
 from speculators.train.config import TrainConfig
 from speculators.train.config.schema import (
     CONFIG_DESTS,
-    DataArgs,
     DFlashArgs,
     DraftArgs,
-    GenerationArgs,
-    KVNativeDFlashArgs,
     LossArgs,
     OptimizerArgs,
 )
@@ -62,19 +59,6 @@ def test_flatten_resolves_dflash_derived_defaults():
     assert flat["block_size"] == 16
 
 
-def test_flatten_resolves_kv_native_dflash_derived_defaults():
-    flat = TrainConfig(speculator_type="kv_native_dflash").flatten()
-    assert flat["num_layers"] == 5
-    assert flat["per_position_loss_weight"] == "dpace"
-    assert flat["loss_fn"] == "ce"
-    assert flat["block_size"] == 16
-    assert flat["num_speculative_tokens"] == 15
-    assert flat["verifier_kv_layer_mapping"] == [3, 11, 19, 27, 35]
-    assert "verifier_partial_rotary_factor" not in flat
-    assert "verifier_rope_theta" not in flat
-    assert "verifier_" + "mrope_section" not in flat
-
-
 def test_flatten_leaves_non_dflash_derived_defaults_unchanged():
     # Only dflash gets the new defaults; every other speculator type keeps the
     # pre-existing behavior.
@@ -103,7 +87,7 @@ def test_from_flat_inverts_flatten():
     cfg = TrainConfig(
         speculator_type="dspark",
         draft=DraftArgs(num_layers=4, full_attention_indices=[2, 18, 33]),
-        optimizer=OptimizerArgs(lr=3e-4, kv_bridge_lr=3e-5),
+        optimizer=OptimizerArgs(lr=3e-4, muon_lr=3e-3),
     )
     assert TrainConfig.from_flat(cfg.flatten()) == cfg
 
@@ -127,121 +111,3 @@ def test_from_flat_accepts_partial_working_dict():
     assert recovered.draft.num_layers == 6
     # Untouched fields fall back to their schema defaults.
     assert recovered.trainer.epochs == 20
-
-
-def _kv_native_dflash_config(**kv_kwargs):
-    return TrainConfig(
-        speculator_type="kv_native_dflash",
-        draft=DraftArgs(num_layers=5),
-        data=DataArgs(hidden_states_backend="file"),
-        generation=GenerationArgs(on_missing="generate", on_generate="delete"),
-        kv_native_dflash=KVNativeDFlashArgs(**kv_kwargs),
-    )
-
-
-def test_kv_native_config_is_online_only():
-    cfg = _kv_native_dflash_config()
-    assert cfg.generation.on_missing == "generate"
-    assert cfg.generation.on_generate == "delete"
-
-
-@pytest.mark.parametrize(
-    ("generation", "match"),
-    [
-        (GenerationArgs(on_missing="raise"), "on-missing=generate"),
-        (GenerationArgs(on_generate="cache"), "on-generate=delete"),
-    ],
-)
-def test_kv_native_rejects_non_online_generation(generation, match):
-    with pytest.raises(ValueError, match=match):
-        TrainConfig(
-            speculator_type="kv_native_dflash",
-            draft=DraftArgs(num_layers=5),
-            data=DataArgs(hidden_states_backend="file"),
-            generation=generation,
-        )
-
-
-def test_kv_native_rejects_pretrained_initialization():
-    with pytest.raises(ValueError, match="from-scratch training only"):
-        TrainConfig(
-            speculator_type="kv_native_dflash",
-            draft=DraftArgs(num_layers=5, from_pretrained="checkpoint"),
-            data=DataArgs(hidden_states_backend="file"),
-            generation=GenerationArgs(on_missing="generate", on_generate="delete"),
-        )
-
-
-def test_kv_native_rejects_auxiliary_hidden_layers():
-    with pytest.raises(ValueError, match="omit --target-layer-ids"):
-        TrainConfig(
-            speculator_type="kv_native_dflash",
-            draft=DraftArgs(num_layers=5, target_layer_ids=[2, 20, 37]),
-            data=DataArgs(hidden_states_backend="file"),
-            generation=GenerationArgs(on_missing="generate", on_generate="delete"),
-        )
-
-
-def test_kv_native_dflash_defaults_to_fifteen_proposal_slots():
-    cfg = _kv_native_dflash_config()
-    assert cfg.kv_native_dflash.num_speculative_tokens == 15
-    assert cfg.kv_native_dflash.verifier_kv_layer_ids == [3, 11, 19, 27, 35]
-    assert cfg.dflash.sample_from_anchor is None
-    assert cfg.draft.num_layers == 5
-
-
-@pytest.mark.parametrize("num_speculative_tokens", [14, 16])
-def test_kv_native_dflash_requires_the_complete_proposal_block(
-    num_speculative_tokens,
-):
-    with pytest.raises(ValueError, match="must equal the complete proposal block"):
-        _kv_native_dflash_config(num_speculative_tokens=num_speculative_tokens)
-
-
-def test_kv_native_dflash_rejects_sampling_from_anchor():
-    with pytest.raises(ValueError, match="no-sample-from-anchor"):
-        TrainConfig(
-            speculator_type="kv_native_dflash",
-            draft=DraftArgs(num_layers=5),
-            data=DataArgs(hidden_states_backend="file"),
-            generation=GenerationArgs(on_missing="generate", on_generate="delete"),
-            dflash=DFlashArgs(sample_from_anchor=True),
-            kv_native_dflash=KVNativeDFlashArgs(),
-        )
-
-
-def test_final_raw_kv_uses_depth_matched_sources():
-    cfg = _kv_native_dflash_config()
-    assert cfg.kv_native_dflash.verifier_kv_layer_mapping == [3, 11, 19, 27, 35]
-
-
-def test_raw_kv_layer_fields_round_trip_through_flat_schema():
-    cfg = _kv_native_dflash_config(
-        verifier_kv_layer_ids=[3, 11, 19, 27, 35],
-        verifier_kv_layer_mapping=[3, 3, 19, 27, 35],
-    )
-    recovered = TrainConfig.from_flat(cfg.flatten())
-    args = recovered.kv_native_dflash
-    assert args.verifier_kv_layer_ids == [3, 11, 19, 27, 35]
-    assert args.verifier_kv_layer_mapping == [3, 3, 19, 27, 35]
-
-
-def test_raw_kv_rejects_non_exported_anchor_mapping():
-    with pytest.raises(ValueError, match="non-exported layers"):
-        _kv_native_dflash_config(
-            verifier_kv_layer_mapping=[7, 15, 23, 31, 999],
-        )
-
-
-def test_kv_direct_read_rejects_wrong_mapping_length():
-    with pytest.raises(ValueError, match="verifier-kv-layer-mapping"):
-        _kv_native_dflash_config(
-            verifier_kv_layer_mapping=[7, 15],
-        )
-
-
-def test_kv_direct_read_rejects_non_exported_layer():
-    with pytest.raises(ValueError, match="non-exported layers"):
-        _kv_native_dflash_config(
-            verifier_kv_layer_mapping=[7, 15, 23, 31, 35],
-        )

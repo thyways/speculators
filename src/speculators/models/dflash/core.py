@@ -102,17 +102,15 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         rotary_config = flatten_rope_parameters(config.transformer_layer_config)
         self.rotary_emb = Qwen3RotaryEmbedding(rotary_config)  # type: ignore[arg-type]
 
-        if config.speculators_model_type != "kv_native_dflash":
-            self.fc = nn.Linear(
-                len(self.target_layer_ids)
-                * config.transformer_layer_config.hidden_size,
-                config.transformer_layer_config.hidden_size,
-                bias=False,
-            )
-            self.hidden_norm = Qwen3RMSNorm(
-                config.transformer_layer_config.hidden_size,
-                eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
-            )
+        self.fc = nn.Linear(
+            len(self.target_layer_ids) * config.transformer_layer_config.hidden_size,
+            config.transformer_layer_config.hidden_size,
+            bias=False,
+        )
+        self.hidden_norm = Qwen3RMSNorm(
+            config.transformer_layer_config.hidden_size,
+            eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
+        )
         self.verifier_norm = Qwen3RMSNorm(
             config.transformer_layer_config.hidden_size,
             eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
@@ -190,12 +188,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             GreedyTokenProposalConfig,
         )
 
-        target_layer_ids = (
-            []
-            if algorithm == "kv_native_dflash"
-            else resolve_target_layer_ids(
-                kwargs.get("target_layer_ids"), kwargs["verifier_name_or_path"]
-            )
+        target_layer_ids = resolve_target_layer_ids(
+            kwargs.get("target_layer_ids"), kwargs["verifier_name_or_path"]
         )
         verifier_config._attn_implementation = kwargs.get(  # noqa: SLF001
             "draft_attn_impl", "simple_flex_attention"

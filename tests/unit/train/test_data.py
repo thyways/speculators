@@ -17,46 +17,6 @@ from speculators.train.data import (
 )
 
 
-def test_collate_fn_preserves_verifier_kv_and_layer_ids():
-    collate = CollateFn(
-        max_len=4,
-        hidden_size=2,
-        num_target_layers=1,
-        dtype=torch.bfloat16,
-        verifier_kv_shape=(2, 1, 2),
-    )
-    sample = {
-        "hidden_states": torch.zeros(2, 2),
-        "input_ids": torch.tensor([1, 2]),
-        "verifier_last_hidden_states": torch.zeros(2, 2),
-        "loss_mask": torch.ones(2, dtype=torch.bool),
-        "lengths": torch.tensor([2]),
-        "position_ids": torch.tensor([0, 1]),
-        "verifier_keys": torch.ones(2, 2, 1, 2, dtype=torch.float32),
-        "verifier_values": torch.full((2, 2, 1, 2), 2.0),
-        "verifier_kv_layer_ids": torch.tensor([3, 11]),
-    }
-    batch = collate([sample])
-    assert batch["batch_valid"].item()
-    assert batch["verifier_keys"].shape == (1, 4, 2, 1, 2)
-    assert batch["verifier_keys"].dtype == torch.bfloat16
-    assert torch.equal(batch["verifier_kv_layer_ids"], torch.tensor([3, 11]))
-
-
-def test_collate_fn_marks_all_failed_online_kv_samples_invalid():
-    collate = CollateFn(
-        max_len=4,
-        hidden_size=2,
-        num_target_layers=1,
-        verifier_kv_shape=(2, 1, 2),
-        verifier_kv_layer_ids=[3, 11],
-    )
-    batch = collate([None, None])
-    assert not batch["batch_valid"].item()
-    assert torch.equal(batch["verifier_kv_layer_ids"], torch.tensor([3, 11]))
-    assert batch["verifier_keys"].shape == (1, 4, 2, 1, 2)
-
-
 def test_shift_batch():
     """Test shift_batch function."""
     batch = {

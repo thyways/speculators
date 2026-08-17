@@ -126,7 +126,7 @@ speculators = "speculators.__main__:app"
 [project.entry-points."vllm.general_plugins"]
 speculators_dfly = "speculators.vllm.dfly:register"
 speculators_domino = "speculators.vllm.domino:register"
-speculators_kv_native_dflash = "speculators.vllm.kv_native_dflash:register"
+speculators_peagle = "speculators.vllm.peagle:register"
 
 [project.urls]
 homepage = "https://github.com/vllm-project/speculators"

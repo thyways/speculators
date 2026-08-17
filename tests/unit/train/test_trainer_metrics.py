@@ -25,12 +25,12 @@ def test_optimizer_lr_logging_reports_each_named_parameter_group():
             {
                 "params": [torch.nn.Parameter(torch.zeros(()))],
                 "lr": 6e-5,
-                "name": "kv_bridge",
+                "name": "base_no_decay",
             },
         ]
     )
 
     assert _optimizer_lrs([optimizer]) == {
         "AdamW/base": 6e-4,
-        "AdamW/kv_bridge": 6e-5,
+        "AdamW/base_no_decay": 6e-5,
     }

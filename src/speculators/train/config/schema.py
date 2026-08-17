@@ -280,8 +280,7 @@ class GenerationArgs(_Group):
         default="delete",
         description="Behaviour after generating a hidden state (only if "
         "--on-missing=generate). 'delete' discards it once loaded; 'cache' stores it "
-        "in the hidden states path. KV-native DFlash rejects 'cache' and always uses "
-        "fresh online payloads.",
+        "in the hidden states path.",
     )
     request_timeout: float = Field(
         default=DEFAULT_REQUEST_TIMEOUT,
@@ -343,18 +342,17 @@ class OptimizerArgs(_Group):
         "AdamW to the remaining params (norms, biases, embeddings, lm_head).",
     )
     lr: float = Field(default=1e-4, description="Learning rate (AdamW / base group).")
-    kv_bridge_lr: float | None = Field(
-        default=None,
-        gt=0.0,
-        description=(
-            "Optional AdamW learning rate for parameters whose name contains "
-            "'.kv_bridge.'. When unset, all parameters use --lr."
-        ),
-    )
     weight_decay: float = Field(
         default=0.01,
         description="Weight decay for the AdamW optimizer (and the AdamW group in muon "
         "mode).",
+    )
+    weight_decay_exclude_1d: bool = Field(
+        default=False,
+        description="Put every parameter with ndim <= 1 (RMSNorm weights, biases, "
+        "scalar gates) in a weight_decay=0 group. Decaying those pulls norms and "
+        "gates toward zero rather than regularizing a weight matrix. Off by "
+        "default so existing runs stay reproducible.",
     )
     muon_lr: float | None = Field(
         default=None,
@@ -567,50 +565,6 @@ class DSparkArgs(_Group):
     )
 
 
-class KVNativeDFlashArgs(_Group):
-    """Online real-K/V settings for KV-native DFlash."""
-
-    verifier_kv_layer_ids: list[int] = Field(
-        default_factory=lambda: [3, 11, 19, 27, 35],
-        description=(
-            "Full-attention verifier layers exported by the online vLLM service."
-        ),
-    )
-    verifier_kv_layer_mapping: list[int] | None = Field(
-        default=None,
-        description=(
-            "One exported verifier layer used as the depth-matched raw-KV anchor "
-            "for every draft layer."
-        ),
-    )
-    verifier_num_key_value_heads: int = Field(default=2, gt=0)
-    verifier_head_dim: int = Field(default=256, gt=0)
-    warm_start_context_queries: bool = Field(
-        default=True,
-        description=(
-            "Initialize each draft layer's q_proj/q_norm from the verifier layer "
-            "whose raw K/V it reads, so the context cross-attention starts in the "
-            "verifier's key space instead of learning the alignment from noise."
-        ),
-    )
-    anchor_hidden_injection: bool = Field(
-        default=False,
-        description=(
-            "Add the verifier's final hidden state at the last verified position "
-            "into the anchor slot's draft input. Training-only: vLLM does not pass "
-            "that state to the draft, so such checkpoints cannot be served."
-        ),
-    )
-    num_speculative_tokens: int | None = Field(
-        default=None,
-        gt=0,
-        description=(
-            "Number of proposal slots used for formal speculative evaluation. "
-            "Defaults to block_size-1."
-        ),
-    )
-
-
 class PEagleArgs(_Group):
     num_depths: int = Field(
         default=8,
@@ -651,7 +605,6 @@ _GROUPS: dict[str, type[_Group]] = {
     "dfly": DFlyArgs,
     "domino": DominoArgs,
     "dspark": DSparkArgs,
-    "kv_native_dflash": KVNativeDFlashArgs,
     "peagle": PEagleArgs,
     "mtp": MTPArgs,
 }
@@ -735,7 +688,7 @@ class TrainConfig(BaseSettings):
     speculator_type: str = Field(
         default="eagle3",
         description="Type of speculator model to train "
-        "(eagle3, dflash, dfly, domino, dspark, kv_native_dflash, peagle, mtp).",
+        "(eagle3, dflash, dfly, domino, dspark, peagle, mtp).",
     )
     dry_run: bool = Field(
         default=False,
@@ -763,12 +716,11 @@ class TrainConfig(BaseSettings):
     dfly: DFlyArgs = Field(default_factory=DFlyArgs)
     domino: DominoArgs = Field(default_factory=DominoArgs)
     dspark: DSparkArgs = Field(default_factory=DSparkArgs)
-    kv_native_dflash: KVNativeDFlashArgs = Field(default_factory=KVNativeDFlashArgs)
     peagle: PEagleArgs = Field(default_factory=PEagleArgs)
     mtp: MTPArgs = Field(default_factory=MTPArgs)
 
     @model_validator(mode="after")
-    def _resolve_derived_defaults(self) -> "TrainConfig":  # noqa: C901
+    def _resolve_derived_defaults(self) -> "TrainConfig":
         """Fill defaults that derive from other fields, mirroring the tail of the
         pre-refactor ``parse_args``: unset ``draft_arch`` -> ``llama`` for eagle3 else
         ``qwen3``; unset ``norm_before_fc`` / ``norm_output`` -> ``True`` for eagle3
@@ -794,7 +746,7 @@ class TrainConfig(BaseSettings):
         untouched, so :meth:`from_flat` round-trips.
         """
         is_eagle3 = self.speculator_type == "eagle3"
-        is_dflash = self.speculator_type in {"dflash", "kv_native_dflash"}
+        is_dflash = self.speculator_type == "dflash"
         if self.draft.draft_arch is None:
             self.draft.draft_arch = "llama" if is_eagle3 else "qwen3"
         if self.draft.norm_before_fc is None:
@@ -813,13 +765,6 @@ class TrainConfig(BaseSettings):
             self.loss.loss_fn = "ce" if is_dflash else "kl_div"
         if self.dflash.block_size is None:
             self.dflash.block_size = 16 if is_dflash else 8
-        if self.kv_native_dflash.verifier_kv_layer_mapping is None:
-            exported_ids = self.kv_native_dflash.verifier_kv_layer_ids
-            self.kv_native_dflash.verifier_kv_layer_mapping = exported_ids[
-                : self.draft.num_layers
-            ]
-        if self.kv_native_dflash.num_speculative_tokens is None:
-            self.kv_native_dflash.num_speculative_tokens = self.dflash.block_size - 1
         return self
 
     @model_validator(mode="after")
@@ -834,71 +779,6 @@ class TrainConfig(BaseSettings):
                 raise ValueError(
                     f"--dpace-alpha must be in (0, 1], got {self.dflash.dpace_alpha}"
                 )
-        return self
-
-    @model_validator(mode="after")
-    def _validate_kv_native_online(self) -> "TrainConfig":  # noqa: C901
-        if self.speculator_type != "kv_native_dflash":
-            return self
-        if self.data.legacy_data:
-            raise ValueError("KV-native training supports online Arrow data only")
-        if self.generation.on_missing != "generate":
-            raise ValueError(
-                "KV-native training requires --on-missing=generate for online K/V"
-            )
-        if self.generation.on_generate != "delete":
-            raise ValueError(
-                "KV-native training requires --on-generate=delete; persistent/offline "
-                "K/V caching is intentionally unsupported"
-            )
-        if self.data.hidden_states_backend != "file":
-            raise ValueError(
-                "KV-native training currently requires --hidden-states-backend=file"
-            )
-        if self.draft.from_pretrained:
-            raise ValueError(
-                "KV-native training in this checkout supports from-scratch training "
-                "only; use the trainer checkpoint resume path after the run starts"
-            )
-        if self.draft.target_layer_ids is not None:
-            raise ValueError(
-                "KV-native training does not consume auxiliary hidden states; omit "
-                "--target-layer-ids"
-            )
-        kv_args = self.kv_native_dflash
-        exported_ids = kv_args.verifier_kv_layer_ids
-        if not exported_ids:
-            raise ValueError("--verifier-kv-layer-ids must not be empty")
-        if len(exported_ids) != len(set(exported_ids)):
-            raise ValueError("--verifier-kv-layer-ids must not contain duplicates")
-        if any(layer_id < 0 for layer_id in exported_ids):
-            raise ValueError("--verifier-kv-layer-ids must be non-negative")
-        if kv_args.verifier_kv_layer_mapping is None:
-            raise ValueError("--verifier-kv-layer-mapping was not resolved")
-        if len(kv_args.verifier_kv_layer_mapping) != self.draft.num_layers:
-            raise ValueError(
-                "--verifier-kv-layer-mapping must contain exactly --num-layers IDs"
-            )
-        exported = set(exported_ids)
-        unknown = sorted(set(kv_args.verifier_kv_layer_mapping) - exported)
-        if unknown:
-            raise ValueError(
-                f"--verifier-kv-layer-mapping references non-exported layers: {unknown}"
-            )
-        sample_from_anchor = self.dflash.sample_from_anchor or False
-        if sample_from_anchor:
-            raise ValueError("KV-native DFlash requires --no-sample-from-anchor")
-        trained_tokens = (
-            self.dflash.block_size if sample_from_anchor else self.dflash.block_size - 1
-        )
-        if kv_args.num_speculative_tokens is None:
-            raise ValueError("--num-speculative-tokens was not resolved")
-        if kv_args.num_speculative_tokens != trained_tokens:
-            raise ValueError(
-                "--num-speculative-tokens must equal the complete proposal block "
-                f"represented by --block-size: {kv_args.num_speculative_tokens} "
-                f"!= {trained_tokens}"
-            )
         return self
 
     def flatten(self) -> dict[str, Any]:

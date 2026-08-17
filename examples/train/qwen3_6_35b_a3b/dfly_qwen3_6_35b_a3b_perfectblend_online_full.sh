@@ -215,6 +215,7 @@ setsid env \
     --on-generate delete \
     --logger tensorboard \
     --log-dir "$TENSORBOARD_DIR" \
+    --checkpoint-freq 0.1 \
     --run-name dfly_qwen3_6_35b_a3b_5full &
 TRAIN_PID=$!
 

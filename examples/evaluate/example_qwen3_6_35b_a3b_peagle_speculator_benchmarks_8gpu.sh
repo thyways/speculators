@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# Run final dual-stream raw-KV DFlash on eight independent single-GPU vLLM
-# replicas. Each replica stays TP=1/PP=1 for raw-KV parity, while benchmark
-# subsets are sharded across GPUs to reduce total wall-clock time.
+# Run the five-layer Qwen3.6-35B-A3B P-EAGLE checkpoint on eight independent
+# single-GPU vLLM replicas. Each replica has concurrency 1; nine benchmark
+# subsets are sharded across the eight workers, then acceptance and latency
+# CSVs are merged.
 
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_REPO="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
-
-REPO="${REPO:-$DEFAULT_REPO}"
+REPO="${REPO:-$(cd -- "$SCRIPT_DIR/../.." && pwd)}"
 WORKSPACE="${WORKSPACE:-$(dirname -- "$REPO")}"
-SINGLE_GPU_SCRIPT="$REPO/examples/evaluate/example_qwen3_6_35b_a3b_kv_native_dflash_speculator_benchmarks.sh"
-MODEL="${MODEL:-$WORKSPACE/model_weights/kv_native_dflash_qwen3_6_35b_a3b_dual_stream_raw_kv_final_5full/checkpoints/0}"
+RUNTIME_REPO="${RUNTIME_REPO:-$WORKSPACE/speculators}"
+SINGLE_GPU_SCRIPT="$REPO/examples/evaluate/example_qwen3_6_35b_a3b_peagle_speculator_benchmarks.sh"
+
+DRAFT_ROOT="$WORKSPACE/model_weights/Qwen3_6_35B_A3B_draft"
+MODEL="${MODEL:-$DRAFT_ROOT/peagle_qwen3_6_35b_a3b_5full/checkpoints/0}"
 VERIFIER_MODEL="${VERIFIER_MODEL:-$WORKSPACE/model_weights/Qwen/Qwen3.6-35B-A3B}"
 
 GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
@@ -20,12 +22,14 @@ BASE_INTERNAL_PORT="${BASE_INTERNAL_PORT:-20000}"
 MAX_REQUESTS="${MAX_REQUESTS:-200}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-12288}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
-NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-15}"
-VLLM_USE_V2_MODEL_RUNNER="${VLLM_USE_V2_MODEL_RUNNER:-1}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
+NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-7}"
+# Must match the single-GPU script's default: 0.90 starves the KV cache under
+# the V1 model runner that P-EAGLE parallel drafting requires.
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.94}"
 MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-4096}"
 TEMPERATURE="${TEMPERATURE:-0}"
+VLLM_USE_V2_MODEL_RUNNER="${VLLM_USE_V2_MODEL_RUNNER:-0}"
 HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 STARTUP_STAGGER_SECONDS="${STARTUP_STAGGER_SECONDS:-2}"
 
@@ -34,7 +38,7 @@ if [[ -z "${GEN_KWARGS+x}" ]]; then
 fi
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-OUTPUT_ROOT="${OUTPUT_ROOT:-$WORKSPACE/evaluation_results/kv_native_dflash_qwen3_6_35b_a3b_ckpt0_spec${NUM_SPECULATIVE_TOKENS}_8gpu_${TIMESTAMP}}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$WORKSPACE/evaluation_results/peagle_qwen3_6_35b_a3b_5full_ckpt0_spec${NUM_SPECULATIVE_TOKENS}_8gpu_${TIMESTAMP}}"
 
 IFS=',' read -r -a GPU_ARRAY <<< "$GPU_IDS"
 WORKLOADS=(
@@ -52,18 +56,24 @@ if [[ "${#GPU_ARRAY[@]}" -ne "${#WORKLOADS[@]}" ]]; then
     echo "Expected 8 comma-separated GPU IDs, got: $GPU_IDS" >&2
     exit 1
 fi
-if [[ "$NUM_SPECULATIVE_TOKENS" != "15" ]]; then
-    echo "Final block-16 KV-native DFlash requires NUM_SPECULATIVE_TOKENS=15" >&2
+if [[ ! "$NUM_SPECULATIVE_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "NUM_SPECULATIVE_TOKENS must be a positive integer, got: $NUM_SPECULATIVE_TOKENS" >&2
     exit 1
 fi
-if [[ "$VLLM_USE_V2_MODEL_RUNNER" != "0" && "$VLLM_USE_V2_MODEL_RUNNER" != "1" ]]; then
-    echo "VLLM_USE_V2_MODEL_RUNNER must be 0 or 1" >&2
+if [[ ! -f "$SINGLE_GPU_SCRIPT" ]]; then
+    echo "Missing script: $SINGLE_GPU_SCRIPT" >&2
     exit 1
 fi
-if [[ ! -x "$SINGLE_GPU_SCRIPT" ]]; then
-    echo "Missing executable script: $SINGLE_GPU_SCRIPT" >&2
-    exit 1
-fi
+
+for path in \
+    "$MODEL/config.json" \
+    "$MODEL/model.safetensors" \
+    "$VERIFIER_MODEL/config.json"; do
+    if [[ ! -f "$path" ]]; then
+        echo "Missing required file: $path" >&2
+        exit 1
+    fi
+done
 
 for index in "${!GPU_ARRAY[@]}"; do
     gpu="${GPU_ARRAY[$index]}"
@@ -112,18 +122,19 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-echo "=== Eight-GPU KV-native DFlash evaluation ==="
+echo "=== Eight-GPU P-EAGLE evaluation ==="
 echo "Draft model:         $MODEL"
 echo "Verifier model:      $VERIFIER_MODEL"
 echo "Speculative tokens:  $NUM_SPECULATIVE_TOKENS"
-echo "vLLM model runner:    V$((VLLM_USE_V2_MODEL_RUNNER + 1))"
 echo "GPUs:                $GPU_IDS"
 echo "Per-GPU concurrency: $MAX_CONCURRENCY"
 echo "Global concurrency:  ${#GPU_ARRAY[@]}"
+echo "Max model length:    $MAX_MODEL_LEN"
 echo "Max output tokens:   $MAX_OUTPUT_TOKENS"
 echo "Generation kwargs:   $GEN_KWARGS"
 echo "Request endpoint:    /v1/chat/completions"
 echo "HF endpoint:         $HF_ENDPOINT"
+echo "vLLM V2 runner:      $VLLM_USE_V2_MODEL_RUNNER"
 echo "Output root:         $OUTPUT_ROOT"
 
 for index in "${!GPU_ARRAY[@]}"; do
@@ -138,11 +149,13 @@ for index in "${!GPU_ARRAY[@]}"; do
 
     echo "Launching GPU $gpu on API port $port (internal $internal_port) for: $subsets"
     setsid env \
-        CUDA_VISIBLE_DEVICES="$gpu" \
+        REPO="$REPO" \
+        WORKSPACE="$WORKSPACE" \
+        RUNTIME_REPO="$RUNTIME_REPO" \
         MODEL="$MODEL" \
         VERIFIER_MODEL="$VERIFIER_MODEL" \
         NUM_SPECULATIVE_TOKENS="$NUM_SPECULATIVE_TOKENS" \
-        VLLM_USE_V2_MODEL_RUNNER="$VLLM_USE_V2_MODEL_RUNNER" \
+        CUDA_VISIBLE_DEVICES="$gpu" \
         VLLM_PORT="$port" \
         VLLM_INTERNAL_PORT="$internal_port" \
         SUBSETS="$subsets" \
@@ -155,6 +168,7 @@ for index in "${!GPU_ARRAY[@]}"; do
         MAX_OUTPUT_TOKENS="$MAX_OUTPUT_TOKENS" \
         TEMPERATURE="$TEMPERATURE" \
         GEN_KWARGS="$GEN_KWARGS" \
+        VLLM_USE_V2_MODEL_RUNNER="$VLLM_USE_V2_MODEL_RUNNER" \
         HF_ENDPOINT="$HF_ENDPOINT" \
         MODE=throughput \
         bash "$SINGLE_GPU_SCRIPT" >"$runner_log" 2>&1 &

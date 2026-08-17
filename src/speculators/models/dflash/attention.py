@@ -12,12 +12,13 @@ def create_dual_stream_anchor_mask_mod(
     sliding_window: int | None = None,
     sliding_window_non_causal: bool = False,
 ):
-    """Build the independent prefix and local masks used by raw-KV DFlash.
+    """Build the independent prefix and local masks for an anchored block.
 
     The prefix stream reads only verifier tokens before an anchor.  The local
-    stream reads only the synthetic tokens in the same anchored block.  Keeping
-    these masks separate is what makes the two attention calls use independent
-    softmax normalizers.
+    stream reads only the synthetic tokens in the same anchored block.  Returned
+    separately so a caller can either combine them into one mask (see
+    :func:`create_anchor_block_mask_mod`) or drive two attention calls with
+    independent softmax normalizers.
     """
     non_causal = sliding_window is None or sliding_window_non_causal
     device = document_ids.device

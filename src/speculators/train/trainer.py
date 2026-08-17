@@ -102,12 +102,12 @@ class TrainerConfig(NamedTuple):
     lr: float
     num_epochs: int
     save_path: str
-    kv_bridge_lr: float | None = None
     resume_from_checkpoint: bool = False
     train_call_kwargs: dict | None = None
     val_call_kwargs: dict | None = None
     optimizer: Literal["adamw", "muon"] = "adamw"
     weight_decay: float = 0.01
+    weight_decay_exclude_1d: bool = False
     muon_lr: float = 0.02
     muon_momentum: float = 0.95
     muon_weight_decay: float = 0.1
@@ -154,7 +154,10 @@ def _reduce_step_metrics(
         return {}
     metric_keys = tuple(metrics)
     stacked = torch.stack(
-        [metrics[key].detach().to(dtype=torch.float32).reshape(()) for key in metric_keys]
+        [
+            metrics[key].detach().to(dtype=torch.float32).reshape(())
+            for key in metric_keys
+        ]
     )
     if distributed:
         dist.reduce(stacked, dst=0, op=dist.ReduceOp.SUM)
@@ -433,19 +436,6 @@ class Trainer:
         for scheduler in self.schedulers:
             scheduler.step()
 
-    def _pop_batch_valid(self, batch: dict) -> bool:
-        valid = batch.pop("batch_valid", None)
-        if valid is None:
-            return True
-        valid = valid.to(
-            device=self.local_rank,
-            dtype=torch.uint8,
-            non_blocking=True,
-        )
-        if self.is_distributed:
-            dist.all_reduce(valid, op=dist.ReduceOp.MIN)
-        return bool(valid.item())
-
     def _prepare_resume_skip(self, epoch: int) -> int:
         """Prepare fast-skip state for mid-epoch resume and return skipped steps."""
         skip_steps = 0
@@ -531,14 +521,6 @@ class Trainer:
                 else v
                 for k, v in batch.items()
             }
-            if not self._pop_batch_valid(gpu_batch):
-                root_logger.warning(
-                    "Skipping packed batch because at least one rank received no "
-                    "valid online verifier payloads."
-                )
-                t_before_fetch = time.perf_counter()
-                continue
-
             # Let progress-dependent objectives update their schedule state.
             self._unwrapped_model.on_training_step(self.global_step, step_horizon)
 
@@ -636,12 +618,6 @@ class Trainer:
                 else v
                 for k, v in batch.items()
             }
-            if not self._pop_batch_valid(gpu_batch):
-                root_logger.warning(
-                    "Skipping validation batch because at least one rank received "
-                    "no valid online verifier payloads."
-                )
-                continue
             num_batches += 1
 
             with torch.autocast(

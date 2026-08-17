@@ -7,60 +7,102 @@ from torch import nn
 from speculators.train.optimizers import build_optimizers
 
 
-class _ToyBridgeModel(nn.Module):
+class _ToyLinearModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.base = nn.Linear(4, 4)
-        self.kv_bridge_source_compressor = nn.Linear(4, 4)
-        self.layer = nn.Module()
-        self.layer.kv_bridge = nn.Linear(4, 4)
+        self.head = nn.Linear(4, 4)
+
+
+class _ToyGatedModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight_matrix = nn.Parameter(torch.zeros(4, 4))
+        self.norm_weight = nn.Parameter(torch.ones(4))
+        self.scalar_gate = nn.Parameter(torch.zeros(()))
 
 
 def _config(**kwargs):
     values = {
         "optimizer": "adamw",
         "lr": 6e-4,
-        "kv_bridge_lr": 6e-5,
         "weight_decay": 0.01,
+        "weight_decay_exclude_1d": False,
     }
     values.update(kwargs)
     return SimpleNamespace(**values)
 
 
-def test_adamw_uses_independent_kv_bridge_parameter_group():
-    model = _ToyBridgeModel()
-    [optimizer] = build_optimizers(model, _config())
+def test_trainer_config_carries_the_weight_decay_exclusion_flag():
+    """build_optimizers reads this off TrainerConfig, not the CLI config.
+
+    TrainerConfig is a NamedTuple with an explicit field list, so a flag that
+    exists on the CLI but not here reaches the optimizer as its default and
+    silently does nothing.
+    """
+    from speculators.train.trainer import TrainerConfig
+
+    assert "weight_decay_exclude_1d" in TrainerConfig._fields
+    config = TrainerConfig(
+        lr=6e-4, num_epochs=1, save_path="x", weight_decay_exclude_1d=True
+    )
+    [optimizer] = build_optimizers(_ToyGatedModel(), config)
+    assert [group["name"] for group in optimizer.param_groups] == [
+        "base",
+        "base_no_decay",
+    ]
+    assert optimizer.param_groups[1]["weight_decay"] == pytest.approx(0.0)
+
+
+def test_weight_decay_exclusion_is_off_by_default():
+    model = _ToyGatedModel()
+    [optimizer] = build_optimizers(model, _config(weight_decay_exclude_1d=False))
+
+    assert len(optimizer.param_groups) == 1
+    assert optimizer.param_groups[0]["weight_decay"] == pytest.approx(0.01)
+
+
+def test_weight_decay_exclusion_puts_norms_and_scalar_gates_in_a_zero_group():
+    model = _ToyGatedModel()
+    [optimizer] = build_optimizers(model, _config(weight_decay_exclude_1d=True))
 
     assert [group["name"] for group in optimizer.param_groups] == [
         "base",
-        "kv_bridge",
+        "base_no_decay",
     ]
-    assert [group["lr"] for group in optimizer.param_groups] == pytest.approx(
-        [6e-4, 6e-5]
-    )
-    bridge_params = {
-        *model.layer.kv_bridge.parameters(),
-        *model.kv_bridge_source_compressor.parameters(),
-    }
-    assert set(optimizer.param_groups[1]["params"]) == bridge_params
-    assert not set(optimizer.param_groups[0]["params"]) & bridge_params
+    decay, no_decay = optimizer.param_groups
+    assert decay["weight_decay"] == pytest.approx(0.01)
+    assert no_decay["weight_decay"] == pytest.approx(0.0)
+    assert decay["param_names"] == ["weight_matrix"]
+    assert sorted(no_decay["param_names"]) == [
+        "norm_weight",
+        "scalar_gate",
+    ]
+    # Same LR either way -- this is a regularization split, not an LR split.
+    assert decay["lr"] == pytest.approx(no_decay["lr"])
 
 
-def test_scheduler_preserves_base_to_bridge_lr_ratio():
-    model = _ToyBridgeModel()
-    [optimizer] = build_optimizers(model, _config())
+def test_weight_decay_exclusion_routes_every_bias_to_the_no_decay_group():
+    model = _ToyLinearModel()
+    [optimizer] = build_optimizers(model, _config(weight_decay_exclude_1d=True))
+
+    by_name = {group["name"]: group["param_names"] for group in optimizer.param_groups}
+    lrs = {group["name"]: group["lr"] for group in optimizer.param_groups}
+    assert lrs["base"] == pytest.approx(lrs["base_no_decay"]) == pytest.approx(6e-4)
+    # Every bias is 1D, so the no-decay group holds exactly the biases here.
+    assert sorted(by_name["base_no_decay"]) == ["base.bias", "head.bias"]
+    assert sorted(by_name["base"]) == ["base.weight", "head.weight"]
+
+
+def test_scheduler_scales_both_weight_decay_groups_together():
+    model = _ToyGatedModel()
+    [optimizer] = build_optimizers(model, _config(weight_decay_exclude_1d=True))
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 0.5)
 
     optimizer.zero_grad()
     optimizer.step()
     scheduler.step()
 
-    base_lr, bridge_lr = [group["lr"] for group in optimizer.param_groups]
-    assert base_lr == pytest.approx(3e-4)
-    assert bridge_lr == pytest.approx(3e-5)
-    assert bridge_lr / base_lr == pytest.approx(0.1)
-
-
-def test_kv_bridge_lr_rejects_a_model_without_bridge_parameters():
-    with pytest.raises(ValueError, match="no trainable KV-bridge parameters"):
-        build_optimizers(nn.Linear(4, 4), _config())
+    decay_lr, no_decay_lr = (group["lr"] for group in optimizer.param_groups)
+    assert decay_lr == pytest.approx(3e-4)
+    assert no_decay_lr == pytest.approx(3e-4)
