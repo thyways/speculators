@@ -80,10 +80,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         # Number of draft layers is encoded in transformer_layer_config
         num_draft_layers = tl_config.num_hidden_layers
         self.layers = nn.ModuleList(
-            [
-                Qwen3DFlashDecoderLayer(config.transformer_layer_config, layer_idx)  # type: ignore[arg-type]
-                for layer_idx in range(num_draft_layers)
-            ]
+            [self._build_layer(layer_idx) for layer_idx in range(num_draft_layers)]
         )
         self.sliding_window = tl_config.sliding_window
         self.sliding_window_indices = [
@@ -127,6 +124,23 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             )
 
         self.post_init()
+
+    def _build_layer(self, layer_idx: int) -> nn.Module:
+        """Build one draft decoder layer.
+
+        Subclasses that carry extra per-layer modules (DFlash2's convolutions)
+        override this instead of rebuilding ``self.layers``; mirrors the
+        ``decoder_layer_cls`` hook on the vLLM side.
+        """
+        return Qwen3DFlashDecoderLayer(self.config.transformer_layer_config, layer_idx)  # type: ignore[arg-type]
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Embed the anchor and mask token ids feeding the draft's query slots.
+
+        Named after -- and overridden for the same reason as -- vLLM's
+        ``embed_input_ids``: DFlash2 scales these embeddings.
+        """
+        return self.embed_tokens(input_ids)
 
     @property
     def target_layer_ids(self) -> list[int]:
@@ -365,7 +379,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             device=device,
         )  # shape: [1, num_anchors*block_size]
         mask_token_ids[:, :: self.block_size] = input_ids[:, anchor_positions]
-        noise_embedding = self.embed_tokens(mask_token_ids)
+        noise_embedding = self.embed_input_ids(mask_token_ids)
         # shape: [1, num_anchors*block_size, hidden_size]
 
         fc_output = self.fc(hidden_states)

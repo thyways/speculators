@@ -463,6 +463,53 @@ class DFlashArgs(_Group):
     )
 
 
+class DFlash2Args(_Group):
+    """DFlash2-exclusive modules (local convolution + candidate selector).
+
+    Every field lands in the saved speculator config under the same name, which is
+    the ``dflash_config`` key the vLLM DFlash2 model reads.
+    """
+
+    conv_kernel_size: int = Field(
+        default=3,
+        description="DFlash2: convolution taps per sublayer. Tap t reaches back t "
+        "draft positions; must not exceed --block-size.",
+    )
+    conv_group_size: int = Field(
+        default=64,
+        description="DFlash2: channels sharing one dynamic convolution coefficient. "
+        "Must divide the draft hidden size.",
+    )
+    selector_rank: int = Field(
+        default=256,
+        description="DFlash2: rank of the candidate selector's predecessor/successor "
+        "codebooks.",
+    )
+    selector_top_k: int = Field(
+        default=16,
+        description="DFlash2: candidates kept per slot at inference. Training scores "
+        "the full vocabulary; this sizes the path walk and the top-K diagnostics.",
+    )
+    input_embedding_scale: float = Field(
+        default=1.0,
+        gt=0.0,
+        description="DFlash2: multiplier on the draft's input embeddings.",
+    )
+    output_multiplier: float = Field(
+        default=1.0,
+        gt=0.0,
+        description="DFlash2: multiplier on the draft logits before the selector "
+        "bias is added.",
+    )
+    final_logit_softcapping: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="DFlash2: softcap the multiplied draft logits as "
+        "tanh(x / cap) * cap before the selector bias is added. Leave unset to "
+        "disable; a non-positive cap is rejected rather than silently ignored.",
+    )
+
+
 class DSparkArgs(_Group):
     """DSpark-exclusive heads (sequential Markov head + confidence head)."""
 
@@ -525,6 +572,7 @@ _GROUPS: dict[str, type[_Group]] = {
     "trainer": TrainerArgs,
     "logging": LoggingArgs,
     "dflash": DFlashArgs,
+    "dflash2": DFlash2Args,
     "dspark": DSparkArgs,
     "peagle": PEagleArgs,
     "mtp": MTPArgs,
@@ -609,7 +657,7 @@ class TrainConfig(BaseSettings):
     speculator_type: str = Field(
         default="eagle3",
         description="Type of speculator model to train "
-        "(eagle3, dflash, dspark, peagle, mtp).",
+        "(eagle3, dflash, dflash2, dspark, peagle, mtp).",
     )
     dry_run: bool = Field(
         default=False,
@@ -634,6 +682,7 @@ class TrainConfig(BaseSettings):
     trainer: TrainerArgs = Field(default_factory=TrainerArgs)
     logging: LoggingArgs = Field(default_factory=LoggingArgs)
     dflash: DFlashArgs = Field(default_factory=DFlashArgs)
+    dflash2: DFlash2Args = Field(default_factory=DFlash2Args)
     dspark: DSparkArgs = Field(default_factory=DSparkArgs)
     peagle: PEagleArgs = Field(default_factory=PEagleArgs)
     mtp: MTPArgs = Field(default_factory=MTPArgs)
@@ -646,7 +695,8 @@ class TrainConfig(BaseSettings):
         else ``False``; unset ``muon_lr`` -> ``10 * lr``; unset ``num_layers`` -> ``5``
         for dflash else ``1``; unset ``per_position_loss_weight`` -> ``dpace`` for
         dflash else ``fixed-exp-decay``; unset ``loss_fn`` -> ``ce`` for dflash else
-        ``kl_div``; unset ``block_size`` -> ``16`` for dflash else ``8``.
+        ``kl_div``; unset ``block_size`` -> ``16`` for dflash else ``8``. ``dflash2``
+        is a DFlash backbone plus two modules, so it takes the same four defaults.
 
         The dflash-conditional defaults reflect the recipe from
         https://github.com/vllm-project/speculators/issues/979: this combination
@@ -665,7 +715,9 @@ class TrainConfig(BaseSettings):
         untouched, so :meth:`from_flat` round-trips.
         """
         is_eagle3 = self.speculator_type == "eagle3"
-        is_dflash = self.speculator_type == "dflash"
+        # dflash2 is a dflash backbone plus the conv and the selector, so the
+        # issue-979 backbone recipe carries over; dspark deliberately does not.
+        is_dflash = self.speculator_type in ("dflash", "dflash2")
         if self.draft.draft_arch is None:
             self.draft.draft_arch = "llama" if is_eagle3 else "qwen3"
         if self.draft.norm_before_fc is None:

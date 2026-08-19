@@ -1,6 +1,6 @@
 # Algorithm Decision Guide
 
-Speculators currently supports five speculative decoding algorithms: **Eagle-3**, **P-EAGLE**, **DFlash**, **DSpark**, and **MTP**. All are lossless -- they produce output from the same distribution as the target model.
+Speculators currently supports six speculative decoding algorithms: **Eagle-3**, **P-EAGLE**, **DFlash**, **DFlash2**, **DSpark**, and **MTP**. All are lossless -- they produce output from the same distribution as the target model.
 
 ## How They Differ
 
@@ -10,32 +10,35 @@ Speculators currently supports five speculative decoding algorithms: **Eagle-3**
 
 **DFlash** predicts all draft tokens in a single forward pass using block-based prediction with anchor points.
 
+**DFlash2** extends DFlash with a local convolution inside each block, so a slot's hidden state mixes in the ones before it, plus a candidate selector that scores adjacent transitions and walks the best path from the verified anchor.
+
 **DSpark** extends DFlash with a Markov head, so positions inside a block depend on earlier ones, plus a confidence head that predicts per-position acceptance.
 
 **MTP** finetunes the model's native multi-token prediction head on domain-specific data. Unlike the other algorithms, MTP does not train from scratch -- it starts from pre-existing MTP layers and is only available for models with native MTP support.
 
-Eagle-3, P-EAGLE, DFlash, and DSpark can be paired with any supported verifier model (including quantized variants) -- the draft architecture is independent of the verifier architecture. MTP requires a model with native MTP layers (e.g. Qwen3-Next, Qwen3.5).
+Every algorithm except MTP can be paired with any supported verifier model (including quantized variants) -- the draft architecture is independent of the verifier architecture. MTP requires a model with native MTP layers (e.g. Qwen3-Next, Qwen3.5). DFlash2 additionally requires the draft vocabulary to be the verifier's full vocabulary.
 
 ## Current Support
 
-|                     | Eagle-3       | P-EAGLE             | DFlash              | DSpark              | MTP                         |
-| ------------------- | ------------- | ------------------- | ------------------- | ------------------- | --------------------------- |
-| **Draft layers**    | Llama-style   | Llama-style         | Qwen3-style         | Qwen3-style         | Native MTP layers           |
-| **Verifier models** | Any supported | Any supported       | Any supported       | Any supported       | Models with native MTP only |
-| **Training mode**   | From scratch  | From scratch        | From scratch        | From scratch        | Finetune existing MTP head  |
-| **Speculators**     | Mature        | Newer, growing fast | Newer, growing fast | Newer, growing fast | Newer, growing fast         |
-| **vLLM**            | Mature        | Newer, growing fast | Newer, growing fast | Newer, growing fast | Newer, growing fast         |
+|                     | Eagle-3       | P-EAGLE             | DFlash              | DFlash2         | DSpark              | MTP                         |
+| ------------------- | ------------- | ------------------- | ------------------- | --------------- | ------------------- | --------------------------- |
+| **Draft layers**    | Llama-style   | Llama-style         | Qwen3-style         | Qwen3-style     | Qwen3-style         | Native MTP layers           |
+| **Verifier models** | Any supported | Any supported       | Any supported       | Any supported   | Any supported       | Models with native MTP only |
+| **Training mode**   | From scratch  | From scratch        | From scratch        | From scratch    | From scratch        | Finetune existing MTP head  |
+| **Speculators**     | Mature        | Newer, growing fast | Newer, growing fast | Newest          | Newer, growing fast | Newer, growing fast         |
+| **vLLM**            | Mature        | Newer, growing fast | Newer, growing fast | PR #52816, open | Newer, growing fast | Newer, growing fast         |
 
-Eagle-3 has been available longer and has broader support in both Speculators and vLLM. P-EAGLE, DFlash, DSpark, and MTP were added more recently and support is improving rapidly.
+Eagle-3 has been available longer and has broader support in both Speculators and vLLM. The others were added more recently and support is improving rapidly; DFlash2's inference path is still an open vLLM pull request, so serving it needs that PR plus the config entry described in [DFlash2](dflash2.md#serving).
 
 ## Which Should I Use?
 
-If you're unsure, start with Eagle-3 -- it has the most mature tooling and documentation. If you want parallel multi-token prediction with an Eagle-3-based architecture, try P-EAGLE. If you want to experiment with DFlash's single-forward-pass block prediction approach, the training workflow is the same, and DSpark adds intra-block dependencies and confidence scheduling on top of it. If your model already has native MTP layers (e.g. Qwen3-Next, Qwen3.5), MTP finetuning lets you improve the existing MTP head on domain-specific data without training a separate draft model.
+If you're unsure, start with Eagle-3 -- it has the most mature tooling and documentation. If you want parallel multi-token prediction with an Eagle-3-based architecture, try P-EAGLE. If you want to experiment with DFlash's single-forward-pass block prediction approach, the training workflow is the same, and both DFlash2 and DSpark add intra-block dependencies on top of it -- DFlash2 through a convolution and a candidate walk, DSpark through a Markov bias and confidence scheduling. If your model already has native MTP layers (e.g. Qwen3-Next, Qwen3.5), MTP finetuning lets you improve the existing MTP head on domain-specific data without training a separate draft model.
 
 For more details on each algorithm, see:
 
 - [Eagle-3](eagle3.md)
 - [P-EAGLE](peagle.md)
 - [DFlash](dflash.md)
+- [DFlash2](dflash2.md)
 - [DSpark](dspark.md)
 - [MTP](mtp.md)
