@@ -436,7 +436,7 @@ class LoggingArgs(_Group):
 
 
 class DFlashArgs(_Group):
-    """DFlash-family backbone knobs (also used by DSpark, which is-a DFlash)."""
+    """DFlash-family backbone knobs shared by DFlash, DFly, DSpark, and Domino."""
 
     block_size: int | None = Field(
         default=None,
@@ -446,10 +446,11 @@ class DFlashArgs(_Group):
     sample_from_anchor: bool | None = Field(
         default=None,
         description="Sample from the anchor position (all positions predict). "
-        "Default: False for dflash, True for dspark.",
+        "Default: False for dflash/dfly, True for dspark/domino.",
     )
     dflash_decay_gamma: float = Field(
-        default=4.0, description="Decay gamma for DFlash/DSpark loss weighting."
+        default=4.0,
+        description="Decay gamma for DFlash/DFly/DSpark/Domino loss weighting.",
     )
     per_position_loss_weight: Literal["fixed-exp-decay", "dpace"] | None = Field(
         default=None,
@@ -460,6 +461,62 @@ class DFlashArgs(_Group):
         default=0.5,
         description="Smoothing constant for the D-PACE loss (default: 0.5). Must be in "
         "(0, 1] when --per-position-loss-weight=dpace.",
+    )
+
+
+class DFlyArgs(_Group):
+    """DFly-exclusive hidden-state correction settings."""
+
+    enable_hidden_correction: bool = Field(
+        default=True,
+        description=(
+            "DFly: apply previous-token-conditioned hidden-state correction "
+            "before the draft LM head."
+        ),
+    )
+    hidden_correction_intermediate_size: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "DFly: SwiGLU width for hidden-state correction. Defaults to the "
+            "draft hidden size."
+        ),
+    )
+
+
+class DominoArgs(_Group):
+    """Domino-exclusive recurrent logit-correction head and its loss schedule."""
+
+    gru_hidden_dim: int = Field(
+        default=1024,
+        gt=0,
+        description="Domino: hidden width of the intra-block GRU.",
+    )
+    logits_correction_emb_dim: int = Field(
+        default=256,
+        gt=0,
+        description="Domino: bottleneck width of the logit-correction MLP "
+        "(upstream calls this emb_dim).",
+    )
+    pure_draft_prefix_len: int = Field(
+        default=1,
+        ge=0,
+        description="Domino: leading predicted slots per block that keep the "
+        "uncorrected DFlash logits.",
+    )
+    lambda_base_start: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Domino: initial weight of the uncorrected (base) loss term; "
+        "decays linearly to 0. Set 0 to disable base anchoring.",
+    )
+    lambda_base_decay_ratio: float = Field(
+        default=0.5,
+        gt=0.0,
+        le=1.0,
+        description="Domino: fraction of total training steps over which "
+        "--lambda-base-start decays to 0.",
     )
 
 
@@ -525,6 +582,8 @@ _GROUPS: dict[str, type[_Group]] = {
     "trainer": TrainerArgs,
     "logging": LoggingArgs,
     "dflash": DFlashArgs,
+    "dfly": DFlyArgs,
+    "domino": DominoArgs,
     "dspark": DSparkArgs,
     "peagle": PEagleArgs,
     "mtp": MTPArgs,
@@ -609,7 +668,7 @@ class TrainConfig(BaseSettings):
     speculator_type: str = Field(
         default="eagle3",
         description="Type of speculator model to train "
-        "(eagle3, dflash, dspark, peagle, mtp).",
+        "(eagle3, dflash, dfly, domino, dspark, peagle, mtp).",
     )
     dry_run: bool = Field(
         default=False,
@@ -634,6 +693,8 @@ class TrainConfig(BaseSettings):
     trainer: TrainerArgs = Field(default_factory=TrainerArgs)
     logging: LoggingArgs = Field(default_factory=LoggingArgs)
     dflash: DFlashArgs = Field(default_factory=DFlashArgs)
+    dfly: DFlyArgs = Field(default_factory=DFlyArgs)
+    domino: DominoArgs = Field(default_factory=DominoArgs)
     dspark: DSparkArgs = Field(default_factory=DSparkArgs)
     peagle: PEagleArgs = Field(default_factory=PEagleArgs)
     mtp: MTPArgs = Field(default_factory=MTPArgs)
