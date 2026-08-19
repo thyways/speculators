@@ -226,6 +226,13 @@ class DataArgs(_Group):
     )
     num_workers: int = Field(default=12, description="Number of dataloader workers.")
     prefetch_factor: int = Field(default=4, description="Dataloader prefetch factor.")
+    fetch_threads: int = Field(
+        default=1,
+        description="Threads per dataloader worker used to fetch a batch's hidden "
+        "states concurrently. Online generation blocks on one request per sample, so "
+        "a batch of N samples otherwise waits on the sum of N latencies and one slow "
+        "sample stalls the rank. Default 1 (serial).",
+    )
     max_anchors: int = Field(
         default=512,
         description="Maximum anchor positions for DFlash, DSpark, and P-EAGLE training "
@@ -285,6 +292,13 @@ class GenerationArgs(_Group):
         default=DEFAULT_MAX_RETRIES,
         description="Maximum retry attempts per vLLM request on failure. Only applies "
         "if --on-missing=generate.",
+    )
+    fail_on_hidden_state_error: bool = Field(
+        default=False,
+        description=(
+            "Abort training when online hidden-state generation fails or returns "
+            "token IDs that differ from the prepared sample."
+        ),
     )
 
 

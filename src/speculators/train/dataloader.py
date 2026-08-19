@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import copy
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-import os
 
 import torch
 from torch.utils.data import DataLoader
@@ -49,6 +49,20 @@ def _worker_init_fn(worker_id: int) -> None:  # noqa: ARG001
     torch.set_num_threads(1)
 
 
+def _make_worker_dataset(dataset: BaseDataset) -> BaseDataset:
+    """Drop parent-only sampler state from the dataset sent to spawned workers.
+
+    ``approx_lengths`` can contain hundreds of thousands of Python integers. The
+    batch sampler copies it into its own NumPy array before worker startup, and
+    ``Dataset.__getitem__`` never reads it. Avoiding that field in every spawn pickle
+    keeps the parent from blocking while each child imports the training stack.
+    """
+
+    worker_dataset = copy.copy(dataset)
+    worker_dataset.approx_lengths = []
+    return worker_dataset
+
+
 def _setup_dataloader(
     dataset: BaseDataset,
     total_seq_len: int,
@@ -65,8 +79,9 @@ def _setup_dataloader(
         rank=get_dp_rank(),
     )
     use_workers = num_workers > 0
+    worker_dataset = _make_worker_dataset(dataset) if use_workers else dataset
     return DataLoader(
-        dataset,
+        worker_dataset,
         batch_sampler=batch_sampler,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor if use_workers else None,
@@ -103,6 +118,8 @@ def create_train_val_loaders(
     prefetch_factor: int,
     preprocess: Callable[[BatchType], BatchType] | None,
     train_data_ratio: float = 0.9,
+    fail_on_hidden_state_error: bool = False,
+    fetch_threads: int = 1,
 ) -> tuple[DataLoader, DataLoader]:
     """Create training and validation DataLoaders.
 
@@ -130,6 +147,8 @@ def create_train_val_loaders(
         hidden_states_dtype=hidden_states_dtype,
         request_timeout=request_timeout,
         max_retries=max_retries,
+        fail_on_hidden_state_error=fail_on_hidden_state_error,
+        fetch_threads=fetch_threads,
     )
     val_dataset: BaseDataset = ArrowDataset(
         datapath=data_path,
@@ -144,6 +163,8 @@ def create_train_val_loaders(
         hidden_states_dtype=hidden_states_dtype,
         request_timeout=request_timeout,
         max_retries=max_retries,
+        fail_on_hidden_state_error=fail_on_hidden_state_error,
+        fetch_threads=fetch_threads,
     )
 
     train_loader = _setup_dataloader(

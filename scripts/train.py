@@ -673,6 +673,8 @@ def main(cfg: TrainConfig):  # noqa: C901
         prefetch_factor=args.prefetch_factor,
         preprocess=preprocess,
         train_data_ratio=args.train_data_ratio,
+        fail_on_hidden_state_error=args.fail_on_hidden_state_error,
+        fetch_threads=args.fetch_threads,
     )
 
     # Get trainer kwargs from model class

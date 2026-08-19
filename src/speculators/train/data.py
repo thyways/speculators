@@ -1,5 +1,6 @@
 import warnings
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from os import PathLike
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -94,10 +95,13 @@ class BaseDataset(Dataset):
         max_len: int,
         transform: TransformTensors | None = None,
         hidden_states_dtype=torch.bfloat16,
+        fetch_threads: int = 1,
     ):
         self.max_len = max_len
         self.transform = transform
         self.hidden_states_dtype = hidden_states_dtype
+        self.fetch_threads = max(1, fetch_threads)
+        self._fetch_pool: ThreadPoolExecutor | None = None
         self.approx_lengths = self._compute_approx_lengths()
 
     def _compute_approx_lengths(self):
@@ -105,6 +109,48 @@ class BaseDataset(Dataset):
 
     def _get_raw_data(self, index):
         raise NotImplementedError
+
+    def _prepare_fetch(self) -> None:
+        """One-time setup that must happen before the fetch pool starts.
+
+        Subclasses with lazily initialized state override this so several fetch
+        threads don't race to build it.
+        """
+
+    def __getstate__(self) -> dict[str, Any]:
+        # The DataLoader pickles this dataset into every spawned worker, and a
+        # live executor cannot cross that boundary. Workers rebuild their own
+        # pool on first use.
+        state = self.__dict__.copy()
+        state["_fetch_pool"] = None
+        return state
+
+    def __getitems__(self, indices: Sequence[int]) -> list[BatchType | None]:
+        """Fetch a whole batch at once, overlapping the per-sample round trips.
+
+        ``_MapDatasetFetcher`` prefers this over ``__getitem__`` when it exists,
+        handing over every index in the batch together. Online hidden states
+        cost one blocking HTTP request per sample, so fetching serially makes a
+        step wait on the *sum* of its samples' latencies -- and because the
+        DataLoader delivers batches in order, one slow sample stalls the whole
+        rank while its peers idle at the gradient all-reduce. Threads turn that
+        sum into a max.
+
+        The returned order matches ``indices``: collation derives ``lengths``
+        and ``document_ids`` from the sequence position.
+        """
+        if self.fetch_threads <= 1 or len(indices) <= 1:
+            return [self[index] for index in indices]
+
+        self._prepare_fetch()
+        if self._fetch_pool is None:
+            self._fetch_pool = ThreadPoolExecutor(
+                max_workers=self.fetch_threads,
+                thread_name_prefix="hs-fetch",
+            )
+        # map() preserves input order and re-raises exceptions from the threads,
+        # so fail_on_hidden_state_error still aborts the run.
+        return list(self._fetch_pool.map(self.__getitem__, indices))
 
     def __getitem__(self, index) -> BatchType | None:
         data = self._get_raw_data(index)
@@ -159,6 +205,8 @@ class ArrowDataset(BaseDataset):
         model: str | None = None,
         request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        fail_on_hidden_state_error: bool = False,
+        fetch_threads: int = 1,
     ):
         self.data = load_from_disk(datapath)
         if not 0.0 < train_ratio <= 1.0:
@@ -188,12 +236,23 @@ class ArrowDataset(BaseDataset):
         self.model = model
         self.request_timeout = request_timeout
         self.max_retries = max_retries
+        self.fail_on_hidden_state_error = fail_on_hidden_state_error
 
         # Delay super init so that `_compute_approx_lengths` has required data
-        super().__init__(max_len, transform, hidden_states_dtype)
+        super().__init__(max_len, transform, hidden_states_dtype, fetch_threads)
 
     def _map_to_file_idx(self, index: int):
         return index + self.start_file_idx
+
+    def _prepare_fetch(self) -> None:
+        """Build the vLLM client before the fetch pool starts, not inside it.
+
+        ``_get_raw_data`` sets the client up on first use. Several fetch threads
+        discovering ``self.client is None`` at once would each run the model
+        handshake and ``transfer.setup()``.
+        """
+        if not self.client:
+            self._setup_client()
 
     def _setup_client(self):
         self.client = openai.OpenAI(
@@ -245,7 +304,11 @@ class ArrowDataset(BaseDataset):
                     self.transfer.cache(handle, file_idx)
                 case "delete":
                     self.transfer.delete(handle)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
+            if self.fail_on_hidden_state_error:
+                raise RuntimeError(
+                    f"Online hidden-state generation failed for sample {index}"
+                ) from e
             warnings.warn(
                 f"Failed to load/cache hidden states for sample {index}: {e}",
                 stacklevel=1,
@@ -284,8 +347,12 @@ class ArrowDataset(BaseDataset):
         # }
 
         if not torch.equal(loaded_hs["token_ids"], self.data[index]["input_ids"]):
+            if self.fail_on_hidden_state_error:
+                raise RuntimeError(
+                    f"Loaded hidden-state token ids do not match sample {index}"
+                )
             warnings.warn(
-                f"Loaded token ids {loaded_hs['token_ids']} for index {index} don't"
+                f"Loaded token ids {loaded_hs['token_ids']} for index {index} don't "
                 f"match input ids {self.data[index]['input_ids']}",
                 stacklevel=1,
             )
