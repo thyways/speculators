@@ -34,7 +34,16 @@ def _conv(n: int) -> list[dict]:
 def _patch_encode(monkeypatch, renders: dict[tuple[int, bool], list[int]]):
     """Stub ``_encode_render`` to return crafted ids keyed by (prefix_len, gen)."""
 
-    def fake(conv_prefix, render_endpoint, *, add_generation_prompt, tools=None):
+    def fake(
+        conv_prefix,
+        render_endpoint,
+        *,
+        add_generation_prompt,
+        tools=None,
+        chat_template_kwargs=None,
+        processor=None,
+    ):
+        del render_endpoint, tools, chat_template_kwargs, processor
         return renders[(len(conv_prefix), add_generation_prompt)]
 
     monkeypatch.setattr(preprocessing, "_encode_render", fake)
@@ -124,6 +133,41 @@ def test_append_row_statuses():
     assert results["seq_len"] == [3]
 
 
+def test_fanout_copies_preserved_source_columns(monkeypatch):
+    rows = [
+        {
+            "input_ids": [1, 2, 3],
+            "loss_mask": [0, 1, 1],
+            "conv": _conv(2),
+        },
+        {
+            "input_ids": [1, 2, 3, 4],
+            "loss_mask": [0, 0, 1, 1],
+            "conv": _conv(4),
+        },
+    ]
+    monkeypatch.setattr(
+        preprocessing,
+        "_render_conversation_rows",
+        lambda *args, **kwargs: rows,
+    )
+
+    result = preprocessing._preprocess_batch(
+        {
+            "conversations": [_conv(4)],
+            "record_id": ["record-7"],
+            "candidate_rank": [11],
+        },
+        is_multimodal=False,
+        render_endpoint="http://x",
+        max_length=100,
+        preserve_columns=("record_id", "candidate_rank"),
+    )
+
+    assert result["record_id"] == ["record-7", "record-7"]
+    assert result["candidate_rank"] == [11, 11]
+
+
 # --------------------------------------------------------------------------- #
 # render_client                                                                #
 # --------------------------------------------------------------------------- #
@@ -143,6 +187,25 @@ def test_render_conversation_missing_token_ids_raises(monkeypatch):
         render_client.render_conversation(
             "http://x", [], add_generation_prompt=False, max_retries=0
         )
+
+
+def test_render_conversation_forwards_chat_template_kwargs(monkeypatch):
+    captured = {}
+
+    def post(url, *, json, timeout):
+        captured.update({"url": url, "json": json, "timeout": timeout})
+        return _Resp(200, {"token_ids": [1, 2, 3]})
+
+    monkeypatch.setattr(render_client.httpx, "post", post)
+    token_ids = render_client.render_conversation(
+        "http://x",
+        [{"role": "user", "content": "hello"}],
+        add_generation_prompt=True,
+        chat_template_kwargs={"enable_thinking": False},
+    )
+
+    assert token_ids == [1, 2, 3]
+    assert captured["json"]["chat_template_kwargs"] == {"enable_thinking": False}
 
 
 def test_render_conversation_client_error_not_retried(monkeypatch):
