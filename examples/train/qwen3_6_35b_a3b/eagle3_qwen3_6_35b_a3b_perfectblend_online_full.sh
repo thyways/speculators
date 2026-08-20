@@ -200,9 +200,9 @@ setsid env \
     --draft-vocab-size "$DRAFT_VOCAB_SIZE" \
     --epochs 1 \
     --train-data-ratio 0.98 \
-    --optimizer adamw \
-    --lr "$LR" \
-    --weight-decay 0.01 \
+    --optimizer muon \
+    --muon-lr 2e-4 \
+    --lr 1e-4 \
     --noise-std 0 \
     --scheduler-type cosine \
     --scheduler-warmup-ratio 0.04 \

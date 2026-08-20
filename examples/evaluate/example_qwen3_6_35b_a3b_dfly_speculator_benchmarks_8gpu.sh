@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the five-layer Qwen3.6-35B-A3B DFlash checkpoint on eight independent
+# Run the five-layer Qwen3.6-35B-A3B DFly checkpoint on eight independent
 # single-GPU vLLM replicas. Nine benchmark subsets are sharded across the eight
 # workers, then acceptance and latency CSVs are merged.
 
@@ -9,8 +9,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-$(cd -- "$SCRIPT_DIR/../.." && pwd)}"
 WORKSPACE="${WORKSPACE:-$(dirname -- "$REPO")}"
 RUNTIME_REPO="${RUNTIME_REPO:-$WORKSPACE/speculators}"
-SINGLE_GPU_SCRIPT="$REPO/examples/evaluate/example_qwen3_6_35b_a3b_dflash_speculator_benchmarks.sh"
-MODEL="${MODEL:-$WORKSPACE/model_weights/dflash_qwen3_6_35b_a3b_5full_muon/checkpoints/0}"
+SINGLE_GPU_SCRIPT="$REPO/examples/evaluate/example_qwen3_6_35b_a3b_dfly_speculator_benchmarks.sh"
+MODEL="${MODEL:-$WORKSPACE/model_weights/dfly_qwen3_6_35b_a3b_5full/checkpoints/0}"
 VERIFIER_MODEL="${VERIFIER_MODEL:-$WORKSPACE/model_weights/Qwen/Qwen3.6-35B-A3B}"
 
 GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
@@ -32,7 +32,7 @@ if [[ -z "${GEN_KWARGS+x}" ]]; then
 fi
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-OUTPUT_ROOT="${OUTPUT_ROOT:-$WORKSPACE/evaluation_results/dflash_qwen3_6_35b_a3b_5full_ckpt0_spec${NUM_SPECULATIVE_TOKENS}_8gpu_${TIMESTAMP}}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$WORKSPACE/evaluation_results/dfly_qwen3_6_35b_a3b_5full_ckpt0_spec${NUM_SPECULATIVE_TOKENS}_8gpu_${TIMESTAMP}}"
 
 IFS=',' read -r -a GPU_ARRAY <<< "$GPU_IDS"
 WORKLOADS=(
@@ -115,7 +115,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-echo "=== Eight-GPU DFlash evaluation ==="
+echo "=== Eight-GPU DFly evaluation ==="
 echo "Draft model:         $MODEL"
 echo "Verifier model:      $VERIFIER_MODEL"
 echo "Speculative tokens:  $NUM_SPECULATIVE_TOKENS"

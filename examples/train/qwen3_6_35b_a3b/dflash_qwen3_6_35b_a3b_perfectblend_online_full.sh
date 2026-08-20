@@ -10,7 +10,7 @@ export ENV_REPO="${ENV_REPO:-$ROOT/speculators}"
 
 MODEL="${MODEL:-$ROOT/model_weights/Qwen/Qwen3.6-35B-A3B}"
 DATA_DIR="${DATA_DIR:-$ROOT/datasets/qwen3_6_35b_500k}"
-export RUN_DIR="${RUN_DIR:-$ROOT/model_weights/dflash_qwen3_6_35b_a3b_5full}"
+export RUN_DIR="${RUN_DIR:-$ROOT/model_weights/dflash_qwen3_6_35b_a3b_5full_muon}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-$RUN_DIR/checkpoints}"
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-$RUN_DIR/tensorboard}"
 
@@ -183,8 +183,7 @@ setsid env \
     --epochs 1 \
     --train-data-ratio 0.98 \
     --optimizer adamw \
-    --lr 6e-4 \
-    --weight-decay 0.01 \
+    --lr 1e-4 \
     --noise-std 0 \
     --scheduler-type cosine \
     --scheduler-warmup-ratio 0.04 \
