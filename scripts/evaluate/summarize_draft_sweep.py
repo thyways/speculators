@@ -22,14 +22,33 @@ SUBSET_ORDER = [
 ]
 
 HEADER = """Qwen3.6-35B-A3B draft checkpoints, RedHatAI/speculator_benchmarks
-8 single-GPU vLLM replicas, per-replica concurrency 1, temperature 0,
-max_output_tokens 4096, max_requests 200/subset, verifier Qwen/Qwen3.6-35B-A3B
+single-GPU vLLM, concurrency 1, temperature 0, max_output_tokens 4096,
+verifier Qwen/Qwen3.6-35B-A3B. Every subset runs its full row count
+(HumanEval 164, tool_call 200, the other seven 80) -- the earlier
+`max_requests 200/subset` cap never truncated any subset, and guidellm does
+not resample, so capped and uncapped runs are the same measurement.
+NOTE: `dflash_muon-*` was run alone on one card, sequentially; the other
+      columns come from 8 concurrent single-GPU replicas. Acceptance metrics
+      are per-draft and unaffected, but output_tps / itl / ttft carry a small
+      bias because the 8-replica runs contend for host CPU.
 NOTE: the dataset ships question.jsonl and writing.jsonl with identical
-      content (same git oid), so those two rows are expected to match."""
+      content (same git oid), so those two rows are expected to match.
+NOTE: acceptance positions are 0-indexed, so `pos14` is the 15th speculative
+      position. A run that proposes fewer tokens than a position asks for
+      leaves that cell blank rather than reporting a zero."""
 
 SUBSET_WIDTH = 15
 OVERALL_WIDTH = 22
 COL_WIDTH = 15
+
+# Acceptance rates are per-draft, so they aggregate across subsets weighted by
+# each subset's draft count; throughput and latency medians do not.
+DRAFTS_WEIGHTED_FIELDS = (
+    "acceptance_length",
+    "acceptance_at_pos_0",
+    "acceptance_at_pos_6",
+    "acceptance_at_pos_14",
+)
 
 
 def variant_sort_key(name: str) -> tuple[str, int]:
@@ -74,10 +93,18 @@ def format_table(
     return lines
 
 
-def overall_row(rows: dict[str, dict[str, float]], field: str) -> float:
-    """Drafts-weighted for acceptance fields, plain mean for perf fields."""
-    subsets = [s for s in SUBSET_ORDER if s in rows]
-    if field in ("acceptance_length", "acceptance_at_pos_0"):
+def overall_row(rows: dict[str, dict[str, float]], field: str) -> float | None:
+    """Drafts-weighted for acceptance fields, plain mean for perf fields.
+
+    Returns ``None`` when no subset reports the field. That is how a run with
+    fewer speculative positions than the row asks for stays blank: a spec=7 run
+    has no ``acceptance_at_pos_14`` column at all, and averaging the positions
+    it does have would silently answer a different question.
+    """
+    subsets = [s for s in SUBSET_ORDER if s in rows and field in rows[s]]
+    if not subsets:
+        return None
+    if field in DRAFTS_WEIGHTED_FIELDS:
         drafts = sum(rows[s]["num_drafts"] for s in subsets)
         if field == "acceptance_length":
             # per-subset acceptance_length == accepted/drafts + 1
@@ -128,13 +155,17 @@ def main() -> None:
     for metric, field, digits in (
         ("acceptance_length", "acceptance_length", 3),
         ("pos0 accept rate", "acceptance_at_pos_0", 4),
+        ("pos6 accept rate", "acceptance_at_pos_6", 4),
+        ("pos14 accept rate", "acceptance_at_pos_14", 4),
         ("output_tps", "output_tps_median", 2),
         ("itl_ms", "itl_median_ms", 2),
     ):
         line = metric.ljust(OVERALL_WIDTH)
         for label in labels:
-            line += f"{overall_row(data[label], field):.{digits}f}".rjust(COL_WIDTH)
-        lines.append(line)
+            value = overall_row(data[label], field)
+            cell = "" if value is None else f"{value:.{digits}f}"
+            line += cell.rjust(COL_WIDTH)
+        lines.append(line.rstrip())
 
     text = "\n".join(lines) + "\n"
     if args.output:
