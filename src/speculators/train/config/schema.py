@@ -466,8 +466,10 @@ class DFlashArgs(_Group):
 class DFlash2Args(_Group):
     """DFlash2-exclusive modules (local convolution + candidate selector).
 
-    Every field lands in the saved speculator config under the same name, which is
-    the ``dflash_config`` key the vLLM DFlash2 model reads.
+    Every field except ``selector_loss_weight`` lands in the saved speculator config
+    under the same name, which is the ``dflash_config`` key the vLLM DFlash2 model
+    reads. That one weights a loss term, so it belongs to the run, not to the
+    checkpoint.
     """
 
     conv_kernel_size: int = Field(
@@ -488,7 +490,15 @@ class DFlash2Args(_Group):
     selector_top_k: int = Field(
         default=16,
         description="DFlash2: candidates kept per slot at inference. Training scores "
-        "the full vocabulary; this sizes the path walk and the top-K diagnostics.",
+        "the same K, so this sizes the selector loss, the path walk and the "
+        "diagnostics.",
+    )
+    selector_loss_weight: float = Field(
+        default=1.0,
+        ge=0.0,
+        description="DFlash2: weight of the selector's top-K cross-entropy term, "
+        "added to DFlash's full-vocabulary loss on the unary logits. 0 trains the "
+        "backbone only.",
     )
     input_embedding_scale: float = Field(
         default=1.0,

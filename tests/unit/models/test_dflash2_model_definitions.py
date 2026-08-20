@@ -165,13 +165,12 @@ class TestCandidateSelector:
         assert bias.abs().max() == 0.0
 
     def test_block_bias_matches_the_inference_edge_scores(self):
-        """The training objective and the serving path score the same function.
+        """The two forms of the bias score the same function.
 
         ``block_bias`` scores the whole vocabulary against the ground-truth
         predecessor; ``edge_scores`` scores the kept top-K against the predecessor
         the walk actually chose. Where the predecessor agrees, the two must return
-        the same number -- otherwise training would optimize something the drafter
-        does not compute.
+        the same number.
         """
         selector = self._selector(vocab=17, hidden_size=16, rank=5, top_k=3)
         with torch.no_grad():
@@ -201,6 +200,59 @@ class TestCandidateSelector:
                 edges[:, step, 0],
                 bias[:, step + 1].gather(1, candidate_ids[:, step]),
             )
+
+    def test_candidate_bias_matches_the_inference_edge_scores(self):
+        """The loss and the serving path score the same function.
+
+        ``candidate_bias`` is what the selector loss adds to the unary logits, and
+        ``edge_scores`` is what the walk scores. For the ground-truth predecessor the
+        two must agree column by column -- otherwise training would optimize
+        something the drafter does not compute.
+        """
+        selector = self._selector(vocab=17, hidden_size=16, rank=5, top_k=3)
+        with torch.no_grad():
+            selector.successor_codebook.normal_(std=0.5)
+
+        num_blocks, block_size, top_k = 4, 6, 3
+        torch.manual_seed(2)
+        block_tokens = torch.randint(17, (num_blocks, block_size))
+        hidden = torch.randn(num_blocks, block_size, 16)
+        prev_token_ids = torch.cat([block_tokens[:, :1], block_tokens[:, :-1]], dim=1)
+
+        # Inference step l corresponds to slot l+1, so the walk sees slots 1..B-1.
+        steps = block_size - 1
+        candidate_ids = torch.randint(17, (num_blocks, steps, top_k))
+        # Put the ground-truth path at candidate index 0 so the predecessor the edge
+        # scorer uses at step l is prev_token_ids[:, l + 1], i.e. row p=0 is the row
+        # the loss trains.
+        candidate_ids[:, :, 0] = block_tokens[:, 1:]
+        unary = torch.zeros(num_blocks, steps, top_k)
+        edges = selector.edge_scores(
+            candidate_ids, unary, hidden[:, 1:], block_tokens[:, 0]
+        )
+
+        # Slot 0 carries no loss; its candidates are never read.
+        block_candidates = torch.cat([candidate_ids[:, :1], candidate_ids], dim=1)
+        bias = selector.candidate_bias(prev_token_ids, hidden, block_candidates)
+        assert bias.shape == (num_blocks, block_size, top_k)
+        for step in range(steps):
+            torch.testing.assert_close(edges[:, step, 0], bias[:, step + 1])
+
+    def test_candidate_bias_is_block_bias_on_the_kept_candidates(self):
+        """The top-K restriction is a gather, not a different computation."""
+        selector = self._selector(vocab=17, hidden_size=16, rank=5, top_k=3)
+        with torch.no_grad():
+            selector.successor_codebook.normal_(std=0.5)
+
+        torch.manual_seed(3)
+        prev_token_ids = torch.randint(17, (4, 6))
+        hidden = torch.randn(4, 6, 16)
+        candidate_ids = torch.randint(17, (4, 6, 3))
+
+        torch.testing.assert_close(
+            selector.candidate_bias(prev_token_ids, hidden, candidate_ids),
+            selector.block_bias(prev_token_ids, hidden).gather(2, candidate_ids),
+        )
 
     def test_bias_depends_on_the_predecessor(self):
         selector = self._selector()

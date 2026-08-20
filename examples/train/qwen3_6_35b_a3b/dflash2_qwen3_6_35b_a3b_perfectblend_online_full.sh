@@ -18,11 +18,12 @@
 #     run dies at startup on a draft-vocab mismatch. Without them train.py falls
 #     back to the verifier's full vocabulary, which is what DFlash2 needs -- so this
 #     script passes no --draft-vocab-size at all.
-#   * --max-anchors is halved. The forward holds four
-#     [max_anchors * block_size, vocab_size] tensors at peak (targets, the unary
-#     logits, the selector bias, their sum). At Qwen3.6's 248320-entry vocabulary
-#     that is 7.8x wider per tensor than the DFlash run's pruned 32000, so 1024
-#     anchors would put ~30 GiB of logit activations on each training GPU.
+#   * --max-anchors is halved. The forward holds two
+#     [max_anchors * block_size, vocab_size] tensors at peak (the targets and the
+#     unary logits). At Qwen3.6's 248320-entry vocabulary that is 7.8x wider per
+#     tensor than the DFlash run's pruned 32000, so 1024 anchors would put ~15 GiB
+#     of logit activations on each training GPU. The selector's own tensors are
+#     top-K-wide and cost nothing next to those.
 #
 # See docs/user_guide/algorithms/dflash2.md for the algorithm and for what the
 # serving side still needs.
@@ -45,21 +46,30 @@ TENSORBOARD_DIR="${TENSORBOARD_DIR:-$RUN_DIR/tensorboard}"
 # Full-vocabulary view of DATA_DIR (see the header). Symlinks, so it costs nothing.
 FULL_VOCAB_DATA_DIR="${FULL_VOCAB_DATA_DIR:-$RUN_DIR/data_full_vocab}"
 
-# Anchors per step. The four full-vocabulary logit tensors cost
-#   max_anchors * block_size * vocab_size * 2 bytes * 4
-# which is 4 x 3.8 GiB = 15.2 GiB at 512 anchors, block 16 and vocab 248320. The
+# Anchors per step. The two full-vocabulary logit tensors cost
+#   max_anchors * block_size * vocab_size * 2 bytes * 2
+# which is 2 x 3.8 GiB = 7.6 GiB at 512 anchors, block 16 and vocab 248320. The
 # script prints the figure below before it launches anything. Scale this -- not the
-# hyperparameters -- if you change the verifier or the block size.
+# hyperparameters -- if you change the verifier or the block size. Backward adds one
+# more tensor that wide (the logit gradient the top-K accumulates into), so budget
+# three. 512 is kept here so this run stays comparable with the earlier DFlash2 runs;
+# the top-K loss left room to raise it, which is the first thing to try if the
+# drafter is starved for anchors.
 MAX_ANCHORS="${MAX_ANCHORS:-512}"
 
 # DFlash2 modules. conv_group_size must divide the draft hidden size (2048 here);
-# selector_top_k is the candidate count the inference path walks.
-CONV_KERNEL_SIZE="${CONV_KERNEL_SIZE:-3}"
-CONV_GROUP_SIZE="${CONV_GROUP_SIZE:-64}"
+# selector_top_k is the candidate count the inference path walks, and now also the
+# width of the selector's loss term.
+CONV_KERNEL_SIZE="${CONV_KERNEL_SIZE:-2}"
+CONV_GROUP_SIZE="${CONV_GROUP_SIZE:-16}"
 SELECTOR_RANK="${SELECTOR_RANK:-256}"
 SELECTOR_TOP_K="${SELECTOR_TOP_K:-16}"
+# Weight of the selector's top-K cross-entropy, on top of DFlash's full-vocabulary
+# loss on the unary logits. Those two terms train the two decisions inference makes:
+# which tokens make the candidate set, and which candidate the walk takes.
+SELECTOR_LOSS_WEIGHT="${SELECTOR_LOSS_WEIGHT:-1.0}"
 
-BLOCK_SIZE="${BLOCK_SIZE:-16}"
+BLOCK_SIZE="${BLOCK_SIZE:-8}"
 
 VLLM_PORT="${VLLM_PORT:-8101}"
 VLLM_ENDPOINT="${VLLM_ENDPOINT:-http://localhost:${VLLM_PORT}/v1}"
@@ -145,7 +155,7 @@ print(text_config["vocab_size"])
 PY
 )"
 LOGIT_GIB="$("$SPEC_PYTHON" -c "
-print(round(4 * $MAX_ANCHORS * $BLOCK_SIZE * $VOCAB_SIZE * 2 / 1024 ** 3, 1))
+print(round(2 * $MAX_ANCHORS * $BLOCK_SIZE * $VOCAB_SIZE * 2 / 1024 ** 3, 1))
 ")"
 
 # Preserve the GPU allocation supplied by the scheduler. When no allocation
@@ -222,7 +232,7 @@ setsid env \
     "$VLLM_PYTHON" \
     "$LAUNCH_VLLM" \
     "$MODEL" \
-    --target-layer-ids 2 7 12 17 23 28 33 38 \
+    --target-layer-ids 2 11 20 29 38 \
     --hidden-states-path "$HIDDEN_STATES_DIR" \
     --tensor-parallel-size 1 \
     --data-parallel-size 2 \
@@ -262,7 +272,8 @@ setsid env \
     --save-path "$CHECKPOINT_DIR" \
     --epochs 1 \
     --train-data-ratio 0.98 \
-    --optimizer adamw \
+    --optimizer muon \
+    --muon-lr 2e-4 \
     --lr 1e-4 \
     --noise-std 0 \
     --scheduler-type cosine \
@@ -278,8 +289,10 @@ setsid env \
     --conv-group-size "$CONV_GROUP_SIZE" \
     --selector-rank "$SELECTOR_RANK" \
     --selector-top-k "$SELECTOR_TOP_K" \
-    --full-attention-indices 0 1 2 3 4 \
-    --target-layer-ids 2 7 12 17 23 28 33 38 \
+    --selector-loss-weight "$SELECTOR_LOSS_WEIGHT" \
+    --sliding-window 2048 \
+    --sliding-window-non-causal \
+    --target-layer-ids 2 11 20 29 38 \
     --vllm-endpoint "$VLLM_ENDPOINT" \
     --request-timeout 300 \
     --on-missing generate \
@@ -295,5 +308,7 @@ TRAIN_PID=$!
 #
 # Watch selector_accept_len against unary_accept_len in TensorBoard: the latter is
 # the DFlash baseline computed inside the same run, so their difference is what the
-# candidate selector is earning. candidate_recall bounds it.
+# candidate selector is earning. candidate_recall bounds it, and is the metric to
+# read first -- it is what the unary_loss term buys, and no selector can beat it.
+# unary_loss and selector_loss are the two terms of the total.
 wait "$TRAIN_PID"

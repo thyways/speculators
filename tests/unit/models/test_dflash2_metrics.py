@@ -1,15 +1,23 @@
-"""Unit tests for the DFlash2 selector diagnostics.
+"""Unit tests for the DFlash2 selector loss and diagnostics.
 
-The diagnostics replay the inference-time walk, so they are the only place in
-training where the top-K restriction and the selector's own predecessor choice are
-exercised. These tests construct cases where the per-slot top-1 and the corrected
-walk disagree, so a walk that silently ignored the bias -- or propagated the wrong
-predecessor -- would fail.
+The loss is a cross-entropy over the kept top-K, and the diagnostics replay the
+inference-time walk. Between them they are the whole of the top-K restriction and of
+the selector's own predecessor choice, so these tests construct cases where the
+per-slot top-1 and the corrected walk disagree, where the target is outside the
+candidate set, and where the answer is analytic -- a loss taken over the full
+vocabulary, or a walk that ignored the bias or propagated the wrong predecessor,
+fails them.
 """
+
+import math
 
 import torch
 
-from speculators.models.dflash2.metrics import compute_selector_diagnostics
+from speculators.models.dflash2.metrics import (
+    compute_selector_diagnostics,
+    select_candidates,
+    selector_cross_entropy,
+)
 from speculators.models.dflash2.model_definitions import CandidateSelector
 
 VOCAB = 8
@@ -50,6 +58,104 @@ def one_hot_logits(token_ids: torch.Tensor, high: float = 10.0) -> torch.Tensor:
 
 def targets_for(label_ids: torch.Tensor) -> torch.Tensor:
     return one_hot_logits(label_ids, high=5.0)
+
+
+def test_select_candidates_returns_the_unary_top_k_in_rank_order():
+    """The candidate set is the draft head's own ranking, as at inference."""
+    selector = make_selector(top_k=2)
+    unary = torch.zeros(1, NUM_BLOCKS * BLOCK_SIZE, VOCAB)
+    unary[0, :, 1] = 2.0
+    unary[0, :, 2] = 1.0
+    candidates = select_candidates(unary, selector, BLOCK_SIZE)
+    assert candidates.ids.shape == (NUM_BLOCKS, BLOCK_SIZE, 2)
+    assert (candidates.ids[..., 0] == 1).all()
+    assert (candidates.ids[..., 1] == 2).all()
+    torch.testing.assert_close(
+        candidates.values, torch.tensor([2.0, 1.0]).expand_as(candidates.values)
+    )
+
+
+def _two_candidate_case(top_k: int = 2):
+    """Unary logits ranking token 1 (2.0) over token 2 (1.0) in every slot."""
+    unary = torch.zeros(1, NUM_BLOCKS * BLOCK_SIZE, VOCAB)
+    unary[0, :, 1] = 2.0
+    unary[0, :, 2] = 1.0
+    hidden = torch.zeros(1, NUM_BLOCKS * BLOCK_SIZE, HIDDEN)
+    hidden[0, :, 0] = 1.0  # project(h) = [1, 0]
+    selector = make_selector(top_k=top_k)
+    return selector, unary, hidden
+
+
+def test_the_loss_is_a_cross_entropy_over_the_kept_candidates():
+    """The term's logits are the K walk scores, not the whole vocabulary.
+
+    Both candidates carry an explicit unary logit and the rest of the vocabulary
+    sits at 0, so a full-vocabulary cross-entropy would return a different number
+    (1.779 for the runner-up here, against log(1 + e) = 1.313 over the kept two).
+    """
+    selector, unary, hidden = _two_candidate_case()
+    candidates = select_candidates(unary, selector, BLOCK_SIZE)
+    prev = torch.full((NUM_BLOCKS, BLOCK_SIZE), 7)
+
+    runner_up = torch.full((NUM_BLOCKS, BLOCK_SIZE), 2)
+    elementwise, in_candidates = selector_cross_entropy(
+        candidates, runner_up, prev, hidden, selector
+    )
+    assert in_candidates.all()
+    torch.testing.assert_close(
+        elementwise, torch.full_like(elementwise, math.log1p(math.e))
+    )
+
+    top_pick = torch.full((NUM_BLOCKS, BLOCK_SIZE), 1)
+    elementwise, _ = selector_cross_entropy(
+        candidates, top_pick, prev, hidden, selector
+    )
+    torch.testing.assert_close(
+        elementwise, torch.full_like(elementwise, math.log1p(math.exp(-1.0)))
+    )
+
+
+def test_the_bias_enters_the_loss_the_way_it_enters_the_walk():
+    """A bias that outranks the unary gap must drive the term to ~0."""
+    selector, unary, hidden = _two_candidate_case()
+    with torch.no_grad():
+        # bias[v] = <A[prev] * [1, 0], B[v]> = A[prev, 0] * B[v, 0]
+        selector.predecessor_codebook[:, 0] = 1.0
+        selector.successor_codebook[2, 0] = 5.0  # token 2: 1.0 unary -> 6.0 score
+
+    candidates = select_candidates(unary, selector, BLOCK_SIZE)
+    elementwise, _ = selector_cross_entropy(
+        candidates,
+        torch.full((NUM_BLOCKS, BLOCK_SIZE), 2),
+        torch.full((NUM_BLOCKS, BLOCK_SIZE), 7),
+        hidden,
+        selector,
+    )
+    torch.testing.assert_close(
+        elementwise, torch.full_like(elementwise, math.log1p(math.exp(-4.0)))
+    )
+
+
+def test_the_loss_skips_slots_whose_target_is_not_a_candidate():
+    """The selector cannot recover a token outside the set, so it is not trained on
+    one: widening the set is the unary term's job."""
+    selector, unary, hidden = _two_candidate_case()
+    candidates = select_candidates(unary, selector, BLOCK_SIZE)
+    # Slot 1's label is a candidate (token 2); slot 2's is not (token 5).
+    labels = torch.tensor([[7, 2, 5], [7, 2, 5]])
+    elementwise, in_candidates = selector_cross_entropy(
+        candidates,
+        labels,
+        torch.full((NUM_BLOCKS, BLOCK_SIZE), 7),
+        hidden,
+        selector,
+    )
+    covered = in_candidates.view(NUM_BLOCKS, BLOCK_SIZE)
+    per_slot = elementwise.view(NUM_BLOCKS, BLOCK_SIZE)
+    assert covered[:, 1].all()
+    assert not covered[:, 2].any()
+    assert (per_slot[:, 1] > 0).all()
+    assert (per_slot[:, 2] == 0).all()
 
 
 def test_walk_falls_back_to_the_top_1_when_the_bias_is_zero():

@@ -8,10 +8,7 @@ from speculators.losses import LossConfig, kl_div_loss, resolve_loss_config
 from speculators.model import SpeculatorModel
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dflash2.config import DFlash2SpeculatorConfig
-from speculators.models.dflash2.metrics import (
-    compute_metrics,
-    compute_selector_diagnostics,
-)
+from speculators.models.dflash2.metrics import compute_metrics
 from speculators.models.dflash2.model_definitions import (
     CandidateSelector,
     Qwen3DFlash2DecoderLayer,
@@ -40,20 +37,16 @@ class DFlash2DraftModel(DFlashDraftModel):
     * A **candidate selector** adds a low-rank, predecessor-conditioned correction
       to the logits: ``bias[p, c] = <A[p] * project(h), B[c]>``. At inference the
       correction ranks the target head's top-K per slot and the drafter walks the
-      best path from the verified anchor. Training uses the ground-truth previous
-      token as the predecessor and scores the whole vocabulary, so the existing
-      DFlash losses apply unchanged.
+      best path from the verified anchor.
 
-    Training the full vocabulary asks for strictly more than the walk needs, not for
-    something different: making the target token the full-vocabulary argmax of
-    ``unary + bias`` makes it win inside any candidate set that contains it, and the
-    same gradient reaches the hidden states that produce ``unary``, which is what
-    puts it in the set. It is more than the walk needs because the candidate set is
-    ``topK(unary)``, chosen before the bias -- so a correction that would only pay
-    off outside the top-K is wasted, and the DFlash loss and its ``eal`` /
-    ``position_i_acc`` metrics cannot see that. The selector diagnostics
-    (``candidate_recall``, ``selector_accept_len`` vs ``unary_accept_len``) replay
-    the walk under the real top-K restriction and are the numbers to read.
+    The loss mirrors that split, because inference makes two decisions and only one
+    of them is the selector's (see :mod:`speculators.models.dflash2.metrics`):
+    DFlash's full-vocabulary loss on the unary logits decides the candidate set,
+    ``topK(unary)``, and a cross-entropy over the kept candidates -- scored as the
+    walk scores them, ``unary[c] + bias[prev, c]`` -- decides which one wins.
+    Slots whose target the draft head left outside the top-K carry no selector loss;
+    ``candidate_recall`` reports how often that happens and bounds the selector,
+    ``selector_accept_len`` vs ``unary_accept_len`` reports what it is earning.
 
     The block layout already matches inference: ``_backbone_forward`` lays the
     draft out as ``max_anchors`` contiguous blocks of ``block_size`` query slots
@@ -62,8 +55,9 @@ class DFlash2DraftModel(DFlashDraftModel):
 
     Memory: unlike DFlash, DFlash2 cannot prune the draft vocabulary, so every
     full-vocabulary logit tensor in the forward is sized by the verifier's vocab.
-    Scale ``--max-anchors`` down accordingly -- the peak holds four such tensors
-    (targets, the unary logits, the selector bias, and their sum).
+    Scale ``--max-anchors`` down accordingly -- the peak holds two such tensors
+    (the targets and the unary logits), as DFlash's does. The selector adds only
+    ``top_k``-wide tensors.
 
     Starting from DFlash weights: ``--from-pretrained`` does not cross algorithms,
     because each speculator config pins its own ``speculators_model_type``. Build
@@ -164,8 +158,8 @@ class DFlash2DraftModel(DFlashDraftModel):
 
     @staticmethod
     def get_trainer_kwargs(**kwargs) -> tuple[dict, dict]:
-        """Same knobs as DFlash: the selector is sized by the config, not by call
-        kwargs."""
+        """DFlash's knobs plus the selector term's weight; the selector's shape
+        comes from the config, not from call kwargs."""
         loss_config = resolve_loss_config(
             kwargs["loss_fn"], kwargs.get("loss_implementation", "fused")
         )
@@ -177,12 +171,17 @@ class DFlash2DraftModel(DFlashDraftModel):
                 "per_position_loss_weight", "fixed-exp-decay"
             ),
             "dpace_alpha": kwargs.get("dpace_alpha", 0.5),
+            "selector_loss_weight": kwargs.get("selector_loss_weight", 1.0),
         }
         return dict(shared), dict(shared)
 
     def _scale_logits(self, logits: torch.Tensor) -> torch.Tensor:
         """Apply ``output_multiplier`` and the softcap, as ``compute_candidates``
-        does before the selector bias is added. Both default to no-ops."""
+        does to the candidate values it returns. Both default to no-ops.
+
+        ``compute_candidates`` scales after its top-K and this scales before, which
+        selects the same candidates: both transforms are monotonic.
+        """
         if self.output_multiplier != 1.0:
             logits = logits * self.output_multiplier
         if self.final_logit_softcapping is not None:
@@ -204,6 +203,7 @@ class DFlash2DraftModel(DFlashDraftModel):
         max_anchors: int = 512,
         per_position_loss_weight: str = "fixed-exp-decay",
         dpace_alpha: float = 0.5,
+        selector_loss_weight: float = 1.0,
         **kwargs,
     ):
         hidden, logits, targets, aligned_loss_mask, anchored_block_indices = (
@@ -230,32 +230,20 @@ class DFlash2DraftModel(DFlashDraftModel):
         prev_token_ids = torch.cat(
             [block_tokens[:, :1], block_tokens[:, :-1]], dim=1
         )  # [num_blocks, block]
-        hidden_blocks = hidden.view(num_blocks, block, -1)
-
-        unary_logits = self._scale_logits(logits)
-        diagnostics = compute_selector_diagnostics(
-            unary_logits,
-            targets,
-            aligned_loss_mask,
-            hidden,
-            block_tokens[:, 0],
-            self.candidate_selector,
-            block,
-        )
-        selector_bias = self.candidate_selector.block_bias(
-            prev_token_ids, hidden_blocks
-        )
-        logits = unary_logits + selector_bias.view(1, num_blocks * block, -1)
 
         loss, metrics = compute_metrics(
-            logits,
+            self._scale_logits(logits),
             targets,
             aligned_loss_mask,
             block,
-            diagnostics=diagnostics,
+            selector=self.candidate_selector,
+            hidden_states=hidden,
+            prev_token_ids=prev_token_ids,
+            anchor_token_ids=block_tokens[:, 0],
             gamma=gamma,
             loss_config=loss_config or _DEFAULT_LOSS_CONFIG,
             per_position_loss_weight=per_position_loss_weight,
             dpace_alpha=dpace_alpha,
+            selector_loss_weight=selector_loss_weight,
         )
         return None, loss, metrics

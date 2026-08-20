@@ -112,6 +112,39 @@ def dpace_loss_decay(
     return weight.reshape(1, -1)
 
 
+def masked_decayed_mean(
+    elementwise: torch.Tensor,  # shape: [1, seq_len]
+    loss_mask: torch.Tensor,  # shape: [1, seq_len]
+    pos_idx: torch.Tensor,  # shape: [1, seq_len]
+    decay_fn: Callable[..., torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Masked, optionally position-decayed mean of a precomputed per-position term.
+
+    :func:`loss_function` for auxiliary heads: same masking, decay and reduction,
+    but over a term the caller already reduced to one scalar per position (a BCE, a
+    top-K cross-entropy) instead of a ``[1, seq_len, vocab]`` logit tensor.
+
+    Args:
+        elementwise: Per-position loss.
+        loss_mask: Positions to include. Its sum is the denominator, so passing a
+            mask narrower than the block mask means "average over these positions"
+            rather than "average over the block, counting the rest as zero".
+        pos_idx: Position indices within each speculative block.
+        decay_fn: Optional position-dependent decay weighting function.
+
+    Returns:
+        Scalar mean loss across the batch.
+    """
+    loss_mask = loss_mask.to(elementwise.dtype)
+    weighted = elementwise * loss_mask
+    if decay_fn is not None:
+        weighted = weighted * decay_fn(
+            pos_idx.to(weighted.dtype), elementwise_loss=elementwise
+        )
+    denominator = loss_mask.sum(dim=1) + _LOSS_REDUCTION_EPS
+    return (weighted.sum(dim=1) / denominator).mean()
+
+
 def _fused_kernel(name: str):
     """Import a fused loss by name."""
     try:

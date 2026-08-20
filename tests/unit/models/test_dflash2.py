@@ -300,9 +300,41 @@ class TestForward:
                 == metrics[f"unary_position_{pos}_acc_sum"]
             )
 
+    def test_the_total_is_the_two_reported_terms(self):
+        """``loss = unary_loss + selector_loss_weight * selector_loss``.
+
+        Both terms are reported unweighted, so a run can tell which one is moving.
+        """
+        model = make_model()
+        torch.manual_seed(3)  # select_anchors draws the anchor positions
+        _draft_tokens, total, metrics = model(**make_batch(), **CALL_KWARGS)
+        torch.testing.assert_close(
+            total, metrics["unary_loss_sum"] + metrics["selector_loss_sum"]
+        )
+        assert metrics["selector_loss_sum"] > 0
+        torch.testing.assert_close(metrics["loss_sum"], total.detach())
+
+    def test_weight_zero_leaves_dflashs_loss_on_the_unary_logits(self):
+        """The selector term is additive, so 0 recovers DFlash's own objective --
+        which is also what the candidate set is trained by."""
+        model = make_model()
+        torch.manual_seed(3)
+        _draft_tokens, total, metrics = model(**make_batch(), **CALL_KWARGS)
+        torch.manual_seed(3)
+        _draft_tokens, unary_only, unweighted = model(
+            **make_batch(), **CALL_KWARGS, selector_loss_weight=0.0
+        )
+        torch.testing.assert_close(unary_only, metrics["unary_loss_sum"])
+        assert total > unary_only
+        # Still measured and reported, just not optimized.
+        assert unweighted["selector_loss_sum"] > 0
+
     def test_gradients_reach_the_conv_and_the_selector(self):
         model = make_model()
-        _draft_tokens, loss, _metrics = model(**make_batch(), **CALL_KWARGS)
+        _draft_tokens, loss, metrics = model(**make_batch(), **CALL_KWARGS)
+        # The selector term only covers slots whose target is a candidate, so a
+        # fixture with no such slot would starve the codebooks below.
+        assert metrics["candidate_recall_sum"] > 0
         loss.backward()
         for name in (
             "layers.0.attention_conv.base_kernel",

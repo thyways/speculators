@@ -18,6 +18,7 @@ from speculators.losses import (
     compound_loss,
     dflash_loss_decay,
     dpace_loss_decay,
+    masked_decayed_mean,
     tv_loss,
 )
 from speculators.models.metrics import compute_accuracy_multi_step
@@ -25,25 +26,6 @@ from speculators.models.metrics import compute_accuracy_multi_step
 __all__ = [
     "compute_metrics",
 ]
-
-_EPS = 1e-8
-
-
-def _masked_decayed_mean(
-    elementwise: torch.Tensor,  # [1, T]
-    loss_mask: torch.Tensor,  # [1, T]
-    pos_idx: torch.Tensor,  # [1, T]
-    decay_fn: Callable[..., torch.Tensor] | None,
-) -> torch.Tensor:
-    """Masked, optionally position-decayed mean of a precomputed per-position term."""
-    loss_mask = loss_mask.to(elementwise.dtype)
-    weighted = elementwise * loss_mask
-    if decay_fn is not None:
-        weighted = weighted * decay_fn(
-            pos_idx.to(weighted.dtype), elementwise_loss=elementwise
-        )
-    denominator = loss_mask.sum(dim=1) + _EPS
-    return (weighted.sum(dim=1) / denominator).mean()
 
 
 def compute_metrics(
@@ -101,7 +83,7 @@ def compute_metrics(
         bce = binary_cross_entropy_with_logits(
             confidence_logits, c_star, reduction="none"
         )  # [1, T]
-        conf_loss = _masked_decayed_mean(bce, loss_mask, pos_idx, decay_fn)
+        conf_loss = masked_decayed_mean(bce, loss_mask, pos_idx, decay_fn)
         loss = loss + confidence_head_alpha * conf_loss
 
         with torch.no_grad():

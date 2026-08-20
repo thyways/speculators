@@ -28,9 +28,24 @@ bias[p, c] = <A[p] * project(h), B[c]>
 
 `A` is the predecessor codebook indexed by the token in the previous slot, `B` the successor codebook, and `project(h)` a rank-space gate from the backbone hidden state. It is the same shape of correction as [DSpark](dspark.md)'s Markov head, with the hidden state entering multiplicatively rather than through a sigmoid gate.
 
-At inference the selector keeps the target head's top-`selector_top_k` per slot, scores every adjacent transition, and walks the best path from the verified anchor token -- so the token chosen in slot `k-1` decides which distribution slot `k` is read from. Training uses the ground-truth previous token as the predecessor and scores the whole vocabulary, which lets the existing DFlash losses apply unchanged.
+At inference the selector keeps the target head's top-`selector_top_k` per slot, scores every adjacent transition, and walks the best path from the verified anchor token -- so the token chosen in slot `k-1` decides which distribution slot `k` is read from. At `temperature=0` the walk takes the argmax of those scores; above it, it samples from them renormalized over the same K, and rejection sampling gets that renormalized distribution as the proposal.
 
-Training the full vocabulary asks for strictly more than the walk needs, not for something different: making the target token the full-vocabulary argmax of `unary + bias` makes it win inside any candidate set that contains it, and the same gradient reaches the hidden states that produce `unary`, which is what puts it in the set. It is more than the walk needs because the candidate set is `topK(unary)`, chosen before the bias -- a correction that would only pay off outside the top-K is wasted, and neither the loss nor DFlash's `eal` / `position_i_acc` metrics (which argmax over the full vocabulary) can see that. The selector diagnostics below replay the walk under the real top-K restriction, and are the numbers to read.
+### The Loss
+
+Inference makes two decisions and only one of them is the selector's, so the loss has two terms:
+
+```
+loss = dflash_loss(unary, targets) + selector_loss_weight * CE(unary + bias over top-K, target)
+```
+
+The draft head picks the candidate set -- `topK(unary)`, fixed before the selector contributes anything -- and the selector picks one candidate out of that set.
+
+* The first term is DFlash's own full-vocabulary loss on the unary logits. It is what puts the target token in the candidate set at all, which `candidate_recall` measures. Nothing else can: a correction that would only pay off outside the top-K is wasted, because the set is chosen before the bias is added.
+* The second is the cross-entropy of the selector's actual decision -- a categorical over the `top_k` kept candidates whose logits are `unary[c] + bias[prev, c]`, the same expression `_score_edges` and the walk kernel evaluate. Training conditions on the ground-truth predecessor; the walk conditions on its own previous choice, which is what the diagnostics below measure.
+
+Slots whose target the draft head left outside the top-K carry no selector loss. The selector cannot recover a token that is not in the candidate set, so including those slots would only ask the bias to move probability onto a candidate that is wrong whatever it does; widening the set is the first term's job. `candidate_recall` reports how often that happens, and the selector term's denominator counts only the slots that clear the bar, so its scale does not move with recall.
+
+Scoring the whole vocabulary instead -- taking the loss on `unary + bias` over all tokens, with no top-K restriction -- trains a decision inference never makes, and lets the bias compensate for a unary head whose top-K does not contain the target, which is the one thing the bias cannot do at serving time.
 
 The selector is zero-initialized on the successor side, so the correction is exactly 0 at step 0. As with LoRA's `B = 0`, the predecessor codebook and the projection get no gradient until the successor side is nonzero, which costs one optimizer step.
 
@@ -45,6 +60,10 @@ DFlash2 reports DFlash's metrics plus the inference-shaped walk, replayed with t
 | `selector_accept_len` | The same run using the selector's path walk                                           |
 | `unary_eal`           | DFlash's EAL estimator with the selector off                                          |
 | `selector_eal`        | DFlash's EAL estimator with the selector on                                           |
+| `unary_loss`          | The full-vocabulary term, before `selector_loss_weight`; DFlash's loss verbatim       |
+| `selector_loss`       | The top-K decision term, before `selector_loss_weight`                                |
+
+`loss` is the weighted total. `unary_loss` and `candidate_recall` move together and bound everything else, so read them first: a selector term that will not fall while recall is low is the expected shape, not a bug.
 
 `*_accept_len` counts drafted tokens only; add 1 for the bonus token to compare with the acceptance length vLLM reports. Both walks start out identical because the selector is zero-initialized.
 
@@ -57,7 +76,8 @@ The diagnostics run every step and cannot be turned off -- a selector that is no
 | `--conv-kernel-size`        | 3       | Convolution taps per sublayer; tap `t` reaches back `t` slots. Must be `<= --block-size` |
 | `--conv-group-size`         | 64      | Channels sharing one dynamic coefficient. Must divide the draft hidden size              |
 | `--selector-rank`           | 256     | Rank of the predecessor/successor codebooks                                              |
-| `--selector-top-k`          | 16      | Candidates kept per slot at inference; sizes the path walk and the diagnostics           |
+| `--selector-top-k`          | 16      | Candidates kept per slot at inference; sizes the selector loss, the path walk and the diagnostics |
+| `--selector-loss-weight`    | 1.0     | Weight of the selector's top-K cross-entropy term. `0` trains the backbone only          |
 | `--input-embedding-scale`   | 1.0     | Multiplier on the draft's input embeddings                                               |
 | `--output-multiplier`       | 1.0     | Multiplier on the draft logits, before the selector bias                                 |
 | `--final-logit-softcapping` | unset   | Softcap the multiplied logits as `tanh(x / cap) * cap`, before the selector bias         |
@@ -72,7 +92,9 @@ All DFlash parameters (`--block-size`, `--max-anchors`, `--num-layers`, ...) app
 
 ### What the full vocabulary costs
 
-The full-vocabulary requirement is also the memory constraint. The forward holds four `[max_anchors * block_size, draft_vocab_size]` tensors at peak -- the targets, the unary logits, the selector bias, and their sum -- so with a pruned 32k draft vocabulary DFlash gets away with `--max-anchors 3072`, and DFlash2 at Qwen3's 151936 needs roughly a fifth of that for the same footprint. Scale `--max-anchors` by `dflash_draft_vocab / verifier_vocab`, or read the number off the arithmetic: `max_anchors * block_size * vocab_size * 2 bytes * 4`.
+The full-vocabulary requirement is also the memory constraint. The forward holds two `[max_anchors * block_size, draft_vocab_size]` tensors at peak -- the targets and the unary logits, the same pair DFlash holds -- so with a pruned 32k draft vocabulary DFlash gets away with `--max-anchors 3072`, and DFlash2 at Qwen3's 151936 needs roughly a fifth of that for the same footprint. Scale `--max-anchors` by `dflash_draft_vocab / verifier_vocab`, or read the number off the arithmetic: `max_anchors * block_size * vocab_size * 2 bytes * 2`.
+
+The selector adds only `[max_anchors * block_size, selector_top_k]` tensors on top, which at `top_k=16` is four orders of magnitude smaller. Its full-vocabulary form (`CandidateSelector.block_bias`) would double the peak; nothing in training calls it, and the parity tests are what keep it honest. Backward adds one more full-vocabulary tensor -- the logit gradient, which the top-K's gradient accumulates into -- so budget three.
 
 ### Starting from DFlash weights
 

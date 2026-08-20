@@ -83,8 +83,9 @@ def score_edges(
 
     Step 0's predecessors are the verified anchor token; every later step's are the
     previous step's candidates. Mirrors the reference implementation exactly and is
-    only used for the inference-shaped diagnostics; the training loss goes through
-    :meth:`CandidateSelector.block_bias`, which scores the whole vocabulary.
+    only used for the inference-shaped diagnostics, which walk every predecessor
+    branch. The loss needs one predecessor per slot -- the ground-truth one -- and
+    gets it from :meth:`CandidateSelector.candidate_bias`.
     """
     successors = successor_table[candidate_ids]
     predecessor_ids = torch.cat(
@@ -193,11 +194,12 @@ class CandidateSelector(nn.Module):
     ``bias[p, c] = <A[p] * project(h), B[c]>`` where ``A`` is the predecessor
     codebook, ``B`` the successor codebook and ``p`` the token occupying the
     previous draft slot. Inference keeps only the target head's top-K per slot and
-    walks the best path through those transitions; training scores the whole
-    vocabulary (:meth:`block_bias`), which is the same function evaluated on every
-    token instead of on the K the walk happens to see, and so gives every token
-    gradient. :meth:`edge_scores` is the walk's own K-by-K view, used by the
-    diagnostics that measure the restricted decision.
+    walks the best path through those transitions, so the bias is only ever
+    evaluated on candidates: :meth:`candidate_bias` is that restriction and is what
+    the loss uses. :meth:`edge_scores` is the walk's own K-by-K view, used by the
+    diagnostics. :meth:`block_bias` evaluates the same function on the whole
+    vocabulary; nothing in training needs it, and the parity tests use it to pin
+    that all three agree.
 
     ``predecessor_codebook`` is indexed by verifier-vocabulary ids (the previous
     token) and ``successor_codebook`` by draft-vocabulary ids (it adds onto the
@@ -262,11 +264,36 @@ class CandidateSelector(nn.Module):
         prev_token_ids: torch.Tensor,  # [num_blocks, block_size]
         hidden_states: torch.Tensor,  # [num_blocks, block_size, hidden_size]
     ) -> torch.Tensor:  # [num_blocks, block_size, draft_vocab_size]
-        """Full-vocabulary additive bias for the training loss."""
+        """The same bias over the whole vocabulary, for tests and offline analysis.
+
+        Costs a ``[num_blocks * block_size, vocab_size]`` tensor, which at a full
+        verifier vocabulary is the largest tensor in the forward -- and the walk
+        reads only ``top_k`` of its columns. :meth:`candidate_bias` computes those.
+        """
         gate = self.predecessor_codebook[prev_token_ids.long()] * self.project(
             hidden_states
         )
         return gate @ self.successor_codebook.transpose(0, 1).to(gate.dtype)
+
+    def candidate_bias(
+        self,
+        prev_token_ids: torch.Tensor,  # [num_blocks, block_size]
+        hidden_states: torch.Tensor,  # [num_blocks, block_size, hidden_size]
+        candidate_ids: torch.Tensor,  # [num_blocks, block_size, top_k]
+    ) -> torch.Tensor:  # [num_blocks, block_size, top_k]
+        """The bias on the kept candidates: :func:`score_edges` at one predecessor.
+
+        The inference walk scores ``unary[c] + bias[p, c]`` for ``c`` in the slot's
+        top-K and ``p`` the token it carried out of the previous slot. This is that
+        expression's bias term for a single ``p`` per slot -- the same einsum as
+        :func:`score_edges` with the predecessor axis collapsed, so the loss sees
+        exactly the quantity the walk decides on.
+        """
+        gate = self.predecessor_codebook[prev_token_ids.long()] * self.project(
+            hidden_states
+        )
+        successors = self.successor_codebook[candidate_ids.long()].to(gate.dtype)
+        return torch.einsum("blr,blcr->blc", gate, successors)
 
     def edge_scores(
         self,

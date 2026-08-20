@@ -39,10 +39,14 @@
 # model reports alongside DFlash's:
 #
 #   candidate_recall        fraction of slots whose target token is in the top-K;
-#                           the ceiling on what the selector can reach
+#                           the ceiling on what the selector can reach, and what
+#                           the unary_loss term buys
 #   unary_accept_len        mean accepted run using the per-slot top-1, i.e. the
 #                           DFlash baseline inside the same run
 #   selector_accept_len     the same run using the selector's path walk
+#   unary_loss/selector_loss  the two terms of the total loss: DFlash's
+#                           full-vocabulary loss on the unary logits, and the
+#                           cross-entropy of the selector's top-K decision
 #
 # selector_accept_len - unary_accept_len is the selector's contribution. Both
 # exclude the bonus token; add 1 to compare with the acceptance length vLLM
@@ -70,11 +74,11 @@ LOSS_FN="ce"
 # Qwen3-8B's vocab_size; change it with the model.
 DRAFT_VOCAB_SIZE=151936
 # The DFlash script this mirrors uses 3072 anchors, but it pairs them with a pruned
-# 32k draft vocabulary. The forward holds four
-# [MAX_ANCHORS * BLOCK_SIZE, DRAFT_VOCAB_SIZE] tensors at peak -- the targets, the
-# unary logits, the selector bias and their sum -- so at 151936 the same footprint
-# (~3 GiB per tensor in bf16) means about a fifth as many anchors. Scale this with
-# the verifier's vocab_size, not by copying it from a DFlash recipe.
+# 32k draft vocabulary. The forward holds two
+# [MAX_ANCHORS * BLOCK_SIZE, DRAFT_VOCAB_SIZE] tensors at peak -- the targets and
+# the unary logits -- so at 151936 the same footprint (~3 GiB per tensor in bf16)
+# means about a fifth as many anchors. Scale this with the verifier's vocab_size,
+# not by copying it from a DFlash recipe.
 MAX_ANCHORS=640
 TARGET_LAYER_IDS="2 18 33"  # Must match vLLM's eagle_aux_hidden_state_layer_ids
 

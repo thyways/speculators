@@ -78,17 +78,25 @@ def _fill(model, seed: int = 0):
     return model
 
 
+# A random draft head and a random verifier head put the target inside a top-K about
+# K/vocab of the time, and the selector term is defined to skip the slots where they
+# do not (widening the set is the unary term's job). At VOCAB_SIZE that leaves the
+# term empty for a serving-shaped K=8, so the tests that need it live use a K wide
+# enough to catch some targets. Nothing else about the path changes with K.
+LIVE_SELECTOR_TOP_K = 512
+
+
 def make_dflash2(attn_impl: str = "simple_flex_attention", **overrides):
-    config = DFlash2SpeculatorConfig(
+    kwargs = {
         **_base_kwargs(attn_impl),
-        conv_kernel_size=3,
-        conv_group_size=64,
-        selector_rank=32,
-        selector_top_k=8,
-        speculators_config=_speculators_config("dflash2"),
-        **overrides,
-    )
-    return _fill(DFlash2DraftModel(config=config)).to(DEVICE)
+        "conv_kernel_size": 3,
+        "conv_group_size": 64,
+        "selector_rank": 32,
+        "selector_top_k": 8,
+        "speculators_config": _speculators_config("dflash2"),
+    }
+    kwargs.update(overrides)
+    return _fill(DFlash2DraftModel(config=DFlash2SpeculatorConfig(**kwargs))).to(DEVICE)
 
 
 def make_dflash(attn_impl: str = "simple_flex_attention"):
@@ -133,11 +141,12 @@ def call_kwargs(loss_fn: str = "ce", per_position: str = "dpace") -> dict:
 @pytest.mark.parametrize("loss_fn", ["ce", "kl_div"])
 def test_forward_backward_on_the_default_training_path(loss_fn):
     """Flex attention + bf16 autocast + fused loss + compiled forward."""
-    model = make_dflash2()
+    model = make_dflash2(selector_top_k=LIVE_SELECTOR_TOP_K)
     torch.manual_seed(0)
     with torch.autocast("cuda", dtype=torch.bfloat16):
         _draft_tokens, loss, metrics = model(**make_batch(), **call_kwargs(loss_fn))
     assert loss.isfinite()
+    assert metrics["candidate_recall_sum"] > 0  # or the selector term is empty
     loss.backward()
 
     named = dict(model.named_parameters())
@@ -163,7 +172,11 @@ def test_a_fresh_dflash2_matches_dflash_exactly():
     """The identity conv and the zero selector make DFlash2 a superset at step 0.
 
     This is what lets a DFlash checkpoint warm-start a DFlash2 run: with the shared
-    backbone weights copied across, the two models must compute the same thing.
+    backbone weights copied across, the two models must compute the same thing. What
+    is pinned is DFlash2's ``unary_loss`` term and every DFlash metric, not the total
+    loss -- DFlash2 adds the selector's top-K cross-entropy on top, which is nonzero
+    at step 0 even though the zero-initialized bias leaves every decision unchanged
+    (the term is the cross-entropy of the unary scores themselves).
 
     Asserted under ``force_eager``. ``conditional_torch_compile`` wraps each model's
     ``forward`` separately, and Inductor is free to fuse two different graphs
@@ -196,22 +209,36 @@ def test_a_fresh_dflash2_matches_dflash_exactly():
 
     with torch.compiler.set_stance("force_eager"):
         base_loss, base_metrics, port_loss, port_metrics = both()
-    torch.testing.assert_close(port_loss, base_loss, rtol=0, atol=0)
+    torch.testing.assert_close(
+        port_metrics["unary_loss_sum"], base_loss, rtol=0, atol=0
+    )
     for key, value in base_metrics.items():
+        if key == "loss_sum":
+            continue  # DFlash2's total carries the selector term as well
         torch.testing.assert_close(port_metrics[key], value, rtol=0, atol=0)
+    # The two reported terms are the whole of the total (selector_loss_weight = 1).
+    torch.testing.assert_close(
+        port_loss,
+        port_metrics["unary_loss_sum"] + port_metrics["selector_loss_sum"],
+        rtol=0,
+        atol=0,
+    )
 
     base_loss, base_metrics, port_loss, port_metrics = both()
-    torch.testing.assert_close(port_loss, base_loss, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(
+        port_metrics["unary_loss_sum"], base_loss, rtol=1e-4, atol=1e-4
+    )
 
 
 @requires_cuda
 def test_the_conv_and_the_selector_change_the_output_once_trained():
     """Guard against the modules being silently inert (e.g. a dropped call)."""
-    model = make_dflash2()
+    model = make_dflash2(selector_top_k=LIVE_SELECTOR_TOP_K)
     batch = make_batch()
     with torch.autocast("cuda", dtype=torch.bfloat16):
         torch.manual_seed(7)
-        _t, before, _m = model(**batch, **call_kwargs())
+        _t, before, metrics = model(**batch, **call_kwargs())
+    assert metrics["candidate_recall_sum"] > 0  # or the selector cannot change it
 
     with torch.no_grad():
         for layer in model.layers:

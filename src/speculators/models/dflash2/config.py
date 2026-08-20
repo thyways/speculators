@@ -64,9 +64,9 @@ class DFlash2SpeculatorConfig(DFlashSpeculatorConfig):
         default=16,
         ge=2,
         description=(
-            "Candidates kept per slot from the target head at inference. Training "
-            "scores the whole vocabulary; this only sizes the path walk and the "
-            "top-K diagnostics."
+            "Candidates kept per slot from the target head at inference. The "
+            "selector loss and the path-walk diagnostics score the same K, so "
+            "changing it changes what training optimizes."
         ),
     )
 
