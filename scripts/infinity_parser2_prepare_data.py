@@ -141,6 +141,8 @@ def prepare_ranked_dataset(args: argparse.Namespace) -> Dataset:
         max_length=args.seq_length,
         num_proc=args.num_preprocessing_workers,
         render_endpoint=args.render_endpoint,
+        local_render=args.local_render,
+        drop_clipped_rows=args.drop_clipped_rows,
         minimum_valid_tokens=args.minimum_valid_tokens,
         preserve_columns=_PRESERVED_COLUMNS,
         keep_in_memory=False,
@@ -399,7 +401,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seq-length", type=int, default=20480)
     parser.add_argument("--ranked-target-samples", type=int, required=True)
     parser.add_argument("--token-freq-train-ratio", type=float, default=0.99)
-    parser.add_argument("--render-endpoint", required=True)
+    render = parser.add_mutually_exclusive_group(required=True)
+    render.add_argument("--render-endpoint")
+    parser.add_argument(
+        "--drop-clipped-rows",
+        action="store_true",
+        help="drop rows longer than --seq-length instead of truncating them. "
+        "Required for online training, where the stored conversation is "
+        "re-rendered and a truncated row's ids can never match; offline "
+        "and text runs should leave it off and keep truncating.",
+    )
+    render.add_argument(
+        "--local-render",
+        action="store_true",
+        help="tokenize with the processor in-process instead of calling the "
+        "vLLM /render endpoint; same ids, far cheaper for image corpora",
+    )
     parser.add_argument("--minimum-valid-tokens", type=int)
     parser.add_argument("--num-preprocessing-workers", type=int, default=8)
     parser.add_argument("--preprocessing-batch-size", type=int, default=1000)

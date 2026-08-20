@@ -6,7 +6,7 @@ set -Eeuo pipefail
 ROOT="/inspire/sfs/project/inf-multimodal/public/wumengke"
 REPO="$ROOT/speculators"
 MODEL="/home/ma-user/work/data_mllm/publish_models/Infinity-Parser2-2B-2604"
-DATA_DIR="$ROOT/datasets/infinity_parser2_v1_12_dflash_data/pilot"
+DATA_DIR="$ROOT/datasets/infinity_parser2_v1_12_dflash_data/full"
 RUN_DIR="$REPO/output/dflash_infinity_parser2_flash_online_800k"
 CHECKPOINT_DIR="$RUN_DIR/checkpoints"
 TENSORBOARD_DIR="$RUN_DIR/tensorboard"

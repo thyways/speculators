@@ -6,15 +6,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import fcntl
+import functools
 import hashlib
 import json
 import os
 import re
 import sqlite3
+import stat
 import sys
 import time
 from array import array
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -39,19 +42,29 @@ HTTP_OK = 200
 HTTP_REDIRECT = 300
 HTTP_SERVER_ERROR = 500
 INVALID_EXAMPLE_LIMIT = 20
+PROGRESS_BAR_WIDTH = 40
+PROGRESS_LOG_INTERVAL = 30.0
+BUILD_CACHE_KIB = 8 << 20
 REQUEST_INSERT_BATCH_SIZE = 1000
 SELECTION_INSERT_BATCH_SIZE = 10000
+# Paged by rank so each page is its own read transaction. Holding one cursor
+# open for the whole run keeps a WAL read snapshot alive, which blocks
+# checkpointing; the WAL then grows without bound (observed: 433 MiB) until
+# extending the mmapped -shm index fails on the shared filesystem and the
+# process takes SIGBUS.
 _PENDING_QUERY = (
-    "SELECT r.record FROM requests r "
+    "SELECT r.rank, r.record FROM requests r "
     "LEFT JOIN generations g ON g.id = r.id "
-    "WHERE r.rank < ? AND g.id IS NULL ORDER BY r.rank"
+    "WHERE r.rank > ? AND r.rank < ? AND g.id IS NULL "
+    "ORDER BY r.rank LIMIT ?"
 )
 _RETRYABLE_PENDING_QUERY = (
-    "SELECT r.record FROM requests r "
+    "SELECT r.rank, r.record FROM requests r "
     "LEFT JOIN generations g ON g.id = r.id "
-    "WHERE r.rank < ? AND (g.id IS NULL OR g.status = 'error') "
-    "ORDER BY r.rank"
+    "WHERE r.rank > ? AND r.rank < ? AND (g.id IS NULL OR g.status = 'error') "
+    "ORDER BY r.rank LIMIT ?"
 )
+PENDING_PAGE_SIZE = 2048
 _PENDING_COUNT_QUERY = (
     "SELECT COUNT(*) AS count FROM requests r "
     "LEFT JOIN generations g ON g.id = r.id "
@@ -124,6 +137,54 @@ class SplitMix64:
                 return value % upper
 
 
+def format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:d}:{minutes:02d}:{secs:02d}"
+
+
+class ProgressBar:
+    """Single-line stderr progress bar with rate and ETA."""
+
+    def __init__(self, total: int, prefix: str, interval: float = 1.0) -> None:
+        self.total = total
+        self.prefix = prefix
+        self.is_tty = sys.stderr.isatty()
+        # Redirected to a file: one line every PROGRESS_LOG_INTERVAL instead of
+        # thousands of carriage returns.
+        self.interval = (
+            interval if self.is_tty else max(interval, PROGRESS_LOG_INTERVAL)
+        )
+        self.started = time.monotonic()
+        self.last_drawn = 0.0
+
+    def update(self, done: int, suffix: str = "", *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self.last_drawn < self.interval:
+            return
+        self.last_drawn = now
+        elapsed = now - self.started
+        rate = done / elapsed if elapsed > 0 else 0.0
+        eta = (self.total - done) / rate if rate > 0 else 0.0
+        fraction = done / self.total if self.total > 0 else 1.0
+        filled = int(PROGRESS_BAR_WIDTH * fraction)
+        bar = "=" * filled + " " * (PROGRESS_BAR_WIDTH - filled)
+        body = (
+            f"{self.prefix} [{bar}] {done}/{self.total} {fraction * 100:5.1f}% "
+            f"{rate:7.1f}/s elapsed {format_duration(elapsed)} "
+            f"eta {format_duration(eta)}{suffix}"
+        )
+        if self.is_tty:
+            print(f"\r{body}\x1b[K", end="", file=sys.stderr, flush=True)
+        else:
+            print(body, file=sys.stderr, flush=True)
+
+    def close(self) -> None:
+        if self.is_tty:
+            print("", file=sys.stderr, flush=True)
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -194,14 +255,44 @@ def file_lock(path: Path):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def connect_db(path: Path, *, write: bool = False) -> sqlite3.Connection:
+def connect_db(
+    path: Path, *, write: bool = False, build: bool = False
+) -> sqlite3.Connection:
     connection = sqlite3.connect(path, timeout=60)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA busy_timeout = 60000")
     connection.execute("PRAGMA foreign_keys = ON")
-    if write:
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = NORMAL")
+    if build:
+        # 64 KiB pages instead of the 4 KiB default. Only settable before the
+        # first table exists, so it has to happen here. Every later full scan
+        # (status, the generate producer, export) is bound by the shared
+        # filesystem's small-read IOPS rather than its bandwidth, and larger
+        # pages cut the syscall count for those scans by 16x.
+        connection.execute("PRAGMA page_size = 65536")
+        # Sample build only. The target is a .partial file that is deleted on
+        # any failure and atomically renamed on success, so a rollback journal
+        # and fsyncs buy nothing. The page cache matters much more: rank is a
+        # random permutation of source order, so rows arrive in random rowid
+        # order across three B-trees. With the stock 2 MiB cache every insert
+        # dirties a different page and writeback thrashes the shared
+        # filesystem; holding the whole database in memory instead lets it be
+        # written out once at commit.
+        connection.execute("PRAGMA journal_mode = OFF")
+        connection.execute("PRAGMA synchronous = OFF")
+        connection.execute(f"PRAGMA cache_size = {-BUILD_CACHE_KIB}")
+        connection.execute("PRAGMA temp_store = MEMORY")
+    elif write:
+        # Not WAL. WAL keeps its index in an mmapped -shm file, and this state
+        # lives on a shared network filesystem where that mapping is neither
+        # coherent nor safely growable: one run took SIGBUS when the index had
+        # to grow past a 433 MiB WAL, and the next corrupted the database
+        # outright (out-of-order rowids, pages referenced twice, scrambled
+        # rows). A rollback journal touches no shared memory. It needs the
+        # writer to take an exclusive lock, which is only viable because the
+        # pending-record reader pages its queries instead of holding one cursor
+        # open for the whole run.
+        connection.execute("PRAGMA journal_mode = TRUNCATE")
+        connection.execute("PRAGMA synchronous = FULL")
     return connection
 
 
@@ -393,6 +484,30 @@ def parse_prefix_maps(values: Sequence[str] | None) -> list[PrefixMap]:
     return sorted(mappings, key=lambda mapping: -len(mapping.source))
 
 
+@functools.cache
+def resolved_directory(directory: str) -> str:
+    return os.path.realpath(directory)
+
+
+def resolve_media_file(value: str) -> str:
+    """realpath() of a media file, reusing a memoised parent directory.
+
+    A plain realpath() re-walks and re-stats every path component. These
+    datasets hold ~10^6 files under ~10^3 directories, so caching the parent
+    turns each file into a single lstat, which is what lets threads scale here.
+    Symlinked files fall back to the full walk.
+    """
+    directory, separator, name = value.rpartition(os.sep)
+    if not separator:
+        return os.path.realpath(value)
+    info = os.lstat(value)
+    if stat.S_ISLNK(info.st_mode):
+        return os.path.realpath(value)
+    if not stat.S_ISREG(info.st_mode):
+        raise PipelineError(f"media path is not a regular file: {value}")
+    return f"{resolved_directory(directory)}{os.sep}{name}"
+
+
 def map_media_path(
     value: str,
     allowed_root: Path,
@@ -401,22 +516,28 @@ def map_media_path(
     if not Path(value).is_absolute():
         raise PipelineError(f"media path is not absolute: {value!r}")
 
-    candidate = value
-    if not Path(value).resolve(strict=False).is_relative_to(allowed_root):
-        for mapping in mappings:
-            if value.startswith(mapping.source):
-                candidate = mapping.destination + value[len(mapping.source) :]
-                break
-        else:
-            raise PipelineError(f"media path has no matching path-map: {value}")
+    candidates = [value]
+    for mapping in mappings:
+        if value.startswith(mapping.source):
+            candidates.append(mapping.destination + value[len(mapping.source) :])
+            break
 
-    try:
-        resolved = Path(candidate).resolve(strict=True)
-    except OSError as exc:
-        raise PipelineError(f"media file does not exist: {candidate}") from exc
-    if not resolved.is_file() or not resolved.is_relative_to(allowed_root):
-        raise PipelineError(f"media file is outside {allowed_root}: {resolved}")
-    return resolved
+    failure = f"media path has no matching path-map: {value}"
+    for candidate in candidates:
+        try:
+            resolved = resolve_media_file(candidate)
+        except OSError:
+            failure = f"media file does not exist: {candidate}"
+            continue
+        if not Path(resolved).is_relative_to(allowed_root):
+            failure = f"media file is outside {allowed_root}: {resolved}"
+            continue
+        # Keep the path as the source spells it so the export stays diffable
+        # against the source dataset. Only the containment check needs the
+        # resolved form, and vLLM resolves again before its own
+        # --allowed-local-media-path check.
+        return Path(candidate)
+    raise PipelineError(failure)
 
 
 def build_user_content(
@@ -569,6 +690,39 @@ def validate_sample_args(args: argparse.Namespace) -> None:
         raise PipelineError("sample size plus reserve exceeds the population")
     if args.pilot_size is not None and not 0 < args.pilot_size < args.sample_size:
         raise PipelineError("--pilot-size must be smaller than --sample-size")
+    if args.convert_workers <= 0:
+        raise PipelineError("--convert-workers must be positive")
+    if args.convert_chunk <= 0:
+        raise PipelineError("--convert-chunk must be positive")
+
+
+def convert_one(
+    task: tuple[int, bytes],
+    *,
+    candidate_ranks: array,
+    source_version: str,
+    allowed_root: Path,
+    mappings: Sequence[PrefixMap],
+) -> tuple[int, int, dict[str, Any] | None, str | None]:
+    """Convert one selected source line; safe to run on a worker thread.
+
+    Most of the wall clock here is media stat/readlink syscalls against the
+    shared filesystem, which release the GIL, so threads scale nearly linearly.
+    """
+    source_index, raw_line = task
+    candidate_rank = int(candidate_ranks[source_index])
+    try:
+        record = convert_source_record(
+            json.loads(raw_line),
+            source_index=source_index,
+            candidate_rank=candidate_rank,
+            source_version=source_version,
+            allowed_root=allowed_root,
+            mappings=mappings,
+        )
+    except (json.JSONDecodeError, OSError, PipelineError) as exc:
+        return source_index, candidate_rank, None, str(exc)
+    return source_index, candidate_rank, record, None
 
 
 def command_sample(args: argparse.Namespace) -> int:  # noqa: C901
@@ -593,7 +747,7 @@ def command_sample(args: argparse.Namespace) -> int:  # noqa: C901
                 )
 
         remove_sqlite_files(partial_path)
-        connection = connect_db(partial_path)
+        connection = connect_db(partial_path, build=True)
         initialize_db(connection)
         set_meta(connection, "sample_config", config)
         connection.commit()
@@ -614,9 +768,66 @@ def command_sample(args: argparse.Namespace) -> int:  # noqa: C901
         source_lines = 0
         invalid_examples: list[dict[str, Any]] = []
         insert_batch: list[tuple[int, str, int, str]] = []
+        progress = ProgressBar(candidate_size, "sample  ")
+
+        convert = functools.partial(
+            convert_one,
+            candidate_ranks=candidate_ranks,
+            source_version=args.source_version,
+            allowed_root=allowed_root,
+            mappings=mappings,
+        )
+        pending: list[tuple[int, bytes]] = []
+
+        def flush_pending(executor: ThreadPoolExecutor) -> None:
+            """Convert one chunk in parallel, then book-keep in source order."""
+            nonlocal valid_count
+            if not pending:
+                return
+            # executor.map preserves input order, so request_digest stays
+            # byte-identical to the sequential implementation.
+            for source_index, candidate_rank, record, error in executor.map(
+                convert, pending
+            ):
+                if record is None:
+                    if len(invalid_examples) < INVALID_EXAMPLE_LIMIT:
+                        invalid_examples.append(
+                            {
+                                "source_line_index": source_index,
+                                "candidate_rank": candidate_rank,
+                                "error": error,
+                            }
+                        )
+                    continue
+                record_data = json_bytes(record)
+                request_digest.update(record_data + b"\n")
+                insert_batch.append(
+                    (
+                        candidate_rank,
+                        record["id"],
+                        source_index,
+                        record_data.decode("utf-8"),
+                    )
+                )
+                set_bit(valid_ranks, candidate_rank)
+                valid_count += 1
+            pending.clear()
+            if len(insert_batch) >= REQUEST_INSERT_BATCH_SIZE:
+                # No commit here: the build is one transaction, made atomic by
+                # the .partial rename rather than by sqlite.
+                connection.executemany(
+                    "INSERT INTO requests(rank, id, source_index, record) "
+                    "VALUES (?, ?, ?, ?)",
+                    insert_batch,
+                )
+                insert_batch.clear()
+            progress.update(selected_seen, f" valid {valid_count}")
 
         try:
-            with Path(config["source"]).open("rb") as source_file:
+            with (
+                ThreadPoolExecutor(max_workers=args.convert_workers) as executor,
+                Path(config["source"]).open("rb") as source_file,
+            ):
                 for source_index, raw_line in enumerate(source_file):
                     source_lines += 1
                     source_digest.update(raw_line)
@@ -626,60 +837,13 @@ def command_sample(args: argparse.Namespace) -> int:  # noqa: C901
                         continue
 
                     selected_seen += 1
-                    candidate_rank = int(candidate_ranks[source_index])
-                    try:
-                        record = convert_source_record(
-                            json.loads(raw_line),
-                            source_index=source_index,
-                            candidate_rank=candidate_rank,
-                            source_version=args.source_version,
-                            allowed_root=allowed_root,
-                            mappings=mappings,
-                        )
-                    except (
-                        json.JSONDecodeError,
-                        OSError,
-                        PipelineError,
-                    ) as exc:
-                        if len(invalid_examples) < INVALID_EXAMPLE_LIMIT:
-                            invalid_examples.append(
-                                {
-                                    "source_line_index": source_index,
-                                    "candidate_rank": candidate_rank,
-                                    "error": str(exc),
-                                }
-                            )
-                        continue
+                    pending.append((source_index, raw_line))
+                    if len(pending) >= args.convert_chunk:
+                        flush_pending(executor)
+                flush_pending(executor)
 
-                    record_data = json_bytes(record)
-                    request_digest.update(record_data + b"\n")
-                    insert_batch.append(
-                        (
-                            candidate_rank,
-                            record["id"],
-                            source_index,
-                            record_data.decode("utf-8"),
-                        )
-                    )
-                    set_bit(valid_ranks, candidate_rank)
-                    valid_count += 1
-                    if len(insert_batch) >= REQUEST_INSERT_BATCH_SIZE:
-                        connection.executemany(
-                            "INSERT INTO requests(rank, id, source_index, record) "
-                            "VALUES (?, ?, ?, ?)",
-                            insert_batch,
-                        )
-                        connection.commit()
-                        insert_batch.clear()
-
-                    if selected_seen % 10000 == 0:
-                        print(
-                            f"sample: {selected_seen}/{candidate_size} selected, "
-                            f"{valid_count} valid",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-
+            progress.update(selected_seen, f" valid {valid_count}", force=True)
+            progress.close()
             if insert_batch:
                 connection.executemany(
                     "INSERT INTO requests(rank, id, source_index, record) "
@@ -784,7 +948,7 @@ def generation_config(
         "sample_sha256": get_meta(connection, "sample_sha256"),
         "model": args.model,
         "model_fingerprint": fingerprint_model(model_path),
-        "max_tokens": args.max_tokens,
+        "max_tokens": args.max_tokens if args.max_tokens > 0 else None,
         "temperature": args.temperature,
         "top_p": args.top_p,
         "seed": args.seed,
@@ -796,14 +960,22 @@ def ensure_generation_config(
     connection: sqlite3.Connection, args: argparse.Namespace
 ) -> tuple[dict[str, Any], str]:
     config = generation_config(connection, args)
-    existing = get_meta(connection, "generation_config", None)
-    if existing is not None and existing != config:
-        raise PipelineError("generation configuration differs from the existing state")
     digest = sha256_json(config)
+    existing = get_meta(connection, "generation_config", None)
     existing_digest = get_meta(connection, "generation_sha256", None)
-    if existing_digest is not None and existing_digest != digest:
+    changed = existing is not None and existing != config
+    if changed and not args.allow_config_change:
+        raise PipelineError("generation configuration differs from the existing state")
+    if changed:
+        # Rows already in `generations` were produced under the superseded
+        # config. Keep the history so the provenance of a mixed run is
+        # auditable instead of silently overwritten.
+        history = get_meta(connection, "superseded_generation_configs", [])
+        history.append({"config": existing, "sha256": existing_digest})
+        set_meta(connection, "superseded_generation_configs", history)
+    elif existing_digest is not None and existing_digest != digest:
         raise PipelineError("generation configuration hash is inconsistent")
-    if existing is None:
+    if existing is None or changed:
         set_meta(connection, "generation_config", config)
         set_meta(connection, "generation_sha256", digest)
         connection.commit()
@@ -1014,12 +1186,15 @@ async def generate_event(
             payload = {
                 "model": args.model,
                 "messages": list(messages),
-                "max_tokens": args.max_tokens,
                 "temperature": args.temperature,
                 "top_p": args.top_p,
                 "seed": request_seed,
                 "chat_template_kwargs": {"enable_thinking": False},
             }
+            # Omitting max_tokens makes vLLM fall back to
+            # max_model_len - prompt_tokens, i.e. the model's own ceiling.
+            if args.max_tokens > 0:
+                payload["max_tokens"] = args.max_tokens
             turn_started = time.perf_counter()
             data, attempts = await post_chat(
                 session,
@@ -1157,13 +1332,21 @@ async def generate_async(  # noqa: C901
         async def producer() -> None:
             connection = connect_db(db_path)
             query = _RETRYABLE_PENDING_QUERY if args.retry_errors else _PENDING_QUERY
-            cursor = connection.execute(query, (rank_limit,))
             produced = 0
+            last_rank = -1
             try:
-                while rows := cursor.fetchmany(256):
+                while True:
+                    # fetchall() completes the statement, which ends the implicit
+                    # read transaction and lets the WAL checkpoint between pages.
+                    rows = connection.execute(
+                        query, (last_rank, rank_limit, PENDING_PAGE_SIZE)
+                    ).fetchall()
+                    if not rows:
+                        break
                     for row in rows:
                         await request_queue.put(json.loads(row["record"]))
                         produced += 1
+                        last_rank = int(row["rank"])
             finally:
                 connection.close()
             if produced != pending:
@@ -1192,9 +1375,16 @@ async def generate_async(  # noqa: C901
         async def writer() -> None:
             connection = connect_db(db_path, write=True)
             batch: list[tuple[str, str, str]] = []
+            progress = ProgressBar(pending, "generate")
+            succeeded = 0
+            failed = 0
             try:
                 for completed in range(1, pending + 1):
                     event = await result_queue.get()
+                    if event["event"] == "success":
+                        succeeded += 1
+                    else:
+                        failed += 1
                     batch.append(
                         (
                             event["id"],
@@ -1212,13 +1402,13 @@ async def generate_async(  # noqa: C901
                         )
                         connection.commit()
                         batch.clear()
-                    if completed % 1000 == 0 or completed == pending:
-                        print(
-                            f"generate: {completed}/{pending}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
+                    progress.update(
+                        completed,
+                        f" ok {succeeded} err {failed}",
+                        force=completed == pending,
+                    )
             finally:
+                progress.close()
                 connection.close()
 
         tasks = [asyncio.create_task(producer())]
@@ -1605,6 +1795,14 @@ def build_parser() -> argparse.ArgumentParser:
     sample.add_argument("--source-version", default="v1.12")
     sample.add_argument("--allowed-media-root", required=True)
     sample.add_argument("--path-map", action="append")
+    sample.add_argument(
+        "--convert-workers",
+        type=int,
+        default=64,
+        help="threads validating media paths; the shared filesystem is "
+        "latency bound so this is the main lever on sample wall clock",
+    )
+    sample.add_argument("--convert-chunk", type=int, default=4096)
     sample.add_argument("--overwrite", action="store_true")
     sample.set_defaults(handler=command_sample)
 
@@ -1614,7 +1812,13 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--model", required=True)
     generate.add_argument("--endpoint", action="append", default=[])
     generate.add_argument("--stage", default="full")
-    generate.add_argument("--max-tokens", type=int, default=32768)
+    generate.add_argument(
+        "--max-tokens",
+        type=int,
+        default=32768,
+        help="0 or less leaves max_tokens unset so the teacher generates up to "
+        "max_model_len minus the prompt length",
+    )
     generate.add_argument("--temperature", type=float, default=0.0)
     generate.add_argument("--top-p", type=float, default=1.0)
     generate.add_argument("--seed", type=int, default=42)
@@ -1624,6 +1828,12 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--connect-timeout", type=float, default=30.0)
     generate.add_argument("--max-retries", type=int, default=5)
     generate.add_argument("--retry-errors", action="store_true")
+    generate.add_argument(
+        "--allow-config-change",
+        action="store_true",
+        help="accept a generation config that differs from the stored one, "
+        "keeping already generated rows and recording the superseded config",
+    )
     generate.add_argument("--api-key-env", default="OPENAI_API_KEY")
     generate.set_defaults(handler=command_generate)
 

@@ -7,8 +7,22 @@ ROOT="/inspire/sfs/project/inf-multimodal/public/wumengke"
 REPO="$ROOT/speculators"
 MODEL="/home/ma-user/work/data_mllm/publish_models/Infinity-Parser2-2B-2604"
 DATA_DIR="$ROOT/datasets/infinity_parser2_v1_12_dflash_data/full"
-RUN_DIR="$REPO/output/dspark_infinity_parser2_flash_online_full"
-CHECKPOINT_DIR="$RUN_DIR/checkpoints"
+RUN_DIR="${RUN_DIR:-$REPO/output/dspark_infinity_parser2_flash_online_full}"
+NUM_WORKERS="${NUM_WORKERS:-16}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-3}"
+# Threads per worker fetching one batch's hidden states concurrently. A batch
+# packed from short samples holds ~20 of them (seq_len p50 is 801 against a
+# 16384-token budget) and each costs a blocking request, so serial fetching
+# makes the step wait on the sum of those latencies. In-flight requests total
+# NUM_WORKERS * FETCH_THREADS, spread over the vLLM data-parallel ranks.
+FETCH_THREADS="${FETCH_THREADS:-4}"
+# Per-request timeout. The tail matters more than the ceiling: a stuck request
+# blocks its rank and every peer then waits at the gradient all-reduce, so fail
+# fast and let --max-retries retry instead of holding the step for minutes.
+REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-120}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-$ROOT/model_weights/dspark_infinity_parser2_2b_v1_12}"
+# Sub-epoch checkpointing: 0.1 saves ten times per epoch.
+CHECKPOINT_FREQ="${CHECKPOINT_FREQ:-0.1}"
 TENSORBOARD_DIR="$RUN_DIR/tensorboard"
 MEDIA_ROOT="/inspire/sfs/project/inf-multimodal/public"
 VLLM_PORT="${VLLM_PORT:-8200}"
@@ -67,8 +81,18 @@ if (( ${#GPU_LIST[@]} != 8 )); then
     echo "Expected exactly 8 GPUs, got: $ALLOCATED_GPUS" >&2
     exit 1
 fi
-VLLM_GPUS=$(IFS=,; printf '%s' "${GPU_LIST[*]:0:4}")
-TRAIN_GPUS=$(IFS=,; printf '%s' "${GPU_LIST[*]:4:4}")
+# Online training fetches every hidden state from the vLLM side, so the split
+# between generation and training GPUs is the main throughput knob. VLLM_GPU_COUNT
+# takes the leading GPUs; the rest train. Note that changing the training count
+# also changes the data-parallel degree, and therefore the tokens per step.
+VLLM_GPU_COUNT="${VLLM_GPU_COUNT:-4}"
+if (( VLLM_GPU_COUNT < 1 || VLLM_GPU_COUNT > ${#GPU_LIST[@]} - 1 )); then
+    echo "VLLM_GPU_COUNT must be between 1 and $(( ${#GPU_LIST[@]} - 1 ))" >&2
+    exit 1
+fi
+TRAIN_GPU_COUNT=$(( ${#GPU_LIST[@]} - VLLM_GPU_COUNT ))
+VLLM_GPUS=$(IFS=,; printf '%s' "${GPU_LIST[*]:0:VLLM_GPU_COUNT}")
+TRAIN_GPUS=$(IFS=,; printf '%s' "${GPU_LIST[*]:VLLM_GPU_COUNT:TRAIN_GPU_COUNT}")
 
 exec 9>"$RUN_DIR/training.lock"
 if ! flock -n 9; then
@@ -144,6 +168,7 @@ echo "Training GPUs: $TRAIN_GPUS"
 echo "Block size:    $BLOCK_SIZE"
 echo "Markov head:   $MARKOV_HEAD_TYPE (rank $MARKOV_RANK)"
 echo "DSpark loss:   $LOSS_FN"
+echo "Fetch:         $NUM_WORKERS workers x $FETCH_THREADS threads, timeout ${REQUEST_TIMEOUT}s"
 
 setsid env \
     CUDA_VISIBLE_DEVICES="$VLLM_GPUS" \
@@ -152,7 +177,7 @@ setsid env \
     --target-layer-ids "${TARGET_LAYER_IDS[@]}" \
     --hidden-states-path "$HIDDEN_STATES_DIR" \
     --tensor-parallel-size 1 \
-    --data-parallel-size 4 \
+    --data-parallel-size "$VLLM_GPU_COUNT" \
     --gpu-memory-utilization 0.9 \
     --max_model_len 65536 \
     --api-server-count 8 \
@@ -182,7 +207,7 @@ setsid env \
     PYTHONUNBUFFERED=1 \
     "$TORCHRUN" \
     --standalone \
-    --nproc_per_node 4 \
+    --nproc_per_node "$TRAIN_GPU_COUNT" \
     "$REPO/scripts/train.py" \
     --verifier-name-or-path "$MODEL" \
     --data-path "$DATA_DIR" \
@@ -210,29 +235,30 @@ setsid env \
     --confidence-head-alpha "$CONFIDENCE_HEAD_ALPHA" \
     --loss-fn "$LOSS_FN" \
     --dflash-decay-gamma 4.0 \
-    --optimizer adamw \
+    --optimizer muon \
+    --muon-lr 2e-4 \
     --lr 1e-4 \
-    --weight-decay 0.01 \
     --scheduler-type cosine \
     --scheduler-warmup-ratio 0.04 \
     --epochs 3 \
-    --total-seq-len 8192 \
+    --checkpoint-freq "$CHECKPOINT_FREQ" \
+    --total-seq-len 16384 \
     --train-data-ratio 0.99 \
     --noise-std 0 \
     --hidden-states-dtype bfloat16 \
-    --num-workers 24 \
-    --prefetch-factor 2 \
+    --num-workers "$NUM_WORKERS" \
+    --prefetch-factor "$PREFETCH_FACTOR" \
+    --fetch-threads "$FETCH_THREADS" \
     --hidden-states-backend file \
     --hidden-states-path "$HIDDEN_STATES_DIR" \
     --vllm-endpoint "http://127.0.0.1:${VLLM_PORT}/v1" \
     --on-missing generate \
     --on-generate delete \
-    --request-timeout 600 \
+    --request-timeout "$REQUEST_TIMEOUT" \
     --max-retries 5 \
     --fail-on-hidden-state-error \
     --seed 42 \
     --logger tensorboard \
-    --log-freq 100 \
     --log-dir "$TENSORBOARD_DIR" \
     --run-name "$JOB_TAG" &
 TRAIN_PID=$!

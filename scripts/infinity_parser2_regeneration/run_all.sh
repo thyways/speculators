@@ -19,12 +19,21 @@ FINAL_DIR="${PARSER2_FINAL_DIR:-/inspire/sfs/project/inf-multimodal/public/wumen
 PREPARED_ROOT="${PARSER2_PREPARED_ROOT:-/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/infinity_parser2_v1_12_dflash_data}"
 
 POPULATION_SIZE="${PARSER2_POPULATION_SIZE:-5275950}"
-FULL_SIZE="${PARSER2_FULL_SIZE:-1500000}"
-PILOT_SIZE="${PARSER2_PILOT_SIZE:-800000}"
+FULL_SIZE="${PARSER2_FULL_SIZE:-800000}"
+# 0 = no intermediate pilot stage; sample straight to FULL_SIZE rows.
+PILOT_SIZE="${PARSER2_PILOT_SIZE:-0}"
 RESERVE_SIZE="${PARSER2_RESERVE_SIZE:-20000}"
 SEED="${PARSER2_SEED:-42}"
-MAX_TOKENS="${PARSER2_MAX_TOKENS:-32768}"
-CONCURRENCY="${PARSER2_CONCURRENCY_PER_ENDPOINT:-4}"
+CONVERT_WORKERS="${PARSER2_CONVERT_WORKERS:-64}"
+# Cap on generated tokens; 0 would let the teacher run to its context limit,
+# which lets greedy repetition loops hold a scheduler slot for over an hour.
+# 16384 is well past the longest answer observed in a 13k-record sample (13443
+# tokens), so it only ever truncates degenerate output.
+MAX_TOKENS="${PARSER2_MAX_TOKENS:-16384}"
+# Deeper than TEACHER_MAX_NUM_SEQS on purpose: the engine batch must stay full
+# while the client parses a response and queues the next turn.
+CONCURRENCY="${PARSER2_CONCURRENCY_PER_ENDPOINT:-128}"
+REQUEST_TIMEOUT="${PARSER2_REQUEST_TIMEOUT:-3600}"
 SEQ_LENGTH="${PARSER2_SEQ_LENGTH:-20480}"
 PREPROCESSING_WORKERS="${PARSER2_PREPROCESSING_WORKERS:-16}"
 PREPROCESSING_BATCH_SIZE="${PARSER2_PREPROCESSING_BATCH_SIZE:-64}"
@@ -41,7 +50,8 @@ export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 TEACHER_GPU_IDS="${PARSER2_TEACHER_GPU_IDS:-0,1,2,3,4,5,6,7}"
 TEACHER_BASE_PORT="${PARSER2_TEACHER_BASE_PORT:-8000}"
 TEACHER_HOST="${PARSER2_TEACHER_HOST:-127.0.0.1}"
-TEACHER_MAX_MODEL_LEN="${PARSER2_TEACHER_MAX_MODEL_LEN:-65536}"
+TEACHER_MAX_MODEL_LEN="${PARSER2_TEACHER_MAX_MODEL_LEN:-262144}"
+TEACHER_MAX_NUM_SEQS="${PARSER2_TEACHER_MAX_NUM_SEQS:-64}"
 TEACHER_MAX_IMAGES="${PARSER2_TEACHER_MAX_IMAGES:-16}"
 TEACHER_START_TIMEOUT="${PARSER2_TEACHER_START_TIMEOUT:-1800}"
 TEACHER_ENDPOINTS="${PARSER2_ENDPOINTS:-}"
@@ -52,13 +62,15 @@ RENDER_ENDPOINT=""
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") sample|smoke|pilot|full|status [stage]
+Usage: $(basename "$0") sample|generate|smoke|pilot|full|status [stage]
 
-  sample  Build the deterministic sample database.
-  smoke   Regenerate and prepare 100 rows.
-  pilot   Regenerate and prepare the ${PILOT_SIZE}-row pilot.
-  full    Regenerate and prepare the ${FULL_SIZE}-row full dataset.
-  status  Show local progress (default stage: full).
+  sample    Build the deterministic sample database.
+  generate  Regenerate one stage only, without the dflash preparation
+            (default stage: full).
+  smoke     Regenerate and prepare 100 rows.
+  pilot     Regenerate and prepare the pilot; needs PARSER2_PILOT_SIZE > 0.
+  full      Regenerate and prepare the ${FULL_SIZE}-row dataset.
+  status    Show local progress (default stage: full).
 
 Set PARSER2_ENDPOINTS to comma-separated external endpoints to skip local
 teacher startup. Set PARSER2_PREPARE_ONLY=1 to use completed generations only.
@@ -130,13 +142,14 @@ sample_data() {
         --output-root "$OUTPUT_ROOT"
         --population-size "$POPULATION_SIZE"
         --sample-size "$FULL_SIZE"
-        --pilot-size "$PILOT_SIZE"
         --reserve-size "$RESERVE_SIZE"
         --seed "$SEED"
+        --convert-workers "$CONVERT_WORKERS"
         --source-version v1.12
         --allowed-media-root "$MEDIA_ROOT"
         --path-map "/home/ma-user/work/=${MEDIA_ROOT}/"
     )
+    (( PILOT_SIZE > 0 )) && args+=(--pilot-size "$PILOT_SIZE")
     [[ "${PARSER2_OVERWRITE_SAMPLE:-0}" == "1" ]] && args+=(--overwrite)
     "${args[@]}"
 }
@@ -168,13 +181,19 @@ start_teachers() {
     for index in "${!gpus[@]}"; do
         gpu="${gpus[$index]//[[:space:]]/}"
         port=$((TEACHER_BASE_PORT + index))
+        # hs_connectors lives in the workspace, not in vllm_venv. Without it on
+        # the path the speculators vLLM plugins fail to import and dump a
+        # traceback per engine process at startup; harmless for a plain teacher,
+        # but it buries the real log.
         setsid env CUDA_VISIBLE_DEVICES="$gpu" \
+            PYTHONPATH="${REPO_ROOT}/hs_connectors/src${PYTHONPATH:+:${PYTHONPATH}}" \
             "$VLLM_BIN" serve "$MODEL" \
             --host "$TEACHER_HOST" \
             --port "$port" \
             --served-model-name "$MODEL" \
             --tensor-parallel-size 1 \
             --max-model-len "$TEACHER_MAX_MODEL_LEN" \
+            --max-num-seqs "$TEACHER_MAX_NUM_SEQS" \
             --allowed-local-media-path "$MEDIA_ROOT" \
             --limit-mm-per-prompt "{\"image\":${TEACHER_MAX_IMAGES}}" \
             "${extra_args[@]}" \
@@ -251,7 +270,7 @@ generate_stage() {
         --top-p 1
         --seed "$SEED"
         --concurrency-per-endpoint "$CONCURRENCY"
-        --timeout 600
+        --timeout "$REQUEST_TIMEOUT"
         --connect-timeout 30
         --max-retries 5
     )
@@ -259,6 +278,7 @@ generate_stage() {
         args+=(--endpoint "$endpoint")
     done
     [[ "${PARSER2_RETRY_ERRORS:-0}" == "1" ]] && args+=(--retry-errors)
+    [[ "${PARSER2_ALLOW_CONFIG_CHANGE:-0}" == "1" ]] && args+=(--allow-config-change)
     "${args[@]}"
 }
 
@@ -277,6 +297,7 @@ prepare_stage() {
             token_freq_ratio="$SMOKE_TRAIN_DATA_RATIO"
             ;;
         pilot)
+            (( PILOT_SIZE > 0 )) || die "stage pilot needs PARSER2_PILOT_SIZE > 0"
             target_records="$PILOT_SIZE"
             token_freq_ratio="$TRAIN_DATA_RATIO"
             ;;
@@ -334,6 +355,20 @@ action="${1:-}"
 case "$action" in
     sample)
         sample_data
+        ;;
+    generate)
+        stage="${2:-full}"
+        sample_data
+        if ! "$PYTHON_BIN" "$PIPELINE" status \
+            --output-root "$OUTPUT_ROOT" \
+            --stage "$stage" \
+            --require-complete >/dev/null; then
+            resolve_endpoints
+            generate_stage "$stage"
+        fi
+        "$PYTHON_BIN" "$PIPELINE" status \
+            --output-root "$OUTPUT_ROOT" \
+            --stage "$stage"
         ;;
     status)
         "$PYTHON_BIN" "$PIPELINE" status \
