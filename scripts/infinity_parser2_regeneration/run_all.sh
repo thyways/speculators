@@ -5,37 +5,66 @@ set -Eeuo pipefail
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 
-PYTHON_BIN="${PARSER2_PYTHON_BIN:-${REPO_ROOT}/speculators_venv/bin/python}"
-VLLM_BIN="${PARSER2_VLLM_BIN:-${REPO_ROOT}/vllm_venv/bin/vllm}"
+# This lives in a git worktree that carries no venv of its own, so fall back to
+# the ones in the primary checkout next door.
+VENV_ROOT="${PARSER2_VENV_ROOT:-}"
+if [[ -z "$VENV_ROOT" ]]; then
+    if [[ -x "${REPO_ROOT}/speculators_venv/bin/python" ]]; then
+        VENV_ROOT="${REPO_ROOT}"
+    else
+        VENV_ROOT="$(cd -- "${REPO_ROOT}/.." && pwd -P)/speculators"
+    fi
+fi
+PYTHON_BIN="${PARSER2_PYTHON_BIN:-${VENV_ROOT}/speculators_venv/bin/python}"
+VLLM_BIN="${PARSER2_VLLM_BIN:-${VENV_ROOT}/vllm_venv/bin/vllm}"
 PIPELINE="${SCRIPT_DIR}/script.py"
 PREPARE_SCRIPT="${REPO_ROOT}/scripts/infinity_parser2_prepare_data.py"
 VOCAB_SCRIPT="${REPO_ROOT}/scripts/build_vocab_mapping.py"
 
-SOURCE_JSONL="${PARSER2_SOURCE_JSONL:-/home/ma-user/work/data_mllm/new_datasets/swift_merged_datasets/version_v1.12/train_v1.12.jsonl}"
+SOURCE_JSONL="${PARSER2_SOURCE_JSONL:-/home/ma-user/work/new_datasets/swift_merged_datasets/version_v2.1/train_v2.1.jsonl}"
 MEDIA_ROOT="${PARSER2_MEDIA_ROOT:-/inspire/sfs/project/inf-multimodal/public}"
-MODEL="${PARSER2_MODEL:-/home/ma-user/work/data_mllm/publish_models/Infinity-Parser2-2B-2604}"
-OUTPUT_ROOT="${PARSER2_REGEN_ROOT:-/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/infinity_parser2_v1_12_regen_1p5m}"
-FINAL_DIR="${PARSER2_FINAL_DIR:-/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/infinity_parser2_v1_12_target_answers}"
-PREPARED_ROOT="${PARSER2_PREPARED_ROOT:-/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/infinity_parser2_v1_12_dflash_data}"
+# Tags the record ids and the sample fingerprint, so it must track SOURCE_JSONL.
+SOURCE_VERSION="${PARSER2_SOURCE_VERSION:-v2.1}"
+MODEL="${PARSER2_MODEL:-/home/ma-user/work/data_mllm/publish_models/Infinity-Parser2.1-Flash-2608}"
+OUTPUT_ROOT="${PARSER2_REGEN_ROOT:-/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/infinity_parser2_v2_1_regen_1p5m}"
+FINAL_DIR="${PARSER2_FINAL_DIR:-/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/infinity_parser2_v2_1_target_answers}"
+PREPARED_ROOT="${PARSER2_PREPARED_ROOT:-/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/infinity_parser2_v2_1_dflash_data}"
 
-POPULATION_SIZE="${PARSER2_POPULATION_SIZE:-5275950}"
-FULL_SIZE="${PARSER2_FULL_SIZE:-800000}"
+# Exact line count of SOURCE_JSONL; the sample aborts if the file disagrees.
+# train_v2.1.jsonl: 5795953 lines (wc -l, 2026-08-20).
+POPULATION_SIZE="${PARSER2_POPULATION_SIZE:-5795953}"
+FULL_SIZE="${PARSER2_FULL_SIZE:-1500000}"
 # 0 = no intermediate pilot stage; sample straight to FULL_SIZE rows.
 PILOT_SIZE="${PARSER2_PILOT_SIZE:-0}"
-RESERVE_SIZE="${PARSER2_RESERVE_SIZE:-20000}"
+# Spare candidates that absorb rows lost to conversion and generation failures,
+# so the full stage can still hand FULL_SIZE successes to prepare. 4% of
+# FULL_SIZE, up from v1.12's flat 20000 (2.5%). v1.12 failed 16443 of 819950
+# generations, a 2.0% rate that left only 0.4% of headroom -- it finished with
+# 803507 successes against a target of 800000. Lifting the MAX_TOKENS cap also
+# lets degenerate rows run into REQUEST_TIMEOUT instead of being clipped, which
+# converts some of v1.12's clipped successes into timeout errors.
+RESERVE_SIZE="${PARSER2_RESERVE_SIZE:-60000}"
 SEED="${PARSER2_SEED:-42}"
-CONVERT_WORKERS="${PARSER2_CONVERT_WORKERS:-64}"
-# Cap on generated tokens; 0 would let the teacher run to its context limit,
-# which lets greedy repetition loops hold a scheduler slot for over an hour.
-# 16384 is well past the longest answer observed in a 13k-record sample (13443
-# tokens), so it only ever truncates degenerate output.
-MAX_TOKENS="${PARSER2_MAX_TOKENS:-16384}"
+CONVERT_WORKERS="${PARSER2_CONVERT_WORKERS:-32}"
+# 0 sends no max_tokens at all, which makes vLLM fall back to
+# max_model_len - prompt_tokens: the full 64k generation budget the model was
+# trained for, minus whatever the prompt takes. Do not express that as a literal
+# 65536 instead -- vLLM rejects prompt_tokens + max_tokens > max_model_len with
+# HTTP 400 rather than clipping max_tokens, so a fixed 65536 against a 65536
+# context 400s every request (measured, 2026-08-20).
+#
+# The cost of an open budget is that a greedy repetition loop now runs until the
+# context fills or REQUEST_TIMEOUT expires, holding a scheduler slot the whole
+# time; v1.12's 16384 cap cut those off roughly four times sooner. Real answers
+# are nowhere near this: v2.1's longest prompt+answer sequence is 65355 tokens
+# and the median is 982.
+MAX_TOKENS="${PARSER2_MAX_TOKENS:-32768}"
 # Deeper than TEACHER_MAX_NUM_SEQS on purpose: the engine batch must stay full
 # while the client parses a response and queues the next turn.
-CONCURRENCY="${PARSER2_CONCURRENCY_PER_ENDPOINT:-128}"
+CONCURRENCY="${PARSER2_CONCURRENCY_PER_ENDPOINT:-64}"
 REQUEST_TIMEOUT="${PARSER2_REQUEST_TIMEOUT:-3600}"
 SEQ_LENGTH="${PARSER2_SEQ_LENGTH:-20480}"
-PREPROCESSING_WORKERS="${PARSER2_PREPROCESSING_WORKERS:-16}"
+PREPROCESSING_WORKERS="${PARSER2_PREPROCESSING_WORKERS:-32}"
 PREPROCESSING_BATCH_SIZE="${PARSER2_PREPROCESSING_BATCH_SIZE:-64}"
 MINIMUM_VALID_TOKENS="${PARSER2_MINIMUM_VALID_TOKENS:-1}"
 DRAFT_VOCAB_SIZE="${PARSER2_DRAFT_VOCAB_SIZE:-32000}"
@@ -47,11 +76,19 @@ export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 
+# One single-GPU teacher per id, so the id count is the data-parallel width:
+# 8 ids here means dp=8, and each teacher runs tp=1. A 2.2B model in bf16 is
+# 4.4 GiB, so sharding it would only cost collectives and shrink the KV cache.
 TEACHER_GPU_IDS="${PARSER2_TEACHER_GPU_IDS:-0,1,2,3,4,5,6,7}"
+TEACHER_TENSOR_PARALLEL_SIZE="${PARSER2_TEACHER_TP_SIZE:-1}"
 TEACHER_BASE_PORT="${PARSER2_TEACHER_BASE_PORT:-8000}"
 TEACHER_HOST="${PARSER2_TEACHER_HOST:-127.0.0.1}"
-TEACHER_MAX_MODEL_LEN="${PARSER2_TEACHER_MAX_MODEL_LEN:-262144}"
-TEACHER_MAX_NUM_SEQS="${PARSER2_TEACHER_MAX_NUM_SEQS:-64}"
+# 64k: the length this model was actually trained and SFT'd at, and with
+# MAX_TOKENS=0 also the per-turn generation budget. config.json advertises
+# max_position_embeddings 262144, but that is only the rope ceiling -- serving
+# past 64k would be extrapolation. v1.12 served 262144 without checking.
+TEACHER_MAX_MODEL_LEN="${PARSER2_TEACHER_MAX_MODEL_LEN:-65536}"
+TEACHER_MAX_NUM_SEQS="${PARSER2_TEACHER_MAX_NUM_SEQS:-128}"
 TEACHER_MAX_IMAGES="${PARSER2_TEACHER_MAX_IMAGES:-16}"
 TEACHER_START_TIMEOUT="${PARSER2_TEACHER_START_TIMEOUT:-1800}"
 TEACHER_ENDPOINTS="${PARSER2_ENDPOINTS:-}"
@@ -71,6 +108,14 @@ Usage: $(basename "$0") sample|generate|smoke|pilot|full|status [stage]
   pilot     Regenerate and prepare the pilot; needs PARSER2_PILOT_SIZE > 0.
   full      Regenerate and prepare the ${FULL_SIZE}-row dataset.
   status    Show local progress (default stage: full).
+
+Serves ${MODEL##*/} on GPUs ${TEACHER_GPU_IDS} (dp=$(awk -F, '{print NF}' <<< "$TEACHER_GPU_IDS"),
+tp=${TEACHER_TENSOR_PARALLEL_SIZE}) at a ${TEACHER_MAX_MODEL_LEN}-token context, generating
+$( ((MAX_TOKENS > 0)) && echo "at most ${MAX_TOKENS} tokens" || echo "up to the remaining context" ) per turn.
+
+At full size, prefer 'generate full' followed by prepare_fast.sh: the prepare
+built into this script derives loss masks through the vLLM /render endpoint,
+which caps near 16 renders/s and would take days for this many rows.
 
 Set PARSER2_ENDPOINTS to comma-separated external endpoints to skip local
 teacher startup. Set PARSER2_PREPARE_ONLY=1 to use completed generations only.
@@ -145,7 +190,7 @@ sample_data() {
         --reserve-size "$RESERVE_SIZE"
         --seed "$SEED"
         --convert-workers "$CONVERT_WORKERS"
-        --source-version v1.12
+        --source-version "$SOURCE_VERSION"
         --allowed-media-root "$MEDIA_ROOT"
         --path-map "/home/ma-user/work/=${MEDIA_ROOT}/"
     )
@@ -191,7 +236,7 @@ start_teachers() {
             --host "$TEACHER_HOST" \
             --port "$port" \
             --served-model-name "$MODEL" \
-            --tensor-parallel-size 1 \
+            --tensor-parallel-size "$TEACHER_TENSOR_PARALLEL_SIZE" \
             --max-model-len "$TEACHER_MAX_MODEL_LEN" \
             --max-num-seqs "$TEACHER_MAX_NUM_SEQS" \
             --allowed-local-media-path "$MEDIA_ROOT" \

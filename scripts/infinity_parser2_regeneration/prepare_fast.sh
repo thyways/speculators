@@ -18,15 +18,25 @@ set -Eeuo pipefail
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 
-PYTHON_BIN="${PARSER2_PYTHON_BIN:-${REPO_ROOT}/speculators_venv/bin/python}"
+# Mirrors run_all.sh: the worktree carries no venv, so fall back next door.
+VENV_ROOT="${PARSER2_VENV_ROOT:-}"
+if [[ -z "$VENV_ROOT" ]]; then
+    if [[ -x "${REPO_ROOT}/speculators_venv/bin/python" ]]; then
+        VENV_ROOT="${REPO_ROOT}"
+    else
+        VENV_ROOT="$(cd -- "${REPO_ROOT}/.." && pwd -P)/speculators"
+    fi
+fi
+PYTHON_BIN="${PARSER2_PYTHON_BIN:-${VENV_ROOT}/speculators_venv/bin/python}"
 PIPELINE="${SCRIPT_DIR}/script.py"
 PREPARE_SCRIPT="${REPO_ROOT}/scripts/infinity_parser2_prepare_data.py"
 VOCAB_SCRIPT="${REPO_ROOT}/scripts/build_vocab_mapping.py"
 
-MODEL="${PARSER2_MODEL:-/home/ma-user/work/data_mllm/publish_models/Infinity-Parser2-2B-2604}"
-OUTPUT_ROOT="${PARSER2_REGEN_ROOT:-/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/infinity_parser2_v1_12_regen_1p5m}"
-FINAL_DIR="${PARSER2_FINAL_DIR:-/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/infinity_parser2_v1_12_target_answers}"
-PREPARED_ROOT="${PARSER2_PREPARED_ROOT:-/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/infinity_parser2_v1_12_dflash_data}"
+# Must match run_all.sh, which owns the sqlite state these paths point into.
+MODEL="${PARSER2_MODEL:-/home/ma-user/work/data_mllm/publish_models/Infinity-Parser2.1-Flash-2608}"
+OUTPUT_ROOT="${PARSER2_REGEN_ROOT:-/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/infinity_parser2_v2_1_regen_1p5m}"
+FINAL_DIR="${PARSER2_FINAL_DIR:-/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/infinity_parser2_v2_1_target_answers}"
+PREPARED_ROOT="${PARSER2_PREPARED_ROOT:-/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/infinity_parser2_v2_1_dflash_data}"
 
 STAGE="${PARSER2_STAGE:-full}"
 # Must match --total-seq-len in the training script: that is the per-rank token
