@@ -9,8 +9,8 @@ export ROOT="${ROOT:-$(dirname -- "$REPO")}"
 export ENV_REPO="${ENV_REPO:-$ROOT/speculators}"
 
 MODEL="${MODEL:-$ROOT/model_weights/Qwen/Qwen3.6-35B-A3B}"
-DATA_DIR="${DATA_DIR:-$ROOT/datasets/qwen3_6_35b_500k}"
-export RUN_DIR="${RUN_DIR:-$ROOT/model_weights/dflash_qwen3_6_35b_a3b_5full_muon}"
+DATA_DIR="${DATA_DIR:-$ROOT/datasets/qwen3.6-35b-a3b/qwen3.6-35b-a3b_train_spec_260820_800k_len4096_fullvocab}"
+export RUN_DIR="${RUN_DIR:-$ROOT/model_weights/dflash_qwen3_6_35b_a3b_5full}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-$RUN_DIR/checkpoints}"
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-$RUN_DIR/tensorboard}"
 
@@ -50,12 +50,13 @@ if [[ ! -f "$MODEL/config.json" ]]; then
     exit 1
 fi
 
+# Training runs on the full verifier vocabulary, so no vocab-mapping artifacts
+# are required. Do not reinstate the d2t.npy/t2d.npy checks: passing
+# --draft-vocab-size alongside a token_freq.pt would make train.py synthesize a
+# reduced mapping and cache it into DATA_DIR.
 for path in \
     "$DATA_DIR/state.json" \
-    "$DATA_DIR/dataset_info.json" \
-    "$DATA_DIR/token_freq.pt" \
-    "$DATA_DIR/d2t.npy" \
-    "$DATA_DIR/t2d.npy"; do
+    "$DATA_DIR/dataset_info.json"; do
     if [[ ! -f "$path" ]]; then
         echo "Missing prepared-data artifact: $path" >&2
         exit 1
@@ -179,10 +180,10 @@ setsid env \
     --verifier-name-or-path "$MODEL" \
     --data-path "$DATA_DIR" \
     --save-path "$CHECKPOINT_DIR" \
-    --draft-vocab-size 32000 \
     --epochs 1 \
     --train-data-ratio 0.98 \
-    --optimizer adamw \
+    --optimizer muon \
+    --muon-lr 2e-4 \
     --lr 1e-4 \
     --noise-std 0 \
     --scheduler-type cosine \
@@ -190,12 +191,13 @@ setsid env \
     --total-seq-len 4096 \
     --speculator-type dflash \
     --block-size 16 \
-    --max-anchors 1024 \
+    --max-anchors 512 \
     --num-layers 5 \
     --loss-fn ce \
     --per-position-loss-weight dpace \
-    --full-attention-indices 0 1 2 3 4 \
-    --target-layer-ids 2 7 12 17 23 28 33 38 \
+    --sliding-window 2048 \
+    --sliding-window-non-causal \
+    --target-layer-ids 2 11 20 29 38 \
     --vllm-endpoint "$VLLM_ENDPOINT" \
     --request-timeout 300 \
     --on-missing generate \

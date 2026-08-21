@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Online DSpark training for Qwen3.6-35B-A3B on one 8-GPU node, using the
-# already-prepared 500k-sample PerfectBlend corpus from the matching DFlash run.
+# already-prepared 800k-sample PerfectBlend corpus from the matching DFlash run.
 # DSpark keeps the official Qwen3.6-35B-A3B-DFlash target features with five
-# full-attention draft layers, and adds a Markov head plus a confidence head.
+# sliding-window draft layers (window 2048, non-causal within blocks), and adds
+# a Markov head plus a confidence head.
 # Run this script as the cluster job command; do not wrap it in nohup.
-# The prepared data in DATA_DIR must use this model's tokenizer.
+# The prepared data in DATA_DIR must use this model's tokenizer, and training
+# runs on the full verifier vocabulary (no draft-vocab reduction).
 
 set -Eeuo pipefail
 
@@ -16,17 +18,18 @@ export ROOT="${ROOT:-$(dirname -- "$REPO")}"
 export ENV_REPO="${ENV_REPO:-$ROOT/speculators}"
 
 MODEL="${MODEL:-$ROOT/model_weights/Qwen/Qwen3.6-35B-A3B}"
-DATA_DIR="${DATA_DIR:-$ROOT/datasets/qwen3_6_35b_500k}"
+DATA_DIR="${DATA_DIR:-$ROOT/datasets/qwen3.6-35b-a3b/qwen3.6-35b-a3b_train_spec_260820_800k_len4096_fullvocab}"
 export RUN_DIR="${RUN_DIR:-$ROOT/model_weights/dspark_qwen3_6_35b_a3b_5full}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-$RUN_DIR/checkpoints}"
-TENSORBOARD_DIR="${TENSORBOARD_DIR:-$RUN_DIR/tensorboard}"
+LOG_DIR="${LOG_DIR:-$RUN_DIR}"
+WANDB_PROJECT="${WANDB_PROJECT:-qwen3_6_35b_a3b_spec}"
+WANDB_KEY_FILE="${WANDB_KEY_FILE:-$ROOT/.secrets/wandb_key}"
 
 VLLM_PORT="${VLLM_PORT:-8200}"
 VLLM_ENDPOINT="${VLLM_ENDPOINT:-http://localhost:${VLLM_PORT}/v1}"
 VLLM_HEALTH_ENDPOINT="${VLLM_HEALTH_ENDPOINT:-http://localhost:${VLLM_PORT}/health}"
-DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-32000}"
-# Use the canonical DSpark block size from the existing example. DSpark samples
-# from the anchor by default, so BLOCK_SIZE=8 produces 8 speculative tokens.
+# Train all 16 block positions. DSpark samples from the anchor by default, so
+# BLOCK_SIZE=16 produces 16 speculative tokens.
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 MARKOV_RANK="${MARKOV_RANK:-256}"
 MARKOV_HEAD_TYPE="${MARKOV_HEAD_TYPE:-vanilla}"
@@ -44,7 +47,7 @@ LAUNCH_VLLM="${LAUNCH_VLLM:-$REPO/scripts/launch_vllm.py}"
 TRAIN_SCRIPT="${TRAIN_SCRIPT:-$REPO/scripts/train.py}"
 LOCAL_PYTHONPATH="${LOCAL_PYTHONPATH:-$REPO/src:$REPO/hs_connectors/src}"
 
-mkdir -p "$RUN_DIR" "$CHECKPOINT_DIR" "$TENSORBOARD_DIR" "$HIDDEN_STATES_DIR"
+mkdir -p "$RUN_DIR" "$CHECKPOINT_DIR" "$HIDDEN_STATES_DIR"
 
 for executable in "$SPEC_PYTHON" "$TORCHRUN" "$VLLM_PYTHON"; do
     if [[ ! -x "$executable" ]]; then
@@ -66,12 +69,27 @@ if [[ ! -f "$MODEL/config.json" ]]; then
     exit 1
 fi
 
+# Load the W&B key from disk and export it rather than listing it in the `env`
+# invocations below: command-line arguments are visible in `ps` output to every
+# user sharing this node.
+if [[ ! -f "$WANDB_KEY_FILE" ]]; then
+    echo "Missing W&B key file: $WANDB_KEY_FILE" >&2
+    exit 1
+fi
+WANDB_API_KEY="$(tr -d '[:space:]' < "$WANDB_KEY_FILE")"
+if [[ -z "$WANDB_API_KEY" ]]; then
+    echo "W&B key file is empty: $WANDB_KEY_FILE" >&2
+    exit 1
+fi
+export WANDB_API_KEY
+
+# Training runs on the full verifier vocabulary, so no vocab-mapping artifacts
+# are required. Do not reinstate the d2t.npy/t2d.npy checks: passing
+# --draft-vocab-size alongside a token_freq.pt would make train.py synthesize a
+# reduced mapping and cache it into DATA_DIR.
 for path in \
     "$DATA_DIR/state.json" \
-    "$DATA_DIR/dataset_info.json" \
-    "$DATA_DIR/token_freq.pt" \
-    "$DATA_DIR/d2t.npy" \
-    "$DATA_DIR/t2d.npy"; do
+    "$DATA_DIR/dataset_info.json"; do
     if [[ ! -f "$path" ]]; then
         echo "Missing prepared-data artifact: $path" >&2
         exit 1
@@ -133,7 +151,7 @@ echo "Repository:       $REPO"
 echo "Model:            $MODEL"
 echo "Data (500k):      $DATA_DIR"
 echo "Checkpoints:      $CHECKPOINT_DIR"
-echo "TensorBoard:      $TENSORBOARD_DIR/$JOB_TAG"
+echo "W&B project:      $WANDB_PROJECT"
 echo "vLLM GPUs:        $VLLM_GPUS"
 echo "Training GPUs:    $TRAIN_GPUS"
 echo "Markov head:      $MARKOV_HEAD_TYPE (rank $MARKOV_RANK)"
@@ -159,7 +177,7 @@ setsid env \
     "$VLLM_PYTHON" \
     "$LAUNCH_VLLM" \
     "$MODEL" \
-    --target-layer-ids 2 7 12 17 23 28 33 38 \
+    --target-layer-ids 2 11 20 29 38 \
     --hidden-states-path "$HIDDEN_STATES_DIR" \
     -- \
     --tensor-parallel-size 1 \
@@ -191,6 +209,7 @@ setsid env \
     CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" \
     PYTHONPATH="$LOCAL_PYTHONPATH" \
     PYTHONUNBUFFERED=1 \
+    WANDB_PROJECT="$WANDB_PROJECT" \
     "$TORCHRUN" \
     --standalone \
     --nproc_per_node 6 \
@@ -198,11 +217,11 @@ setsid env \
     --verifier-name-or-path "$MODEL" \
     --data-path "$DATA_DIR" \
     --save-path "$CHECKPOINT_DIR" \
-    --draft-vocab-size "$DRAFT_VOCAB_SIZE" \
     --epochs 1 \
     --train-data-ratio 0.98 \
-    --optimizer adamw \
-    --lr 6e-4 \
+    --optimizer muon \
+    --muon-lr 2e-4 \
+    --lr 1e-4 \
     --weight-decay 0.01 \
     --noise-std 0 \
     --scheduler-type cosine \
@@ -211,10 +230,11 @@ setsid env \
     --speculator-type dspark \
     --block-size "$BLOCK_SIZE" \
     --sample-from-anchor \
-    --max-anchors 1024 \
+    --max-anchors 512 \
     --num-layers 5 \
-    --full-attention-indices 0 1 2 3 4 \
-    --target-layer-ids 2 7 12 17 23 28 33 38 \
+    --sliding-window 2048 \
+    --sliding-window-non-causal \
+    --target-layer-ids 2 11 20 29 38 \
     --markov-rank "$MARKOV_RANK" \
     --markov-head-type "$MARKOV_HEAD_TYPE" \
     --enable-confidence-head \
@@ -225,9 +245,9 @@ setsid env \
     --request-timeout 300 \
     --on-missing generate \
     --on-generate delete \
-    --logger tensorboard \
-    --log-dir "$TENSORBOARD_DIR" \
-    --run-name dspark_qwen3_6_35b_a3b_5full &
+    --logger wandb \
+    --log-dir "$LOG_DIR" \
+    --run-name dspark_5swa2048nc_muon_fullvocab &
 TRAIN_PID=$!
 
 # Keep the cluster job attached to training. Its stdout/stderr is therefore
