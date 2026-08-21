@@ -809,9 +809,9 @@ def load_raw_dataset(
     """Load a raw dataset from one of several source types.
 
     Resolution order:
-        1. Local ``.json``/``.jsonl`` file.
-        2. Local directory: recursively load all ``*.json``/``*.jsonl`` files
-           as a single dataset.
+        1. Local ``.json``/``.jsonl``/``.parquet`` file.
+        2. Local directory: recursively load all files sharing one supported
+           extension as a single dataset, preferring JSON over Parquet.
         3. Named preset from ``DATASET_CONFIGS``.
         4. ``hf:<id>[:<subset>:<split>]`` for an arbitrary HuggingFace dataset.
 
@@ -824,23 +824,35 @@ def load_raw_dataset(
 
     Raises:
         ValueError: If the source cannot be resolved or a local directory
-            contains no ``.json``/``.jsonl`` files.
+            contains no ``.json``/``.jsonl``/``.parquet`` files.
     """
     # 1. Local file
     if train_data_path.endswith((".jsonl", ".json")):
         return load_dataset("json", data_files=train_data_path, split="train"), None
 
+    if train_data_path.endswith(".parquet"):
+        return load_dataset("parquet", data_files=train_data_path, split="train"), None
+
     # 2. Local directory
     path = Path(train_data_path)
     if path.is_dir():
-        data_files = sorted(
-            str(p) for p in (*path.rglob("*.json"), *path.rglob("*.jsonl"))
-        )
-        if not data_files:
-            raise ValueError(
-                f"No .json/.jsonl files found in directory: {train_data_path}"
+        # One builder per directory: a single load_dataset call cannot mix JSON
+        # shards with Parquet ones, they resolve to different schemas.
+        for builder, patterns in (
+            ("json", ("*.json", "*.jsonl")),
+            ("parquet", ("*.parquet",)),
+        ):
+            data_files = sorted(
+                str(p) for pattern in patterns for p in path.rglob(pattern)
             )
-        return load_dataset("json", data_files=data_files, split="train"), None
+            if data_files:
+                return (
+                    load_dataset(builder, data_files=data_files, split="train"),
+                    None,
+                )
+        raise ValueError(
+            f"No .json/.jsonl/.parquet files found in directory: {train_data_path}"
+        )
 
     # 3. Named preset
     if train_data_path in DATASET_CONFIGS:
@@ -857,8 +869,9 @@ def load_raw_dataset(
         return _load_hf_dataset(train_data_path)
 
     raise ValueError(
-        f"Unsupported dataset: {train_data_path}. Supported: local .json/.jsonl "
-        f"file, local directory of .json/.jsonl files, hf:<id>[:<subset>:<split>], "
+        f"Unsupported dataset: {train_data_path}. Supported: local "
+        f".json/.jsonl/.parquet file, local directory of .json/.jsonl/.parquet "
+        f"files, hf:<id>[:<subset>:<split>], "
         f"or a preset {list(DATASET_CONFIGS.keys())}."
     )
 
