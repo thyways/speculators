@@ -142,8 +142,9 @@ setsid env \
     "$VLLM_PYTHON" \
     "$LAUNCH_VLLM" \
     "$MODEL" \
-    --target-layer-ids 2 7 12 17 23 28 33 38 \
+    --target-layer-ids 2 11 20 29 38 \
     --hidden-states-path "$HIDDEN_STATES_DIR" \
+    -- \
     --tensor-parallel-size 1 \
     --data-parallel-size 2 \
     --max-model-len 10000 \

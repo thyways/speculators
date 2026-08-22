@@ -26,7 +26,7 @@ LOGITS_CORRECTION_EMB_DIM="${LOGITS_CORRECTION_EMB_DIM:-256}"
 PURE_DRAFT_PREFIX_LEN="${PURE_DRAFT_PREFIX_LEN:-1}"
 LAMBDA_BASE_START="${LAMBDA_BASE_START:-1.0}"
 LAMBDA_BASE_DECAY_RATIO="${LAMBDA_BASE_DECAY_RATIO:-1.0}"
-DEFAULT_LOSS_FN='kl_div'
+DEFAULT_LOSS_FN='{"ce": 0.1, "tv": 0.9}'
 LOSS_FN="${LOSS_FN:-$DEFAULT_LOSS_FN}"
 JOB_TAG="${SLURM_JOB_ID:-${JOB_ID:-$$}}"
 HIDDEN_STATES_DIR="${HIDDEN_STATES_DIR:-/tmp/domino_qwen3_6_35b_a3b_hidden_states}"
@@ -241,7 +241,7 @@ setsid env \
     --logger wandb \
     --log-dir "$LOG_DIR" \
     --checkpoint-freq 0.1 \
-    --run-name domino_5swa2048nc_muon_fullvocab &
+    --run-name domino_5swa2048nc_muon_fullvocab_lk &
 TRAIN_PID=$!
 
 # Keep the cluster job attached to training. Its stdout/stderr is therefore
