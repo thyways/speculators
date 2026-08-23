@@ -17,8 +17,6 @@ LOG_DIR="${LOG_DIR:-$RUN_DIR}"
 WANDB_PROJECT="${WANDB_PROJECT:-qwen3.6-35b-a3b-5swa}"
 WANDB_KEY_FILE="${WANDB_KEY_FILE:-$ROOT/.secrets/wandb_key}"
 
-FULL_VOCAB_DATA_DIR="${FULL_VOCAB_DATA_DIR:-$RUN_DIR/data_full_vocab}"
-
 MAX_ANCHORS="${MAX_ANCHORS:-512}"
 
 CONV_KERNEL_SIZE="${CONV_KERNEL_SIZE:-2}"
@@ -90,20 +88,15 @@ for command in setsid curl; do
     fi
 done
 
-rm -rf "$FULL_VOCAB_DATA_DIR"
-mkdir -p "$FULL_VOCAB_DATA_DIR"
-shopt -s nullglob
-for path in "$DATA_DIR"/*; do
-    case "$(basename -- "$path")" in
-        d2t.npy|t2d.npy|token_freq.pt) continue ;;
-    esac
-    ln -s -- "$path" "$FULL_VOCAB_DATA_DIR/"
+# DFlash2 cannot prune the verifier vocabulary, but train.py silently enables vocab
+# mapping when it finds these files next to the data. Fail loudly instead.
+for path in "$DATA_DIR/d2t.npy" "$DATA_DIR/t2d.npy"; do
+    if [[ -e "$path" ]]; then
+        echo "Refusing to train: $path would make train.py prune the vocabulary," >&2
+        echo "which DFlash2 does not support. Point DATA_DIR at data without it." >&2
+        exit 1
+    fi
 done
-shopt -u nullglob
-if [[ ! -f "$FULL_VOCAB_DATA_DIR/state.json" ]]; then
-    echo "Failed to build the full-vocabulary data view at $FULL_VOCAB_DATA_DIR" >&2
-    exit 1
-fi
 
 VOCAB_SIZE="$("$SPEC_PYTHON" - "$MODEL" <<'PY'
 import json
@@ -162,7 +155,7 @@ trap 'exit 143' TERM
 
 echo "Repository:     $REPO"
 echo "Model:          $MODEL"
-echo "Data:           $FULL_VOCAB_DATA_DIR (full-vocab view of $DATA_DIR)"
+echo "Data:           $DATA_DIR"
 echo "Checkpoints:    $CHECKPOINT_DIR"
 echo "W&B project:    $WANDB_PROJECT"
 echo "vLLM GPUs:      $VLLM_GPUS"
@@ -227,7 +220,7 @@ setsid env \
     --nproc_per_node 6 \
     "$TRAIN_SCRIPT" \
     --verifier-name-or-path "$MODEL" \
-    --data-path "$FULL_VOCAB_DATA_DIR" \
+    --data-path "$DATA_DIR" \
     --save-path "$CHECKPOINT_DIR" \
     --epochs 1 \
     --train-data-ratio 0.98 \
