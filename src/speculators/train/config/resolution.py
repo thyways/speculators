@@ -90,18 +90,20 @@ REQUIRED_FLAGS: dict[str, str] = _required_flags()
 
 # Algorithm group -> the speculator types that consume it. A group set to a
 # non-default value under a speculator_type absent from its set is ignored, and
-# warns. DFly, DSpark, and Domino are DFlash-family models, so all of them read
-# the dflash group; their exclusive settings remain in their own groups. eagle3
-# uses no algorithm group.
+# warns. DFlash2, DFly, DSpark, and Domino are DFlash-family models, so all of
+# them read the dflash group; their exclusive settings remain in their own
+# groups. eagle3 uses no algorithm group.
 _ALGORITHM_GROUP_USERS: dict[str, frozenset[str]] = {
     "dflash": frozenset(
         {
             "dflash",
+            "dflash2",
             "dfly",
             "domino",
             "dspark",
         }
     ),
+    "dflash2": frozenset({"dflash2"}),
     "dfly": frozenset({"dfly"}),
     "domino": frozenset({"domino"}),
     "dspark": frozenset({"dspark"}),

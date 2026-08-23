@@ -142,6 +142,7 @@ dev = [
 speculators = "speculators.__main__:app"
 
 [project.entry-points."vllm.general_plugins"]
+speculators_dflash2 = "speculators.vllm.dflash2:register"
 speculators_dfly = "speculators.vllm.dfly:register"
 speculators_domino = "speculators.vllm.domino:register"
 speculators_peagle = "speculators.vllm.peagle:register"

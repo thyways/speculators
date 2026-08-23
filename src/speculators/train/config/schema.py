@@ -485,6 +485,63 @@ class DFlashArgs(_Group):
     )
 
 
+class DFlash2Args(_Group):
+    """DFlash2-exclusive modules (local convolution + candidate selector).
+
+    Every field except ``selector_loss_weight`` lands in the saved speculator config
+    under the same name, which is the ``dflash_config`` key the vLLM DFlash2 model
+    reads. That one weights a loss term, so it belongs to the run, not to the
+    checkpoint.
+    """
+
+    conv_kernel_size: int = Field(
+        default=3,
+        description="DFlash2: convolution taps per sublayer. Tap t reaches back t "
+        "draft positions; must not exceed --block-size.",
+    )
+    conv_group_size: int = Field(
+        default=64,
+        description="DFlash2: channels sharing one dynamic convolution coefficient. "
+        "Must divide the draft hidden size.",
+    )
+    selector_rank: int = Field(
+        default=256,
+        description="DFlash2: rank of the candidate selector's predecessor/successor "
+        "codebooks.",
+    )
+    selector_top_k: int = Field(
+        default=16,
+        description="DFlash2: candidates kept per slot at inference. Training scores "
+        "the same K, so this sizes the selector loss, the path walk and the "
+        "diagnostics.",
+    )
+    selector_loss_weight: float = Field(
+        default=1.0,
+        ge=0.0,
+        description="DFlash2: weight of the selector's top-K cross-entropy term, "
+        "added to DFlash's full-vocabulary loss on the unary logits. 0 trains the "
+        "backbone only.",
+    )
+    input_embedding_scale: float = Field(
+        default=1.0,
+        gt=0.0,
+        description="DFlash2: multiplier on the draft's input embeddings.",
+    )
+    output_multiplier: float = Field(
+        default=1.0,
+        gt=0.0,
+        description="DFlash2: multiplier on the draft logits before the selector "
+        "bias is added.",
+    )
+    final_logit_softcapping: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="DFlash2: softcap the multiplied draft logits as "
+        "tanh(x / cap) * cap before the selector bias is added. Leave unset to "
+        "disable; a non-positive cap is rejected rather than silently ignored.",
+    )
+
+
 class DFlyArgs(_Group):
     """DFly-exclusive hidden-state correction settings."""
 
@@ -603,6 +660,7 @@ _GROUPS: dict[str, type[_Group]] = {
     "trainer": TrainerArgs,
     "logging": LoggingArgs,
     "dflash": DFlashArgs,
+    "dflash2": DFlash2Args,
     "dfly": DFlyArgs,
     "domino": DominoArgs,
     "dspark": DSparkArgs,
@@ -689,7 +747,7 @@ class TrainConfig(BaseSettings):
     speculator_type: str = Field(
         default="eagle3",
         description="Type of speculator model to train "
-        "(eagle3, dflash, dfly, domino, dspark, peagle, mtp).",
+        "(eagle3, dflash, dflash2, dfly, domino, dspark, peagle, mtp).",
     )
     dry_run: bool = Field(
         default=False,
@@ -714,6 +772,7 @@ class TrainConfig(BaseSettings):
     trainer: TrainerArgs = Field(default_factory=TrainerArgs)
     logging: LoggingArgs = Field(default_factory=LoggingArgs)
     dflash: DFlashArgs = Field(default_factory=DFlashArgs)
+    dflash2: DFlash2Args = Field(default_factory=DFlash2Args)
     dfly: DFlyArgs = Field(default_factory=DFlyArgs)
     domino: DominoArgs = Field(default_factory=DominoArgs)
     dspark: DSparkArgs = Field(default_factory=DSparkArgs)
@@ -728,7 +787,8 @@ class TrainConfig(BaseSettings):
         else ``False``; unset ``muon_lr`` -> ``10 * lr``; unset ``num_layers`` -> ``5``
         for dflash else ``1``; unset ``per_position_loss_weight`` -> ``dpace`` for
         dflash else ``fixed-exp-decay``; unset ``loss_fn`` -> ``ce`` for dflash else
-        ``kl_div``; unset ``block_size`` -> ``16`` for dflash else ``8``.
+        ``kl_div``; unset ``block_size`` -> ``16`` for dflash else ``8``. ``dflash2``
+        is a DFlash backbone plus two modules, so it takes the same four defaults.
 
         The dflash-conditional defaults reflect the recipe from
         https://github.com/vllm-project/speculators/issues/979: this combination
@@ -747,7 +807,9 @@ class TrainConfig(BaseSettings):
         untouched, so :meth:`from_flat` round-trips.
         """
         is_eagle3 = self.speculator_type == "eagle3"
-        is_dflash = self.speculator_type == "dflash"
+        # dflash2 is a dflash backbone plus the conv and the selector, so the
+        # issue-979 backbone recipe carries over; dspark deliberately does not.
+        is_dflash = self.speculator_type in ("dflash", "dflash2")
         if self.draft.draft_arch is None:
             self.draft.draft_arch = "llama" if is_eagle3 else "qwen3"
         if self.draft.norm_before_fc is None:
