@@ -132,8 +132,11 @@ def populate_successes(output_root: Path) -> tuple[str, str]:
     return sample_hash, generation_hash
 
 
-def test_directory_contains_only_the_two_real_entrypoints():
+def test_directory_contains_only_the_real_entrypoints():
+    # Guards against scratch scripts accumulating here. prepare_fast.sh is the
+    # third: it replaces run_all.sh's prepare stage for the full-size corpus.
     assert {path.name for path in SCRIPT_DIR.iterdir() if path.is_file()} == {
+        "prepare_fast.sh",
         "run_all.sh",
         "script.py",
     }

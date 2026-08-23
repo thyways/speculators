@@ -95,6 +95,11 @@ def _args(tmp_path: Path, target_samples: int) -> argparse.Namespace:
         seq_length=8,
         token_freq_train_ratio=0.67,
         render_endpoint="http://127.0.0.1:8000",
+        # Both are store_true flags, so False is their parser default. Rendering
+        # goes through the endpoint set above, which --local-render is the
+        # alternative to.
+        local_render=False,
+        drop_clipped_rows=False,
         minimum_valid_tokens=None,
         num_preprocessing_workers=1,
         preprocessing_batch_size=2,
