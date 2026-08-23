@@ -332,11 +332,11 @@ def test_load_raw_dataset_local_directory(tmp_path):
 
 @pytest.mark.sanity
 def test_load_raw_dataset_empty_directory_raises(tmp_path):
-    """A directory with no .json/.jsonl files raises an actionable error."""
+    """A directory with no .json/.jsonl/.parquet files raises an actionable error."""
     empty_dir = tmp_path / "empty"
     empty_dir.mkdir()
 
-    with pytest.raises(ValueError, match="No .json/.jsonl files found"):
+    with pytest.raises(ValueError, match=r"No \.json/\.jsonl/\.parquet files found"):
         load_raw_dataset(str(empty_dir))
 
 

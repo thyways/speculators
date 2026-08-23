@@ -41,8 +41,9 @@ def _patch_encode(monkeypatch, renders: dict[tuple[int, bool], list[int]]):
         add_generation_prompt,
         tools=None,
         chat_template_kwargs=None,
+        processor=None,
     ):
-        del render_endpoint, tools, chat_template_kwargs
+        del render_endpoint, tools, chat_template_kwargs, processor
         return renders[(len(conv_prefix), add_generation_prompt)]
 
     monkeypatch.setattr(preprocessing, "_encode_render", fake)
