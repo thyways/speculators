@@ -1,32 +1,4 @@
 #!/usr/bin/env bash
-# DFlash2 on Qwen3.6-35B-A3B, PerfectBlend 500k, online hidden states.
-#
-# Same cluster shape and the same backbone recipe as
-# dflash_qwen3_6_35b_a3b_perfectblend_online_full.sh -- 2 GPUs serving vLLM, 6
-# training, 5 full-attention draft layers, block 16, D-PACE with cross-entropy --
-# so a run of this script is comparable against that one. DFlash2 adds the local
-# convolution and the candidate selector from
-# https://github.com/vllm-project/vllm/pull/52816.
-#
-# Two things differ from the DFlash script, both forced by DFlash2's full-vocabulary
-# requirement (the candidate selector emits the draft head's top-K ids directly as
-# draft tokens, and the inference side applies no d2t remap to them):
-#
-#   * The data directory is re-exposed as a symlink view without d2t.npy / t2d.npy /
-#     token_freq.pt. Those artifacts describe a 32000-entry pruned draft vocabulary
-#     and train.py picks them up ahead of any flag, so with them present a DFlash2
-#     run dies at startup on a draft-vocab mismatch. Without them train.py falls
-#     back to the verifier's full vocabulary, which is what DFlash2 needs -- so this
-#     script passes no --draft-vocab-size at all.
-#   * --max-anchors is halved. The forward holds two
-#     [max_anchors * block_size, vocab_size] tensors at peak (the targets and the
-#     unary logits). At Qwen3.6's 248320-entry vocabulary that is 7.8x wider per
-#     tensor than the DFlash run's pruned 32000, so 1024 anchors would put ~15 GiB
-#     of logit activations on each training GPU. The selector's own tensors are
-#     top-K-wide and cost nothing next to those.
-#
-# See docs/user_guide/algorithms/dflash2.md for the algorithm and for what the
-# serving side still needs.
 
 set -Eeuo pipefail
 
@@ -37,36 +9,22 @@ export REPO="${REPO:-$DEFAULT_REPO}"
 export ROOT="${ROOT:-$(dirname -- "$REPO")}"
 export ENV_REPO="${ENV_REPO:-$ROOT/speculators}"
 
-MODEL="${MODEL:-$ROOT/model_weights/Qwen/Qwen3.6-35B-A3B}"
-DATA_DIR="${DATA_DIR:-$ROOT/datasets/qwen3_6_35b_500k}"
-export RUN_DIR="${RUN_DIR:-$ROOT/model_weights/dflash2_qwen3_6_35b_a3b_5full}"
+MODEL="${MODEL:-$ROOT/model_weights/Qwen--Qwen3.6-35B-A3B}"
+DATA_DIR="${DATA_DIR:-$ROOT/datasets/qwen3.6-35b-a3b/qwen3.6-35b-a3b_train_spec_800k_len4096_fullvocab}"
+export RUN_DIR="${RUN_DIR:-$ROOT/model_weights/dflash2_qwen3_6_35b_a3b_5swa}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-$RUN_DIR/checkpoints}"
-TENSORBOARD_DIR="${TENSORBOARD_DIR:-$RUN_DIR/tensorboard}"
+LOG_DIR="${LOG_DIR:-$RUN_DIR}"
+WANDB_PROJECT="${WANDB_PROJECT:-qwen3.6-35b-a3b-5swa}"
+WANDB_KEY_FILE="${WANDB_KEY_FILE:-$ROOT/.secrets/wandb_key}"
 
-# Full-vocabulary view of DATA_DIR (see the header). Symlinks, so it costs nothing.
 FULL_VOCAB_DATA_DIR="${FULL_VOCAB_DATA_DIR:-$RUN_DIR/data_full_vocab}"
 
-# Anchors per step. The two full-vocabulary logit tensors cost
-#   max_anchors * block_size * vocab_size * 2 bytes * 2
-# which is 2 x 3.8 GiB = 7.6 GiB at 512 anchors, block 16 and vocab 248320. The
-# script prints the figure below before it launches anything. Scale this -- not the
-# hyperparameters -- if you change the verifier or the block size. Backward adds one
-# more tensor that wide (the logit gradient the top-K accumulates into), so budget
-# three. 512 is kept here so this run stays comparable with the earlier DFlash2 runs;
-# the top-K loss left room to raise it, which is the first thing to try if the
-# drafter is starved for anchors.
 MAX_ANCHORS="${MAX_ANCHORS:-512}"
 
-# DFlash2 modules. conv_group_size must divide the draft hidden size (2048 here);
-# selector_top_k is the candidate count the inference path walks, and now also the
-# width of the selector's loss term.
 CONV_KERNEL_SIZE="${CONV_KERNEL_SIZE:-2}"
 CONV_GROUP_SIZE="${CONV_GROUP_SIZE:-16}"
 SELECTOR_RANK="${SELECTOR_RANK:-256}"
 SELECTOR_TOP_K="${SELECTOR_TOP_K:-16}"
-# Weight of the selector's top-K cross-entropy, on top of DFlash's full-vocabulary
-# loss on the unary logits. Those two terms train the two decisions inference makes:
-# which tokens make the candidate set, and which candidate the walk takes.
 SELECTOR_LOSS_WEIGHT="${SELECTOR_LOSS_WEIGHT:-1.0}"
 
 BLOCK_SIZE="${BLOCK_SIZE:-8}"
@@ -85,7 +43,7 @@ LAUNCH_VLLM="${LAUNCH_VLLM:-$REPO/scripts/launch_vllm.py}"
 TRAIN_SCRIPT="${TRAIN_SCRIPT:-$REPO/scripts/train.py}"
 LOCAL_PYTHONPATH="${LOCAL_PYTHONPATH:-$REPO/src:$REPO/hs_connectors/src}"
 
-mkdir -p "$RUN_DIR" "$CHECKPOINT_DIR" "$TENSORBOARD_DIR" "$HIDDEN_STATES_DIR"
+mkdir -p "$RUN_DIR" "$CHECKPOINT_DIR" "$HIDDEN_STATES_DIR"
 
 for executable in "$SPEC_PYTHON" "$TORCHRUN" "$VLLM_PYTHON"; do
     if [[ ! -x "$executable" ]]; then
@@ -94,8 +52,6 @@ for executable in "$SPEC_PYTHON" "$TORCHRUN" "$VLLM_PYTHON"; do
     fi
 done
 
-# Prevent two invocations from writing the same checkpoint directory
-# concurrently. The lock is released automatically when the job exits.
 exec 9>"$RUN_DIR/training.lock"
 if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
     echo "Another cluster job already holds $RUN_DIR/training.lock" >&2
@@ -107,8 +63,17 @@ if [[ ! -f "$MODEL/config.json" ]]; then
     exit 1
 fi
 
-# d2t.npy / t2d.npy / token_freq.pt are deliberately NOT required here: DFlash2
-# trains on the full vocabulary and the symlink view below excludes them.
+if [[ ! -f "$WANDB_KEY_FILE" ]]; then
+    echo "Missing W&B key file: $WANDB_KEY_FILE" >&2
+    exit 1
+fi
+WANDB_API_KEY="$(tr -d '[:space:]' < "$WANDB_KEY_FILE")"
+if [[ -z "$WANDB_API_KEY" ]]; then
+    echo "W&B key file is empty: $WANDB_KEY_FILE" >&2
+    exit 1
+fi
+export WANDB_API_KEY
+
 for path in \
     "$DATA_DIR/state.json" \
     "$DATA_DIR/dataset_info.json"; do
@@ -125,8 +90,6 @@ for command in setsid curl; do
     fi
 done
 
-# Rebuild the full-vocabulary view from scratch each run so a stale d2t.npy left by
-# an earlier experiment can never leak in.
 rm -rf "$FULL_VOCAB_DATA_DIR"
 mkdir -p "$FULL_VOCAB_DATA_DIR"
 shopt -s nullglob
@@ -142,8 +105,6 @@ if [[ ! -f "$FULL_VOCAB_DATA_DIR/state.json" ]]; then
     exit 1
 fi
 
-# Report the vocabulary DFlash2 will actually train on, and the logit footprint it
-# implies, before anything expensive starts.
 VOCAB_SIZE="$("$SPEC_PYTHON" - "$MODEL" <<'PY'
 import json
 import sys
@@ -158,9 +119,6 @@ LOGIT_GIB="$("$SPEC_PYTHON" -c "
 print(round(2 * $MAX_ANCHORS * $BLOCK_SIZE * $VOCAB_SIZE * 2 / 1024 ** 3, 1))
 ")"
 
-# Preserve the GPU allocation supplied by the scheduler. When no allocation
-# variable is present, default to all eight local GPUs. Two GPUs each host one
-# TP=1 vLLM data-parallel replica; the other six train the dense draft model.
 ALLOCATED_GPUS="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 IFS=',' read -r -a GPU_LIST <<< "$ALLOCATED_GPUS"
 if (( ${#GPU_LIST[@]} != 8 )); then
@@ -206,7 +164,7 @@ echo "Repository:     $REPO"
 echo "Model:          $MODEL"
 echo "Data:           $FULL_VOCAB_DATA_DIR (full-vocab view of $DATA_DIR)"
 echo "Checkpoints:    $CHECKPOINT_DIR"
-echo "TensorBoard:    $TENSORBOARD_DIR/$JOB_TAG"
+echo "W&B project:    $WANDB_PROJECT"
 echo "vLLM GPUs:      $VLLM_GPUS"
 echo "Training GPUs:  $TRAIN_GPUS"
 echo "vLLM log:       $VLLM_LOG"
@@ -263,6 +221,7 @@ setsid env \
     CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" \
     PYTHONPATH="$LOCAL_PYTHONPATH" \
     PYTHONUNBUFFERED=1 \
+    WANDB_PROJECT="$WANDB_PROJECT" \
     "$TORCHRUN" \
     --standalone \
     --nproc_per_node 6 \
@@ -297,18 +256,9 @@ setsid env \
     --request-timeout 300 \
     --on-missing generate \
     --on-generate delete \
-    --logger tensorboard \
-    --log-dir "$TENSORBOARD_DIR" \
-    --run-name dflash2_qwen3_6_35b_a3b_5full &
+    --logger wandb \
+    --log-dir "$LOG_DIR" \
+    --run-name dflash2_qwen3_6_35b_a3b_5swa &
 TRAIN_PID=$!
 
-# Keep the cluster job attached to training. Its stdout/stderr is therefore
-# visible in the cluster job log. On completion or cancellation, cleanup stops
-# the full vLLM process group and removes transient hidden-state files.
-#
-# Watch selector_accept_len against unary_accept_len in TensorBoard: the latter is
-# the DFlash baseline computed inside the same run, so their difference is what the
-# candidate selector is earning. candidate_recall bounds it, and is the metric to
-# read first -- it is what the unary_loss term buys, and no selector can beat it.
-# unary_loss and selector_loss are the two terms of the total.
 wait "$TRAIN_PID"

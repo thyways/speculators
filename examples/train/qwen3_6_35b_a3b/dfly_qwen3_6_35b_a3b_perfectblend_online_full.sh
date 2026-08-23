@@ -1,12 +1,4 @@
 #!/usr/bin/env bash
-# Full-data online DFly training for Qwen3.6-35B-A3B on one 8-GPU node.
-# Reuses the Qwen3.6-35B-A3B DFlash target features with five sliding-window
-# draft layers (window 2048, non-causal within blocks),
-# adding DFly per-layer target fusion and previous-token hidden correction.
-# Uses the Muon + cosine recipe (4% linear warmup, then cosine decay).
-# Run this script as the cluster job command; do not wrap it in nohup.
-# The prepared data in DATA_DIR must use this model's tokenizer, and training
-# runs on the full verifier vocabulary (no draft-vocab reduction).
 
 set -Eeuo pipefail
 
@@ -17,20 +9,19 @@ export REPO="${REPO:-$DEFAULT_REPO}"
 export ROOT="${ROOT:-$(dirname -- "$REPO")}"
 export ENV_REPO="${ENV_REPO:-$ROOT/speculators}"
 
-MODEL="${MODEL:-$ROOT/model_weights/Qwen/Qwen3.6-35B-A3B}"
-DATA_DIR="${DATA_DIR:-$ROOT/datasets/qwen3.6-35b-a3b/qwen3.6-35b-a3b_train_spec_260820_800k_len4096_fullvocab}"
-export RUN_DIR="${RUN_DIR:-$ROOT/model_weights/dfly_qwen3_6_35b_a3b_5full}"
+MODEL="${MODEL:-$ROOT/model_weights/Qwen--Qwen3.6-35B-A3B}"
+DATA_DIR="${DATA_DIR:-$ROOT/datasets/qwen3.6-35b-a3b/qwen3.6-35b-a3b_train_spec_800k_len4096_fullvocab}"
+export RUN_DIR="${RUN_DIR:-$ROOT/model_weights/dfly_qwen3_6_35b_a3b_5swa}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-$RUN_DIR/checkpoints}"
 LOG_DIR="${LOG_DIR:-$RUN_DIR}"
-WANDB_PROJECT="${WANDB_PROJECT:-qwen3_6_35b_a3b_spec}"
+WANDB_PROJECT="${WANDB_PROJECT:-qwen3.6-35b-a3b-5swa}"
 WANDB_KEY_FILE="${WANDB_KEY_FILE:-$ROOT/.secrets/wandb_key}"
 
 VLLM_PORT="${VLLM_PORT:-8100}"
 VLLM_ENDPOINT="${VLLM_ENDPOINT:-http://localhost:${VLLM_PORT}/v1}"
 VLLM_HEALTH_ENDPOINT="${VLLM_HEALTH_ENDPOINT:-http://localhost:${VLLM_PORT}/health}"
-# Train all 16 official block positions. Runtime block-4/block-8 benchmarks
-# then use trained prefixes instead of extrapolating an 8-position checkpoint.
-BLOCK_SIZE="${BLOCK_SIZE:-16}"
+BLOCK_SIZE="${BLOCK_SIZE:-8}"
+MAX_ANCHORS="${MAX_ANCHORS:-512}"
 JOB_TAG="${SLURM_JOB_ID:-${JOB_ID:-$$}}"
 HIDDEN_STATES_DIR="${HIDDEN_STATES_DIR:-/tmp/dfly_qwen3_6_35b_a3b_hidden_states}"
 VLLM_LOG="${VLLM_LOG:-$RUN_DIR/vllm_${JOB_TAG}.log}"
@@ -51,8 +42,6 @@ for executable in "$SPEC_PYTHON" "$TORCHRUN" "$VLLM_PYTHON"; do
     fi
 done
 
-# Prevent two invocations from writing the same checkpoint directory
-# concurrently. The lock is released automatically when the job exits.
 exec 9>"$RUN_DIR/training.lock"
 if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
     echo "Another cluster job already holds $RUN_DIR/training.lock" >&2
@@ -64,9 +53,6 @@ if [[ ! -f "$MODEL/config.json" ]]; then
     exit 1
 fi
 
-# Load the W&B key from disk and export it rather than listing it in the `env`
-# invocations below: command-line arguments are visible in `ps` output to every
-# user sharing this node.
 if [[ ! -f "$WANDB_KEY_FILE" ]]; then
     echo "Missing W&B key file: $WANDB_KEY_FILE" >&2
     exit 1
@@ -78,10 +64,6 @@ if [[ -z "$WANDB_API_KEY" ]]; then
 fi
 export WANDB_API_KEY
 
-# Training runs on the full verifier vocabulary, so no vocab-mapping artifacts
-# are required. Do not reinstate the d2t.npy/t2d.npy checks: passing
-# --draft-vocab-size alongside a token_freq.pt would make train.py synthesize a
-# reduced mapping and cache it into DATA_DIR.
 for path in \
     "$DATA_DIR/state.json" \
     "$DATA_DIR/dataset_info.json"; do
@@ -98,9 +80,6 @@ for command in setsid curl; do
     fi
 done
 
-# Preserve the GPU allocation supplied by the scheduler. When no allocation
-# variable is present, default to all eight local GPUs. Two GPUs each host one
-# TP=1 vLLM data-parallel replica; the other six train the dense draft model.
 ALLOCATED_GPUS="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 IFS=',' read -r -a GPU_LIST <<< "$ALLOCATED_GPUS"
 if (( ${#GPU_LIST[@]} != 8 )); then
@@ -223,7 +202,7 @@ setsid env \
     --speculator-type dfly \
     --enable-hidden-correction \
     --block-size "$BLOCK_SIZE" \
-    --max-anchors 512 \
+    --max-anchors "$MAX_ANCHORS" \
     --num-layers 5 \
     --sliding-window 2048 \
     --sliding-window-non-causal \
@@ -238,7 +217,4 @@ setsid env \
     --run-name dfly_5swa2048nc_muon_fullvocab &
 TRAIN_PID=$!
 
-# Keep the cluster job attached to training. Its stdout/stderr is therefore
-# visible in the cluster job log. On completion or cancellation, cleanup stops
-# the full vLLM process group and removes transient hidden-state files.
 wait "$TRAIN_PID"
