@@ -230,7 +230,7 @@ def test_run_training_stops_at_max_steps_across_epochs(tmp_path: Path):
 
     trainer.train_epoch = fake_train_epoch
     trainer.val_epoch = fake_val_epoch
-    trainer.maybe_save_checkpoint = lambda epoch: saved_epochs.append(epoch)
+    trainer.maybe_save_checkpoint = saved_epochs.append
     trainer.maybe_update_best = lambda _epoch, _metrics: None
 
     trainer.run_training()

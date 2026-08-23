@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from speculators.train.optimizers import build_optimizers
+from speculators.train.trainer import TrainerConfig
 
 
 class _ToyLinearModel(nn.Module):
@@ -40,8 +41,6 @@ def test_trainer_config_carries_the_weight_decay_exclusion_flag():
     exists on the CLI but not here reaches the optimizer as its default and
     silently does nothing.
     """
-    from speculators.train.trainer import TrainerConfig
-
     assert "weight_decay_exclude_1d" in TrainerConfig._fields
     config = TrainerConfig(
         lr=6e-4, num_epochs=1, save_path="x", weight_decay_exclude_1d=True

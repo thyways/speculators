@@ -192,10 +192,12 @@ def _adapt_part_for_processor(part: str | dict) -> tuple[dict, str | None]:
         url = str(part["image_url"]["url"])
         if url.startswith("file://"):
             return {"type": "image"}, url.removeprefix("file://")
-    raise _LocalRenderUnsupported(f"content part not renderable in-process: {part}")
+    raise _LocalRenderUnsupportedError(
+        f"content part not renderable in-process: {part}"
+    )
 
 
-class _LocalRenderUnsupported(ValueError):
+class _LocalRenderUnsupportedError(ValueError):
     """The conversation needs a modality the in-process renderer does not cover."""
 
 
@@ -261,7 +263,7 @@ def _encode_render(
     """
     if processor is not None:
         if tools:
-            raise _LocalRenderUnsupported("tools require the render endpoint")
+            raise _LocalRenderUnsupportedError("tools require the render endpoint")
         return _encode_local(
             conv_prefix,
             processor,

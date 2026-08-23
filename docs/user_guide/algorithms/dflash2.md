@@ -40,8 +40,8 @@ loss = dflash_loss(unary, targets) + selector_loss_weight * CE(unary + bias over
 
 The draft head picks the candidate set -- `topK(unary)`, fixed before the selector contributes anything -- and the selector picks one candidate out of that set.
 
-* The first term is DFlash's own full-vocabulary loss on the unary logits. It is what puts the target token in the candidate set at all, which `candidate_recall` measures. Nothing else can: a correction that would only pay off outside the top-K is wasted, because the set is chosen before the bias is added.
-* The second is the cross-entropy of the selector's actual decision -- a categorical over the `top_k` kept candidates whose logits are `unary[c] + bias[prev, c]`, the same expression `_score_edges` and the walk kernel evaluate. Training conditions on the ground-truth predecessor; the walk conditions on its own previous choice, which is what the diagnostics below measure.
+- The first term is DFlash's own full-vocabulary loss on the unary logits. It is what puts the target token in the candidate set at all, which `candidate_recall` measures. Nothing else can: a correction that would only pay off outside the top-K is wasted, because the set is chosen before the bias is added.
+- The second is the cross-entropy of the selector's actual decision -- a categorical over the `top_k` kept candidates whose logits are `unary[c] + bias[prev, c]`, the same expression `_score_edges` and the walk kernel evaluate. Training conditions on the ground-truth predecessor; the walk conditions on its own previous choice, which is what the diagnostics below measure.
 
 Slots whose target the draft head left outside the top-K carry no selector loss. The selector cannot recover a token that is not in the candidate set, so including those slots would only ask the bias to move probability onto a candidate that is wrong whatever it does; widening the set is the first term's job. `candidate_recall` reports how often that happens, and the selector term's denominator counts only the slots that clear the bar, so its scale does not move with recall.
 
@@ -71,16 +71,16 @@ The diagnostics run every step and cannot be turned off -- a selector that is no
 
 ## Key Parameters
 
-| Parameter                   | Default | Description                                                                              |
-| --------------------------- | ------- | ---------------------------------------------------------------------------------------- |
-| `--conv-kernel-size`        | 3       | Convolution taps per sublayer; tap `t` reaches back `t` slots. Must be `<= --block-size` |
-| `--conv-group-size`         | 64      | Channels sharing one dynamic coefficient. Must divide the draft hidden size              |
-| `--selector-rank`           | 256     | Rank of the predecessor/successor codebooks                                              |
+| Parameter                   | Default | Description                                                                                       |
+| --------------------------- | ------- | ------------------------------------------------------------------------------------------------- |
+| `--conv-kernel-size`        | 3       | Convolution taps per sublayer; tap `t` reaches back `t` slots. Must be `<= --block-size`          |
+| `--conv-group-size`         | 64      | Channels sharing one dynamic coefficient. Must divide the draft hidden size                       |
+| `--selector-rank`           | 256     | Rank of the predecessor/successor codebooks                                                       |
 | `--selector-top-k`          | 16      | Candidates kept per slot at inference; sizes the selector loss, the path walk and the diagnostics |
-| `--selector-loss-weight`    | 1.0     | Weight of the selector's top-K cross-entropy term. `0` trains the backbone only          |
-| `--input-embedding-scale`   | 1.0     | Multiplier on the draft's input embeddings                                               |
-| `--output-multiplier`       | 1.0     | Multiplier on the draft logits, before the selector bias                                 |
-| `--final-logit-softcapping` | unset   | Softcap the multiplied logits as `tanh(x / cap) * cap`, before the selector bias         |
+| `--selector-loss-weight`    | 1.0     | Weight of the selector's top-K cross-entropy term. `0` trains the backbone only                   |
+| `--input-embedding-scale`   | 1.0     | Multiplier on the draft's input embeddings                                                        |
+| `--output-multiplier`       | 1.0     | Multiplier on the draft logits, before the selector bias                                          |
+| `--final-logit-softcapping` | unset   | Softcap the multiplied logits as `tanh(x / cap) * cap`, before the selector bias                  |
 
 All DFlash parameters (`--block-size`, `--max-anchors`, `--num-layers`, ...) apply unchanged, and `--speculator-type dflash2` takes DFlash's [RFC #979](https://github.com/vllm-project/speculators/issues/979) defaults: 5 layers, D-PACE with cross-entropy, `block_size=16`.
 

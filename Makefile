@@ -1,4 +1,7 @@
-MDFILES := $(shell find . -name "*.md" -not -path "./.venv/*" -not -path "./build/*" -not -path "./.pytest_cache/*")
+# Excludes any *_venv/ too: a virtualenv created inside the repo ships hundreds of
+# third-party .md files, and mdformat --check fails the gate on those rather than
+# on anything we wrote.
+MDFILES := $(shell find . -name "*.md" -not -path "./.venv/*" -not -path "./*_venv/*" -not -path "./build/*" -not -path "./.pytest_cache/*")
 
 # run checks on all files for the repo
 quality:
