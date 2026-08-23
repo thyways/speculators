@@ -228,3 +228,105 @@ def test_registering_the_factory_twice_installs_it_once():
         assert _SPECULATOR_FACTORIES.count(_make_dflash2_speculator) == 1
     finally:
         _SPECULATOR_FACTORIES[:] = before
+
+
+def test_every_family_plugin_shares_one_config_wrapper():
+    """The whole point of routing DFlash2 through the family module.
+
+    Each plugin's register() is idempotent and order-independent, and the
+    config-layer wrapper it installs has exactly one owner no matter how many
+    plugins vLLM loads or in what order. Two wrappers would still compose, but
+    the marker would no longer tell anyone that, and the sampler slot the family
+    module also owns is a plain assignment that genuinely cannot be shared.
+    """
+    pytest.importorskip("vllm")
+    from vllm.transformers_utils.configs.speculators.algos import (  # noqa: PLC0415
+        SUPPORTED_SPECULATORS_TYPES,
+    )
+    from vllm.transformers_utils.configs.speculators.base import (  # noqa: PLC0415
+        SpeculatorsConfig,
+    )
+
+    from speculators.vllm import dflash2, dfly, domino, peagle  # noqa: PLC0415
+    from speculators.vllm._dflash_family import (  # noqa: PLC0415
+        _CONFIG_PATCH_MARKER,
+    )
+
+    # Deliberately not in entry-point order: vLLM does not promise one.
+    for plugin in (dflash2, peagle, domino, dfly, dflash2):
+        plugin.register()
+
+    # __func__, not the attribute: accessing a classmethod builds a fresh bound
+    # object every time, so identity only means anything on the function beneath.
+    wrapper = SpeculatorsConfig.build_vllm_speculative_config.__func__
+    assert getattr(SpeculatorsConfig, _CONFIG_PATCH_MARKER, False) is True
+
+    for algorithm in ("dflash", "dflash2", "dfly", "domino", "dspark"):
+        assert algorithm in SUPPORTED_SPECULATORS_TYPES, algorithm
+
+    # Re-registering must not stack a second wrapper on top of the first.
+    for plugin in (dfly, dflash2):
+        plugin.register()
+    assert SpeculatorsConfig.build_vllm_speculative_config.__func__ is wrapper
+
+
+def test_a_dflash2_checkpoint_reaches_the_dflash_runtime_end_to_end():
+    """Both halves of the load path, against the real vLLM registry.
+
+    The stubbed tests above pin the DFlash2 half of the translation. This one
+    additionally proves the delegation target composes: DFlash2 hands off to
+    whatever is registered for ``dflash``, which after the family module's
+    install is its repaired updater rather than vLLM's original.
+    """
+    pytest.importorskip("vllm")
+    from vllm.transformers_utils.configs.speculators.algos import (  # noqa: PLC0415
+        SUPPORTED_SPECULATORS_TYPES,
+    )
+    from vllm.transformers_utils.configs.speculators.base import (  # noqa: PLC0415
+        SpeculatorsConfig,
+    )
+
+    from speculators.vllm import dflash2  # noqa: PLC0415
+
+    dflash2.register()
+
+    # Half one: speculators_model_type -> the draft config vLLM builds the model
+    # from. #52816 keys on the architecture below.
+    pre_trained_config: dict[str, Any] = {
+        "hidden_size": 32,
+        "num_hidden_layers": 2,
+        "vocab_size": 64,
+    }
+    SUPPORTED_SPECULATORS_TYPES["dflash2"](
+        {
+            "speculators_model_type": "dflash2",
+            "aux_hidden_state_layer_ids": [2, 7],
+            "mask_token_id": 63,
+            "block_size": 16,
+            "conv_kernel_size": 3,
+            "conv_group_size": 32,
+            "selector_rank": 8,
+            "selector_top_k": 4,
+            "sliding_window_non_causal": True,
+        },
+        pre_trained_config,
+    )
+    assert pre_trained_config["architectures"] == ["DFlash2DraftModel"]
+    draft_config = pre_trained_config["dflash_config"]
+    assert draft_config["conv_kernel_size"] == 3
+    assert draft_config["selector_top_k"] == 4
+    assert draft_config["block_size"] == 16
+    # Set by the family module's helper, reached through the dflash delegation.
+    assert draft_config["causal"] is False
+
+    # Half two: the same speculators_model_type -> the served method, aliased
+    # back onto dflash so #52816's selection sees what it expects.
+    speculative_config = SpeculatorsConfig.build_vllm_speculative_config(
+        {
+            "speculators_model_type": "dflash2",
+            "speculators_config": {"proposal_methods": [{"speculative_tokens": 15}]},
+            "transformer_layer_config": pre_trained_config,
+        }
+    )
+    assert speculative_config["method"] == "dflash"
+    assert speculative_config["num_speculative_tokens"] == 15

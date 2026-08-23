@@ -151,6 +151,9 @@ def test_dspark_intra_block_causality_follows_the_checkpoint(
     expected_causal_by_layer,
 ):
     """The serving mask must match training for both layer types."""
+    # Reads vLLM's own _dflash_layer_causal, so it needs the real package rather
+    # than only the pure translation helpers the rest of this module exercises.
+    pytest.importorskip("vllm")
     translated: dict[str, Any] = {
         "num_hidden_layers": 2,
         "layer_types": ["sliding_attention", "full_attention"],
@@ -196,6 +199,8 @@ def test_intra_block_causality_honours_an_explicit_default():
 
 
 def test_config_patch_repairs_upstream_dflash_all_full_attention():
+    # Patches vLLM's real updater registry, so it needs the package installed.
+    pytest.importorskip("vllm")
     from vllm.transformers_utils.configs.speculators.algos import (  # noqa: PLC0415
         SUPPORTED_SPECULATORS_TYPES,
     )
