@@ -180,6 +180,11 @@ def _cache_draft_logits_kernel(
 class DFlash2Speculator(DFlashSpeculator):
     _speculator_name = "DFlash2"
 
+    # Declared, not defined: the base allocates it. vLLM is untyped here, so
+    # without this the reassignment in _install_draft_logits would be the only
+    # source for the attribute's type and could not be checked against its reads.
+    draft_logits: torch.Tensor | None
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
         draft_config = self.draft_model_config.hf_config.dflash_config
@@ -200,7 +205,10 @@ class DFlash2Speculator(DFlashSpeculator):
         )
         self._install_draft_logits(vllm_config, device)
 
-    def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:
+    def draft_logits_spec(
+        self,
+        vllm_config: VllmConfig,  # noqa: ARG002 -- part of the base hook's signature
+    ) -> tuple[torch.dtype, float]:
         # fp32, not the head dtype. Rounding real selector scores to bf16 moves
         # the argmax of a candidate row 0.81% of the time and reverses the order
         # of 0.68% of candidate pairs, so the walk and the rejection that checks

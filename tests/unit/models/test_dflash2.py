@@ -1,6 +1,7 @@
 """Unit tests for the DFlash2 draft model: config guards, weight contract, forward."""
 
 import copy
+from typing import Any, cast
 
 import pytest
 import torch
@@ -248,7 +249,7 @@ class TestWeightContract:
         with torch.no_grad():
             # Move the new modules off their initialization so a silent re-init shows.
             model.candidate_selector.successor_codebook.normal_(std=0.3)
-            for layer in model.layers:
+            for layer in cast("Any", model.layers):
                 layer.attention_conv.kernel_projection.weight.normal_(std=0.1)
                 layer.mlp_conv.base_kernel.normal_(std=0.1)
         before = {key: value.clone() for key, value in model.state_dict().items()}
@@ -360,6 +361,7 @@ class TestForward:
         blocked = ("predecessor_codebook", "hidden_projection.weight")
         for name in blocked:
             param = dict(model.named_parameters())[f"candidate_selector.{name}"]
+            assert param.grad is not None, name
             assert param.grad.abs().sum() == 0, name
 
         model.zero_grad(set_to_none=True)
@@ -369,6 +371,7 @@ class TestForward:
         loss.backward()
         for name in blocked:
             param = dict(model.named_parameters())[f"candidate_selector.{name}"]
+            assert param.grad is not None, name
             assert param.grad.abs().sum() > 0, name
 
     def test_dpace_weighting_runs(self):

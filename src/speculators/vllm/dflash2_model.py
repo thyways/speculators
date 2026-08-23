@@ -359,9 +359,7 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         with ExitStack() as stack:
             if not hasattr(DFlashQwen3ForCausalLM, "model_cls"):
-                stack.enter_context(
-                    _substituted("DFlashQwen3Model", DFlash2Qwen3Model)
-                )
+                stack.enter_context(_substituted("DFlashQwen3Model", DFlash2Qwen3Model))
             super().__init__(vllm_config=vllm_config, prefix=prefix)
         draft_config = self.config.dflash_config
         self.output_multiplier = float(draft_config.get("output_multiplier", 1.0))
