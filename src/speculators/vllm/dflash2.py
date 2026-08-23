@@ -19,29 +19,39 @@ ported runtime:
   ``VLLM_USE_V2_MODEL_RUNNER=1``; :func:`_check_v2_model_runner` refuses to start
   otherwise rather than report acceptance for a drafter that never ran.
 
-Modeled on ``speculators.vllm.domino`` from the main branch. The config-patch
-helpers here duplicate a subset of that branch's ``_dflash_family`` module; fold
-them together when the two branches meet, so the algorithms cannot clobber each
-other's single patch slot.
+Like its siblings, this plugin registers into
+:mod:`speculators.vllm._dflash_family` and lets that module patch each vLLM slot
+once; see it for why sharing is mandatory rather than tidy. DFlash2 is the one
+family member whose drafting loop is not DSpark's, so instead of an init hook it
+registers a speculator factory.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
-from vllm.logger import init_logger
+from speculators.vllm._dflash_family import (
+    install_config_patches,
+    install_speculator_factory_patches,
+    propagate_intra_block_causality,
+    register_config_updater,
+    register_speculative_method_alias,
+    register_speculator_factory,
+)
 
 # Named into vLLM's logger hierarchy rather than this module's. vLLM configures a
 # handler on the `vllm` logger and leaves the root one bare, so a
 # `speculators.vllm.dflash2` logger writes nowhere -- and this module's one log
 # line is the evidence that a DFlash2 checkpoint really drafted as DFlash2 rather
 # than silently as DFlash1, which a caller reads out of the server log.
-logger = init_logger("vllm.plugins.speculators_dflash2")
+# ``logging.getLogger`` rather than vLLM's ``init_logger``: the name is what puts
+# the record under vLLM's handler, and keeping vLLM out of this module's imports
+# lets the config translation below be unit-tested without vLLM installed.
+logger = logging.getLogger("vllm.plugins.speculators_dflash2")
 
 _DFLASH2_ARCH = "DFlash2DraftModel"
 _MODEL_IMPL = "speculators.vllm.dflash2_model:DFlash2Qwen3ForCausalLM"
-_CONFIG_PATCH_MARKER = "_speculators_dflash2_config_patched"
-_SPECULATOR_PATCH_MARKER = "_speculators_dflash2_speculator_patched"
 
 # Draft-config keys DFlash2 adds on top of DFlash. Every one of them sizes a
 # module or a decision the checkpoint was trained with, so a missing key is an
@@ -58,34 +68,6 @@ _OPTIONAL_KEYS = (
     "output_multiplier",
     "final_logit_softcapping",
 )
-
-
-def _propagate_intra_block_causality(
-    config_dict: dict[str, Any],
-    pre_trained_config: dict[str, Any],
-) -> None:
-    """Match vLLM's per-layer draft mask to the training-time mask.
-
-    Training always makes full-attention draft layers non-causal;
-    ``sliding_window_non_causal`` only controls sliding-window layers. vLLM's
-    ``dflash_config.causal`` is a *global* override, so translating a false flag
-    into ``causal=True`` would turn full-attention layers causal too -- a
-    train/serve mismatch that costs acceptance and raises nothing. Set the
-    override only to force non-causal; otherwise drop it and let vLLM's per-layer
-    fallback decide.
-    """
-    non_causal = config_dict.get("sliding_window_non_causal")
-    if non_causal is None:
-        return
-    if not isinstance(non_causal, bool):
-        raise TypeError("sliding_window_non_causal must be a boolean.")
-
-    dflash_config = dict(pre_trained_config.get("dflash_config") or {})
-    if non_causal:
-        dflash_config["causal"] = False
-    else:
-        dflash_config.pop("causal", None)
-    pre_trained_config["dflash_config"] = dflash_config
 
 
 def _update_dflash2(
@@ -124,41 +106,7 @@ def _update_dflash2(
             "boundary at inference is the query block, 1 + num_speculative_tokens, "
             "which equals block_size only when the anchor is the bonus token."
         )
-    _propagate_intra_block_causality(config_dict, pre_trained_config)
-
-
-def _map_method(speculative_config: dict[str, Any]) -> dict[str, Any]:
-    if speculative_config.get("method") != "dflash2":
-        return speculative_config
-    speculative_config = dict(speculative_config)
-    speculative_config["method"] = "dflash"
-    return speculative_config
-
-
-def _install_config_patches() -> None:
-    from vllm.transformers_utils.configs.speculators.algos import (  # noqa: PLC0415
-        SUPPORTED_SPECULATORS_TYPES,
-    )
-    from vllm.transformers_utils.configs.speculators.base import (  # noqa: PLC0415
-        SpeculatorsConfig,
-    )
-
-    SUPPORTED_SPECULATORS_TYPES.setdefault("dflash2", _update_dflash2)
-
-    if getattr(SpeculatorsConfig, _CONFIG_PATCH_MARKER, False):
-        return
-
-    original = SpeculatorsConfig.build_vllm_speculative_config.__func__
-
-    @classmethod  # type: ignore[misc]
-    def build_vllm_speculative_config(
-        cls: type,
-        config_dict: dict[str, Any],
-    ) -> dict[str, Any]:
-        return _map_method(original(cls, config_dict))
-
-    SpeculatorsConfig.build_vllm_speculative_config = build_vllm_speculative_config
-    setattr(SpeculatorsConfig, _CONFIG_PATCH_MARKER, True)
+    propagate_intra_block_causality(config_dict, pre_trained_config)
 
 
 def _is_dflash2_draft(speculative_config: Any) -> bool:
@@ -202,43 +150,32 @@ def _check_v2_model_runner(vllm_config: Any) -> None:
         )
 
 
-def _install_speculator_patches() -> None:
-    """Route a DFlash2 draft to the ported speculator."""
-    from vllm.v1.worker.gpu import (
-        model_runner,  # noqa: PLC0415
-        spec_decode,  # noqa: PLC0415
+def _make_dflash2_speculator(vllm_config: Any, device: Any) -> Any | None:
+    """Build the ported DFlash2 speculator, or decline a draft we do not own."""
+    speculative_config = vllm_config.speculative_config
+    if not _is_dflash2_draft(speculative_config):
+        return None
+
+    from speculators.vllm.dflash2_speculator import (  # noqa: PLC0415
+        DFlash2Speculator,
     )
 
-    if getattr(spec_decode.init_speculator, _SPECULATOR_PATCH_MARKER, False):
-        return
-
-    original = spec_decode.init_speculator
-
-    def init_speculator(vllm_config: Any, device: Any) -> Any:
-        speculative_config = vllm_config.speculative_config
-        if _is_dflash2_draft(speculative_config):
-            from speculators.vllm.dflash2_speculator import (  # noqa: PLC0415
-                DFlash2Speculator,
-            )
-
-            _check_v2_model_runner(vllm_config)
-            _check_block_size(speculative_config)
-            return DFlash2Speculator(vllm_config, device)
-        return original(vllm_config, device)
-
-    setattr(init_speculator, _SPECULATOR_PATCH_MARKER, True)
-    spec_decode.init_speculator = init_speculator
-    # model_runner binds the name at import time, so the module attribute there
-    # is a second, independent reference that has to be replaced as well.
-    model_runner.init_speculator = init_speculator
+    _check_v2_model_runner(vllm_config)
+    _check_block_size(speculative_config)
+    return DFlash2Speculator(vllm_config, device)
 
 
 def register() -> None:
     """vLLM general-plugin entry point."""
     from vllm import ModelRegistry  # noqa: PLC0415
 
-    _install_config_patches()
+    register_config_updater("dflash2", _update_dflash2)
+    # base.py derives speculative_config.method from speculators_model_type,
+    # while #52816 selects DFlash2 on method == "dflash" plus the architecture.
+    register_speculative_method_alias("dflash2", "dflash")
+    register_speculator_factory(_make_dflash2_speculator)
+    install_config_patches()
     if _DFLASH2_ARCH not in ModelRegistry.get_supported_archs():
         ModelRegistry.register_model(_DFLASH2_ARCH, _MODEL_IMPL)
-    _install_speculator_patches()
+    install_speculator_factory_patches()
     logger.info("Registered Speculators DFlash2 support for vLLM.")

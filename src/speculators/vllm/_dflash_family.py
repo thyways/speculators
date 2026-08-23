@@ -17,8 +17,11 @@ Algorithms therefore register into this module and let it patch vLLM once:
 * :func:`register_speculative_method_alias` -- route ``method`` to a runtime.
 * :func:`register_init_hook` -- adjust a constructed speculator in place.
 * :func:`register_speculative_config_updater` -- finalize the vLLM proposal config.
-* :func:`install_config_patches` / :func:`install_speculator_patches` --
-  idempotent, safe to call from every plugin's ``register()``.
+* :func:`register_speculator_factory` -- supply a speculator of one's own for an
+  algorithm whose drafting loop is not DSpark's.
+* :func:`install_config_patches` / :func:`install_speculator_patches` /
+  :func:`install_speculator_factory_patches` -- idempotent, safe to call from
+  every plugin's ``register()``.
 
 The shared sampler supports three composable per-step corrections, discovered
 by duck typing so a model only implements what it needs:
@@ -53,11 +56,15 @@ DSPARK_COMPAT_ARCH = "Qwen3DSparkModel"
 
 _CONFIG_PATCH_MARKER = "_speculators_family_config_patched"
 _SPECULATOR_PATCH_MARKER = "_speculators_family_speculator_patched"
+_SPECULATOR_FACTORY_PATCH_MARKER = "_speculators_family_speculator_factory_patched"
 
 # method name in a checkpoint -> the vLLM runtime that can execute it
 _METHOD_ALIASES: dict[str, str] = {}
 # hooks run after DSparkSpeculator.__init__, in registration order
 _INIT_HOOKS: list[Callable[[Any, torch.device], None]] = []
+# factories offered each draft before vLLM builds its own speculator, in
+# registration order; the first to claim the draft wins
+_SPECULATOR_FACTORIES: list[Callable[[Any, torch.device], Any | None]] = []
 # algorithm name -> final mutation of vLLM's speculative-config dictionary
 _SPECULATIVE_CONFIG_UPDATERS: dict[
     str,
@@ -78,6 +85,21 @@ def register_init_hook(hook: Callable[[Any, torch.device], None]) -> None:
     """
     if hook not in _INIT_HOOKS:
         _INIT_HOOKS.append(hook)
+
+
+def register_speculator_factory(
+    factory: Callable[[Any, torch.device], Any | None],
+) -> None:
+    """Register a speculator that stands in for vLLM's on the drafts it claims.
+
+    Where :func:`register_init_hook` adjusts a constructed ``DSparkSpeculator``,
+    a factory returns a speculator object of its own -- for an algorithm whose
+    drafting loop is not DSpark's sequential one at all. It is handed the
+    ``vllm_config`` and the device, and must return ``None`` for every draft it
+    does not own, since each factory is offered every draft.
+    """
+    if factory not in _SPECULATOR_FACTORIES:
+        _SPECULATOR_FACTORIES.append(factory)
 
 
 def register_speculative_config_updater(
@@ -404,3 +426,35 @@ def install_speculator_patches() -> None:
         sample_sequential_block
     )
     setattr(DSparkSpeculator, _SPECULATOR_PATCH_MARKER, True)
+
+
+def install_speculator_factory_patches() -> None:
+    """Wrap the V2 runner's ``init_speculator`` once, for every factory.
+
+    Deliberately apart from :func:`install_speculator_patches`: only the plugins
+    that register a factory reach into ``vllm.v1.worker.gpu``, so the
+    sequential-sampler algorithms never take a dependency on that layout. Like
+    the other installers this is idempotent, so every such plugin may call it.
+    """
+    from vllm.v1.worker.gpu import (  # noqa: PLC0415
+        model_runner,
+        spec_decode,
+    )
+
+    if getattr(spec_decode.init_speculator, _SPECULATOR_FACTORY_PATCH_MARKER, False):
+        return
+
+    original = spec_decode.init_speculator
+
+    def init_speculator(vllm_config: Any, device: torch.device) -> Any:
+        for factory in _SPECULATOR_FACTORIES:
+            speculator = factory(vllm_config, device)
+            if speculator is not None:
+                return speculator
+        return original(vllm_config, device)
+
+    setattr(init_speculator, _SPECULATOR_FACTORY_PATCH_MARKER, True)
+    spec_decode.init_speculator = init_speculator
+    # model_runner binds the name at import time, so the module attribute there
+    # is a second, independent reference that has to be replaced as well.
+    model_runner.init_speculator = init_speculator
