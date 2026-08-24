@@ -32,7 +32,7 @@ if [[ -z "${GEN_KWARGS+x}" ]]; then
 fi
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-OUTPUT_ROOT="${OUTPUT_ROOT:-$WORKSPACE/evaluation_results/dflash_qwen3_6_35b_a3b_5full_ckpt0_spec${NUM_SPECULATIVE_TOKENS}_8gpu_${TIMESTAMP}}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$WORKSPACE/evaluation_results/dflash_qwen3_6_35b_a3b_5full_ckpt0_spec${NUM_SPECULATIVE_TOKENS}_8gpu}"
 
 IFS=',' read -r -a GPU_ARRAY <<< "$GPU_IDS"
 WORKLOADS=(

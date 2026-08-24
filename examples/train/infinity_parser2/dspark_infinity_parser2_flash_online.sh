@@ -21,12 +21,12 @@ FETCH_THREADS="${FETCH_THREADS:-4}"
 # fast and let --max-retries retry instead of holding the step for minutes.
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-120}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-$ROOT/model_weights/dspark_infinity_parser2_2b_v1_12}"
-# Sub-epoch checkpointing: 0.1 saves ten times per epoch.
-CHECKPOINT_FREQ="${CHECKPOINT_FREQ:-0.1}"
-TENSORBOARD_DIR="$RUN_DIR/tensorboard"
+LOG_DIR="${LOG_DIR:-$RUN_DIR}"
+WANDB_PROJECT="${WANDB_PROJECT:-infinity-parser2-flash}"
+WANDB_MODE="${WANDB_MODE:-online}"
+WANDB_KEY_FILE="${WANDB_KEY_FILE:-$ROOT/.secrets/wandb_key}"
 MEDIA_ROOT="/inspire/sfs/project/inf-multimodal/public"
 VLLM_PORT="${VLLM_PORT:-8200}"
-DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-32000}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 MARKOV_RANK="${MARKOV_RANK:-256}"
 MARKOV_HEAD_TYPE="${MARKOV_HEAD_TYPE:-vanilla}"
@@ -42,7 +42,7 @@ SPEC_PYTHON="$REPO/speculators_venv/bin/python"
 TORCHRUN="$REPO/speculators_venv/bin/torchrun"
 VLLM_PYTHON="$REPO/vllm_venv/bin/python"
 
-mkdir -p "$RUN_DIR" "$CHECKPOINT_DIR" "$TENSORBOARD_DIR"
+mkdir -p "$RUN_DIR" "$CHECKPOINT_DIR"
 
 for executable in "$SPEC_PYTHON" "$TORCHRUN" "$VLLM_PYTHON"; do
     if [[ ! -x "$executable" ]]; then
@@ -56,12 +56,21 @@ if [[ ! -f "$MODEL/config.json" ]]; then
     exit 1
 fi
 
+if [[ ! -f "$WANDB_KEY_FILE" ]]; then
+    echo "Missing W&B key file: $WANDB_KEY_FILE" >&2
+    exit 1
+fi
+WANDB_API_KEY="$(tr -d '[:space:]' < "$WANDB_KEY_FILE")"
+if [[ -z "$WANDB_API_KEY" ]]; then
+    echo "W&B key file is empty: $WANDB_KEY_FILE" >&2
+    exit 1
+fi
+export WANDB_API_KEY
+
 for path in \
     "$DATA_DIR/state.json" \
     "$DATA_DIR/dataset_info.json" \
-    "$DATA_DIR/token_freq.pt" \
-    "$DATA_DIR/d2t.npy" \
-    "$DATA_DIR/t2d.npy"; do
+    "$DATA_DIR/token_freq.pt"; do
     if [[ ! -f "$path" ]]; then
         echo "Missing prepared-data artifact: $path" >&2
         exit 1
@@ -205,6 +214,8 @@ done
 setsid env \
     CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" \
     PYTHONUNBUFFERED=1 \
+    WANDB_PROJECT="$WANDB_PROJECT" \
+    WANDB_MODE="$WANDB_MODE" \
     "$TORCHRUN" \
     --standalone \
     --nproc_per_node "$TRAIN_GPU_COUNT" \
@@ -216,9 +227,6 @@ setsid env \
     --draft-arch qwen3 \
     --draft-hidden-act silu \
     --num-layers 5 \
-    --draft-vocab-size "$DRAFT_VOCAB_SIZE" \
-    --d2t-path "$DATA_DIR/d2t.npy" \
-    --t2d-path "$DATA_DIR/t2d.npy" \
     --mask-token-id 248077 \
     --block-size "$BLOCK_SIZE" \
     --sample-from-anchor \
@@ -241,7 +249,7 @@ setsid env \
     --scheduler-type cosine \
     --scheduler-warmup-ratio 0.04 \
     --epochs 3 \
-    --checkpoint-freq "$CHECKPOINT_FREQ" \
+    --checkpoint-freq 0.1 \
     --total-seq-len 16384 \
     --train-data-ratio 0.99 \
     --noise-std 0 \
@@ -258,8 +266,8 @@ setsid env \
     --max-retries 5 \
     --fail-on-hidden-state-error \
     --seed 42 \
-    --logger tensorboard \
-    --log-dir "$TENSORBOARD_DIR" \
+    --logger wandb \
+    --log-dir "$LOG_DIR" \
     --run-name "$JOB_TAG" &
 TRAIN_PID=$!
 

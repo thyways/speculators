@@ -9,39 +9,69 @@ PYTHON_BIN="${PARSER2_PYTHON_BIN:-${REPO_ROOT}/speculators_venv/bin/python}"
 VLLM_BIN="${PARSER2_VLLM_BIN:-${REPO_ROOT}/vllm_venv/bin/vllm}"
 PIPELINE="${SCRIPT_DIR}/script.py"
 PREPARE_SCRIPT="${REPO_ROOT}/scripts/infinity_parser2_prepare_data.py"
-VOCAB_SCRIPT="${REPO_ROOT}/scripts/build_vocab_mapping.py"
+PREPARE_FAST_SCRIPT="${SCRIPT_DIR}/prepare_fast.sh"
 
-SOURCE_JSONL="${PARSER2_SOURCE_JSONL:-/home/ma-user/work/data_mllm/new_datasets/swift_merged_datasets/version_v1.12/train_v1.12.jsonl}"
+SOURCE_JSONL="${PARSER2_SOURCE_JSONL:-/home/ma-user/work/data_mllm/new_datasets/swift_merged_datasets/version_v2.1/train_v2.1.jsonl}"
+# Only tags the stable record ids ("<version>:<line index>"), so it has to track
+# SOURCE_JSONL or ids from two corpora become indistinguishable.
+SOURCE_VERSION="${PARSER2_SOURCE_VERSION:-v2.1}"
 MEDIA_ROOT="${PARSER2_MEDIA_ROOT:-/inspire/sfs/project/inf-multimodal/public}"
-MODEL="${PARSER2_MODEL:-/home/ma-user/work/data_mllm/publish_models/Infinity-Parser2-2B-2604}"
-OUTPUT_ROOT="${PARSER2_REGEN_ROOT:-/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/infinity_parser2_v1_12_regen_1p5m}"
-FINAL_DIR="${PARSER2_FINAL_DIR:-/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/infinity_parser2_v1_12_target_answers}"
-PREPARED_ROOT="${PARSER2_PREPARED_ROOT:-/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/infinity_parser2_v1_12_dflash_data}"
+MODEL="${PARSER2_MODEL:-/home/ma-user/work/data_mllm/publish_models/Infinity-Parser2.1-Flash-2608}"
+# Everything this pipeline produces lives under one directory:
+#   regen/          sample database, generations, teacher logs
+#   target_answers/ the regenerated answers as jsonl
+#   dflash_data/    the prepared dataset the training recipes point at
+DATA_ROOT="${PARSER2_DATA_ROOT:-/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/infinity_parsers2_v2_1}"
+OUTPUT_ROOT="${PARSER2_REGEN_ROOT:-${DATA_ROOT}/regen}"
+FINAL_DIR="${PARSER2_FINAL_DIR:-${DATA_ROOT}/target_answers}"
+PREPARED_ROOT="${PARSER2_PREPARED_ROOT:-${DATA_ROOT}/dflash_data}"
 
-POPULATION_SIZE="${PARSER2_POPULATION_SIZE:-5275950}"
-FULL_SIZE="${PARSER2_FULL_SIZE:-800000}"
+# script.py hard-checks this against the source's real line count and aborts on a
+# mismatch, so it must be the exact `wc -l` of SOURCE_JSONL: 5795953 for v2.1
+# (v1.12 measured 5275950).
+POPULATION_SIZE="${PARSER2_POPULATION_SIZE:-5795953}"
+FULL_SIZE="${PARSER2_FULL_SIZE:-1500000}"
 # 0 = no intermediate pilot stage; sample straight to FULL_SIZE rows.
 PILOT_SIZE="${PARSER2_PILOT_SIZE:-0}"
 RESERVE_SIZE="${PARSER2_RESERVE_SIZE:-20000}"
 SEED="${PARSER2_SEED:-42}"
 CONVERT_WORKERS="${PARSER2_CONVERT_WORKERS:-64}"
-# Cap on generated tokens; 0 would let the teacher run to its context limit,
-# which lets greedy repetition loops hold a scheduler slot for over an hour.
-# 16384 is well past the longest answer observed in a 13k-record sample (13443
-# tokens), so it only ever truncates degenerate output.
+# Cap on generated tokens. Never set this to 0: the teacher would run to its
+# context limit and greedy repetition loops would hold a scheduler slot for
+# hours. It has to stay at or below SEQ_LENGTH too, because prepare drops any row
+# whose rendered ids exceed that -- generating past it buys nothing. Measured at
+# 32768 the degenerate tail ate most of the token budget: record throughput fell
+# 34.3 -> 28.8/s while token throughput held at 34.8k/s, with the finish_reason
+# error rate climbing past 4%. The longest real answer in a 13k-record sample was
+# 13443 tokens, so 16384 only ever truncates output that prepare would discard.
 MAX_TOKENS="${PARSER2_MAX_TOKENS:-16384}"
-# Deeper than TEACHER_MAX_NUM_SEQS on purpose: the engine batch must stay full
-# while the client parses a response and queues the next turn.
-CONCURRENCY="${PARSER2_CONCURRENCY_PER_ENDPOINT:-128}"
+# Half of TEACHER_MAX_NUM_SEQS, so the engine batch runs at most half full. That
+# is deliberate: it caps how much work a degenerate sequence can hold hostage.
+# Raise it towards TEACHER_MAX_NUM_SEQS to trade that back for throughput -- at
+# 128 the batch stayed pinned at 64 running with KV at only 20%.
+CONCURRENCY="${PARSER2_CONCURRENCY_PER_ENDPOINT:-32}"
 REQUEST_TIMEOUT="${PARSER2_REQUEST_TIMEOUT:-3600}"
-SEQ_LENGTH="${PARSER2_SEQ_LENGTH:-20480}"
+# Must match --total-seq-len in the training script: that is the per-rank token
+# budget the packing sampler works with, so a longer row can never be packed.
+# 16384 is what examples/train/infinity_parser2/dspark_infinity_parser2_flash_online.sh
+# uses. In fast mode rows above it are dropped outright, not truncated.
+SEQ_LENGTH="${PARSER2_SEQ_LENGTH:-16384}"
+# The render path is bound by the endpoint, so extra clients only queue; fast
+# renders in-process, where the work is pure CPU and scales with cores.
 PREPROCESSING_WORKERS="${PARSER2_PREPROCESSING_WORKERS:-16}"
+FAST_PREPROCESSING_WORKERS="${PARSER2_FAST_PREPROCESSING_WORKERS:-64}"
 PREPROCESSING_BATCH_SIZE="${PARSER2_PREPROCESSING_BATCH_SIZE:-64}"
 MINIMUM_VALID_TOKENS="${PARSER2_MINIMUM_VALID_TOKENS:-1}"
-DRAFT_VOCAB_SIZE="${PARSER2_DRAFT_VOCAB_SIZE:-32000}"
+# No draft vocab mapping: this pipeline trains the draft on the verifier's full
+# vocab, so d2t/t2d are unnecessary (identity no-ops the framework ignores).
+# prepare no longer builds them; leave --draft-vocab-size off the training side.
 TRAIN_DATA_RATIO="${PARSER2_TRAIN_DATA_RATIO:-0.99}"
 SMOKE_TRAIN_DATA_RATIO="${PARSER2_SMOKE_TRAIN_DATA_RATIO:-0.90}"
 PREPARE_ONLY="${PARSER2_PREPARE_ONLY:-0}"
+# fast delegates to prepare_fast.sh, which tokenizes in-process and needs no
+# server at all; render drives a vLLM /render endpoint. At this corpus size the
+# endpoint is days of work for identical ids -- see prepare_fast.sh's header.
+PREPARE_MODE="${PARSER2_PREPARE_MODE:-fast}"
 
 export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
@@ -50,7 +80,7 @@ export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 TEACHER_GPU_IDS="${PARSER2_TEACHER_GPU_IDS:-0,1,2,3,4,5,6,7}"
 TEACHER_BASE_PORT="${PARSER2_TEACHER_BASE_PORT:-8000}"
 TEACHER_HOST="${PARSER2_TEACHER_HOST:-127.0.0.1}"
-TEACHER_MAX_MODEL_LEN="${PARSER2_TEACHER_MAX_MODEL_LEN:-262144}"
+TEACHER_MAX_MODEL_LEN="${PARSER2_TEACHER_MAX_MODEL_LEN:-65536}"
 TEACHER_MAX_NUM_SEQS="${PARSER2_TEACHER_MAX_NUM_SEQS:-64}"
 TEACHER_MAX_IMAGES="${PARSER2_TEACHER_MAX_IMAGES:-16}"
 TEACHER_START_TIMEOUT="${PARSER2_TEACHER_START_TIMEOUT:-1800}"
@@ -67,13 +97,22 @@ Usage: $(basename "$0") sample|generate|smoke|pilot|full|status [stage]
   sample    Build the deterministic sample database.
   generate  Regenerate one stage only, without the dflash preparation
             (default stage: full).
-  smoke     Regenerate and prepare 100 rows.
-  pilot     Regenerate and prepare the pilot; needs PARSER2_PILOT_SIZE > 0.
-  full      Regenerate and prepare the ${FULL_SIZE}-row dataset.
+  smoke     Sample, regenerate and prepare 100 rows.
+  pilot     Sample, regenerate and prepare the pilot; needs
+            PARSER2_PILOT_SIZE > 0.
+  full      Sample, regenerate and prepare the ${FULL_SIZE}-row dataset.
+            This is the one-shot entry point: teachers come up, generation
+            resumes where it left off, they shut down, then prepare runs.
   status    Show local progress (default stage: full).
+
+Model:   ${MODEL}
+Source:  ${SOURCE_JSONL}
+Prepare: ${PREPARE_MODE}
 
 Set PARSER2_ENDPOINTS to comma-separated external endpoints to skip local
 teacher startup. Set PARSER2_PREPARE_ONLY=1 to use completed generations only.
+Set PARSER2_PREPARE_MODE=render to prepare through a vLLM /render endpoint
+instead of tokenizing in-process.
 EOF
 }
 
@@ -145,7 +184,7 @@ sample_data() {
         --reserve-size "$RESERVE_SIZE"
         --seed "$SEED"
         --convert-workers "$CONVERT_WORKERS"
-        --source-version v1.12
+        --source-version "$SOURCE_VERSION"
         --allowed-media-root "$MEDIA_ROOT"
         --path-map "/home/ma-user/work/=${MEDIA_ROOT}/"
     )
@@ -282,30 +321,73 @@ generate_stage() {
     "${args[@]}"
 }
 
+stage_token_freq_ratio() {
+    case "$1" in
+        smoke) printf '%s\n' "$SMOKE_TRAIN_DATA_RATIO" ;;
+        pilot)
+            (( PILOT_SIZE > 0 )) || die "stage pilot needs PARSER2_PILOT_SIZE > 0"
+            printf '%s\n' "$TRAIN_DATA_RATIO"
+            ;;
+        full) printf '%s\n' "$TRAIN_DATA_RATIO" ;;
+        *) die "unknown stage: $1" ;;
+    esac
+}
+
+# The target answers that actually made it into the prepared dataset, as jsonl.
+# Both prepare paths end here so their artifact sets stay identical.
+export_selected() {
+    local stage="$1"
+    local final_path="${FINAL_DIR}/${stage}.jsonl"
+
+    "$PYTHON_BIN" "$PIPELINE" export \
+        --output-root "$OUTPUT_ROOT" \
+        --stage "$stage" \
+        --output "$final_path" \
+        --selection-manifest "${PREPARED_ROOT}/${stage}/ranked_selection.json" \
+        --report "${final_path%.jsonl}.export.json"
+}
+
+# prepare_fast.sh reads the same PARSER2_* names, so pass every shared setting
+# explicitly: the two entry points must never disagree on model, paths or
+# seq length. Anything it owns alone (target margin, GPU hold) it reads from the
+# inherited environment.
+prepare_stage_fast() {
+    local stage="$1"
+    local token_freq_ratio
+
+    [[ -f "$PREPARE_FAST_SCRIPT" ]] || die "missing script: $PREPARE_FAST_SCRIPT"
+    token_freq_ratio="$(stage_token_freq_ratio "$stage")"
+    mkdir -p "$FINAL_DIR" "$PREPARED_ROOT"
+
+    PARSER2_PYTHON_BIN="$PYTHON_BIN" \
+    PARSER2_MODEL="$MODEL" \
+    PARSER2_REGEN_ROOT="$OUTPUT_ROOT" \
+    PARSER2_FINAL_DIR="$FINAL_DIR" \
+    PARSER2_PREPARED_ROOT="$PREPARED_ROOT" \
+    PARSER2_STAGE="$stage" \
+    PARSER2_SEQ_LENGTH="$SEQ_LENGTH" \
+    PARSER2_TRAIN_DATA_RATIO="$token_freq_ratio" \
+    PARSER2_MINIMUM_VALID_TOKENS="$MINIMUM_VALID_TOKENS" \
+    PARSER2_PREPROCESSING_WORKERS="$FAST_PREPROCESSING_WORKERS" \
+    PARSER2_PREPROCESSING_BATCH_SIZE="$PREPROCESSING_BATCH_SIZE" \
+        bash "$PREPARE_FAST_SCRIPT"
+
+    export_selected "$stage"
+}
+
 prepare_stage() {
     local stage="$1"
     local target_records
     local token_freq_ratio
     local pool_path="${FINAL_DIR}/${stage}.pool.jsonl"
-    local final_path="${FINAL_DIR}/${stage}.jsonl"
     local prepared_dir="${PREPARED_ROOT}/${stage}"
     local -a prepare_args
 
+    token_freq_ratio="$(stage_token_freq_ratio "$stage")"
     case "$stage" in
-        smoke)
-            target_records=100
-            token_freq_ratio="$SMOKE_TRAIN_DATA_RATIO"
-            ;;
-        pilot)
-            (( PILOT_SIZE > 0 )) || die "stage pilot needs PARSER2_PILOT_SIZE > 0"
-            target_records="$PILOT_SIZE"
-            token_freq_ratio="$TRAIN_DATA_RATIO"
-            ;;
-        full)
-            target_records="$FULL_SIZE"
-            token_freq_ratio="$TRAIN_DATA_RATIO"
-            ;;
-        *) die "unknown stage: $stage" ;;
+        smoke) target_records=100 ;;
+        pilot) target_records="$PILOT_SIZE" ;;
+        full) target_records="$FULL_SIZE" ;;
     esac
 
     mkdir -p "$FINAL_DIR" "$PREPARED_ROOT"
@@ -333,23 +415,14 @@ prepare_stage() {
         prepare_args+=(--overwrite)
     "${prepare_args[@]}"
 
-    "$PYTHON_BIN" "$VOCAB_SCRIPT" \
-        --token-freq-path "${prepared_dir}/token_freq.pt" \
-        --draft-vocab-size "$DRAFT_VOCAB_SIZE" \
-        --target-model-path "$MODEL" \
-        --output-path "$prepared_dir"
-
-    "$PYTHON_BIN" "$PIPELINE" export \
-        --output-root "$OUTPUT_ROOT" \
-        --stage "$stage" \
-        --output "$final_path" \
-        --selection-manifest "${prepared_dir}/ranked_selection.json" \
-        --report "${final_path%.jsonl}.export.json"
+    export_selected "$stage"
 }
 
 require_executable "$PYTHON_BIN"
 [[ "$PREPARE_ONLY" == "0" || "$PREPARE_ONLY" == "1" ]] || \
     die "PARSER2_PREPARE_ONLY must be 0 or 1"
+[[ "$PREPARE_MODE" == "fast" || "$PREPARE_MODE" == "render" ]] || \
+    die "PARSER2_PREPARE_MODE must be fast or render"
 
 action="${1:-}"
 case "$action" in
@@ -394,13 +467,20 @@ case "$action" in
         "$PYTHON_BIN" "$PIPELINE" status \
             --output-root "$OUTPUT_ROOT" \
             --stage "$action"
-        if (( ${#ENDPOINTS[@]} == 0 )); then
-            # Completed generations still need one target-model server for /render.
-            resolve_endpoints 1
+        if [[ "$PREPARE_MODE" == "fast" ]]; then
+            # Fast prepare needs no server, and it wants every GPU for its hold
+            # script, so the teachers have to be gone before it starts.
+            stop_teachers
+            prepare_stage_fast "$action"
+        else
+            if (( ${#ENDPOINTS[@]} == 0 )); then
+                # Completed generations still need one target-model server for /render.
+                resolve_endpoints 1
+            fi
+            retain_first_local_teacher
+            RENDER_ENDPOINT="$(render_endpoint_from_chat_endpoint "${ENDPOINTS[0]}")"
+            prepare_stage "$action"
         fi
-        retain_first_local_teacher
-        RENDER_ENDPOINT="$(render_endpoint_from_chat_endpoint "${ENDPOINTS[0]}")"
-        prepare_stage "$action"
         ;;
     *)
         usage >&2

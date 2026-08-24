@@ -21,12 +21,14 @@ readonly REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 PYTHON_BIN="${PARSER2_PYTHON_BIN:-${REPO_ROOT}/speculators_venv/bin/python}"
 PIPELINE="${SCRIPT_DIR}/script.py"
 PREPARE_SCRIPT="${REPO_ROOT}/scripts/infinity_parser2_prepare_data.py"
-VOCAB_SCRIPT="${REPO_ROOT}/scripts/build_vocab_mapping.py"
 
-MODEL="${PARSER2_MODEL:-/home/ma-user/work/data_mllm/publish_models/Infinity-Parser2-2B-2604}"
-OUTPUT_ROOT="${PARSER2_REGEN_ROOT:-/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/infinity_parser2_v1_12_regen_1p5m}"
-FINAL_DIR="${PARSER2_FINAL_DIR:-/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/infinity_parser2_v1_12_target_answers}"
-PREPARED_ROOT="${PARSER2_PREPARED_ROOT:-/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/infinity_parser2_v1_12_dflash_data}"
+# Keep these in step with run_all.sh: it invokes this script with the same names
+# set explicitly, so a stale default here only ever bites a standalone run.
+MODEL="${PARSER2_MODEL:-/home/ma-user/work/data_mllm/publish_models/Infinity-Parser2.1-Flash-2608}"
+DATA_ROOT="${PARSER2_DATA_ROOT:-/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/infinity_parsers2_v2_1}"
+OUTPUT_ROOT="${PARSER2_REGEN_ROOT:-${DATA_ROOT}/regen}"
+FINAL_DIR="${PARSER2_FINAL_DIR:-${DATA_ROOT}/target_answers}"
+PREPARED_ROOT="${PARSER2_PREPARED_ROOT:-${DATA_ROOT}/dflash_data}"
 
 STAGE="${PARSER2_STAGE:-full}"
 # Must match --total-seq-len in the training script: that is the per-rank token
@@ -34,7 +36,6 @@ STAGE="${PARSER2_STAGE:-full}"
 SEQ_LENGTH="${PARSER2_SEQ_LENGTH:-16384}"
 TOKEN_FREQ_RATIO="${PARSER2_TRAIN_DATA_RATIO:-0.99}"
 MINIMUM_VALID_TOKENS="${PARSER2_MINIMUM_VALID_TOKENS:-1}"
-DRAFT_VOCAB_SIZE="${PARSER2_DRAFT_VOCAB_SIZE:-32000}"
 # One render costs ~90 ms of single-core CPU, so workers scale with cores. Keep
 # each worker single-threaded: the image processor otherwise opens a thread pool
 # per worker and the oversubscription cost this many processes is severe.
@@ -83,7 +84,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM HUP
 
 [[ -x "$PYTHON_BIN" ]] || die "missing executable: $PYTHON_BIN"
-for script in "$PIPELINE" "$PREPARE_SCRIPT" "$VOCAB_SCRIPT"; do
+for script in "$PIPELINE" "$PREPARE_SCRIPT"; do
     [[ -f "$script" ]] || die "missing script: $script"
 done
 mkdir -p "$FINAL_DIR" "$PREPARED_ROOT" "$LOG_DIR"
@@ -175,19 +176,13 @@ prepare_dataset() {
     "${args[@]}"
 }
 
-build_vocab() {
-    echo "Building draft vocab mapping"
-    "$PYTHON_BIN" "$VOCAB_SCRIPT" \
-        --token-freq-path "${PREPARED_DIR}/token_freq.pt" \
-        --draft-vocab-size "$DRAFT_VOCAB_SIZE" \
-        --target-model-path "$MODEL" \
-        --output-path "$PREPARED_DIR"
-}
-
 verify_artifacts() {
     local missing=0
     local artifact
-    for artifact in state.json dataset_info.json token_freq.pt d2t.npy t2d.npy; do
+    # Full-vocab draft (draft_vocab_size == verifier vocab): the training
+    # framework sets use_draft_vocab=False and never touches d2t/t2d, so this
+    # stage no longer builds them. See speculators/model.py:_init_vocab.
+    for artifact in state.json dataset_info.json token_freq.pt; do
         if [[ -f "${PREPARED_DIR}/${artifact}" ]]; then
             echo "  ok      ${artifact}"
         else
@@ -209,5 +204,4 @@ echo "Stage ${STAGE}: ${successes} successful records, using target ${target}"
 export_pool "$target"
 hold_all_gpus
 prepare_dataset "$target"
-build_vocab
 verify_artifacts

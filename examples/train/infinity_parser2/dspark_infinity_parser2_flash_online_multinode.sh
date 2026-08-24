@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# Online DFlash training for Infinity-Parser2-Flash on the prepared 800k corpus.
+# 多机（SII 平台）在线 DSpark 训练：Infinity-Parser2-Flash，800k 语料。
+#
+# 架构：co-located。每个节点各自起本地 vLLM（前 VLLM_GPU_COUNT 张卡）写本机
+# /tmp 的 hidden states，本机训练进程（其余卡）经 127.0.0.1 拉取；跨机只有训练
+# 梯度 all-reduce。平台在每个节点各执行一次本脚本，并注入 PET_NNODES /
+# PET_NODE_RANK / MASTER_ADDR / MASTER_PORT / NCCL_SOCKET_IFNAME。
+# 不设这些变量时（PET_NNODES 缺省为 1）自动退化为单机，行为与原脚本一致。
 
 set -Eeuo pipefail
 
@@ -7,17 +13,53 @@ ROOT="/inspire/sfs/project/inf-multimodal/public/wumengke"
 REPO="$ROOT/speculators"
 MODEL="/home/ma-user/work/data_mllm/publish_models/Infinity-Parser2-2B-2604"
 DATA_DIR="$ROOT/datasets/infinity_parser2_v1_12_dflash_data/full"
-RUN_DIR="$REPO/output/dflash_infinity_parser2_flash_online_800k"
-CHECKPOINT_DIR="$RUN_DIR/checkpoints"
+RUN_DIR="${RUN_DIR:-$REPO/output/dspark_infinity_parser2_flash_online_full}"
+NUM_WORKERS="${NUM_WORKERS:-16}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-3}"
+# Threads per worker fetching one batch's hidden states concurrently. A batch
+# packed from short samples holds ~20 of them (seq_len p50 is 801 against a
+# 16384-token budget) and each costs a blocking request, so serial fetching
+# makes the step wait on the sum of those latencies. In-flight requests total
+# NUM_WORKERS * FETCH_THREADS, spread over the vLLM data-parallel ranks.
+FETCH_THREADS="${FETCH_THREADS:-4}"
+# Per-request timeout. The tail matters more than the ceiling: a stuck request
+# blocks its rank and every peer then waits at the gradient all-reduce, so fail
+# fast and let --max-retries retry instead of holding the step for minutes.
+REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-120}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-$ROOT/model_weights/dspark_infinity_parser2_2b_v1_12}"
 LOG_DIR="${LOG_DIR:-$RUN_DIR}"
 WANDB_PROJECT="${WANDB_PROJECT:-infinity-parser2-flash}"
 WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_KEY_FILE="${WANDB_KEY_FILE:-$ROOT/.secrets/wandb_key}"
 MEDIA_ROOT="/inspire/sfs/project/inf-multimodal/public"
-VLLM_PORT="${VLLM_PORT:-8100}"
+VLLM_PORT="${VLLM_PORT:-8200}"
+BLOCK_SIZE="${BLOCK_SIZE:-16}"
+MARKOV_RANK="${MARKOV_RANK:-256}"
+MARKOV_HEAD_TYPE="${MARKOV_HEAD_TYPE:-vanilla}"
+CONFIDENCE_HEAD_ALPHA="${CONFIDENCE_HEAD_ALPHA:-1.0}"
+DEFAULT_LOSS_FN='{"ce": 0.1, "tv": 0.9}'
+LOSS_FN="${LOSS_FN:-$DEFAULT_LOSS_FN}"
+TARGET_LAYER_IDS=(2 7 12 17 22)
 JOB_TAG="${SLURM_JOB_ID:-${JOB_ID:-$$}}"
 HIDDEN_STATES_DIR=""
-VLLM_LOG="$RUN_DIR/vllm_${JOB_TAG}.log"
+
+# ---- 多机拓扑（平台注入 PET_*/MASTER_*）----
+NNODES="${PET_NNODES:-1}"
+NODE_RANK="${PET_NODE_RANK:-0}"
+if (( NNODES > 1 )); then
+    # 多机时 MASTER_ADDR/MASTER_PORT 必须由平台提供，缺失则直接失败而不是静默单机
+    : "${MASTER_ADDR:?多机运行需要平台注入 MASTER_ADDR}"
+    : "${MASTER_PORT:?多机运行需要平台注入 MASTER_PORT}"
+fi
+MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+MASTER_PORT="${MASTER_PORT:-29500}"
+# 跨机 NCCL/GLOO 走平台指定的 IB/RoCE 网卡；平台通常只注入 NCCL_SOCKET_IFNAME，
+# torchrun 的 rendezvous(TCPStore/gloo) 需要同名 GLOO_SOCKET_IFNAME。
+if [[ -n "${NCCL_SOCKET_IFNAME:-}" && -z "${GLOO_SOCKET_IFNAME:-}" ]]; then
+    export GLOO_SOCKET_IFNAME="$NCCL_SOCKET_IFNAME"
+fi
+
+VLLM_LOG="$RUN_DIR/vllm_${JOB_TAG}_node${NODE_RANK}.log"
 
 SPEC_PYTHON="$REPO/speculators_venv/bin/python"
 TORCHRUN="$REPO/speculators_venv/bin/torchrun"
@@ -71,12 +113,23 @@ if (( ${#GPU_LIST[@]} != 8 )); then
     echo "Expected exactly 8 GPUs, got: $ALLOCATED_GPUS" >&2
     exit 1
 fi
-VLLM_GPUS=$(IFS=,; printf '%s' "${GPU_LIST[*]:0:4}")
-TRAIN_GPUS=$(IFS=,; printf '%s' "${GPU_LIST[*]:4:4}")
+# Online training fetches every hidden state from the vLLM side, so the split
+# between generation and training GPUs is the main throughput knob. VLLM_GPU_COUNT
+# takes the leading GPUs; the rest train. Note that changing the training count
+# also changes the data-parallel degree, and therefore the tokens per step.
+VLLM_GPU_COUNT="${VLLM_GPU_COUNT:-4}"
+if (( VLLM_GPU_COUNT < 1 || VLLM_GPU_COUNT > ${#GPU_LIST[@]} - 1 )); then
+    echo "VLLM_GPU_COUNT must be between 1 and $(( ${#GPU_LIST[@]} - 1 ))" >&2
+    exit 1
+fi
+TRAIN_GPU_COUNT=$(( ${#GPU_LIST[@]} - VLLM_GPU_COUNT ))
+VLLM_GPUS=$(IFS=,; printf '%s' "${GPU_LIST[*]:0:VLLM_GPU_COUNT}")
+TRAIN_GPUS=$(IFS=,; printf '%s' "${GPU_LIST[*]:VLLM_GPU_COUNT:TRAIN_GPU_COUNT}")
 
-exec 9>"$RUN_DIR/training.lock"
+# 每个节点各自加自己的锁：防同一节点重复起同一 job，但不误伤同 job 的其它节点。
+exec 9>"$RUN_DIR/training.lock.node${NODE_RANK}"
 if ! flock -n 9; then
-    echo "Another job is using $RUN_DIR" >&2
+    echo "Another job is using $RUN_DIR on node $NODE_RANK" >&2
     exit 1
 fi
 
@@ -119,7 +172,7 @@ cleanup() {
     [[ -n "$TRAIN_PID" ]] && wait "$TRAIN_PID" 2>/dev/null || true
     [[ -n "$VLLM_PID" ]] && wait "$VLLM_PID" 2>/dev/null || true
     case "$HIDDEN_STATES_DIR" in
-        */parser2_flash_*) rm -rf -- "$HIDDEN_STATES_DIR" ;;
+        */dspark_parser2_flash_*) rm -rf -- "$HIDDEN_STATES_DIR" ;;
     esac
     exit "$status"
 }
@@ -127,7 +180,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
 
-HIDDEN_STATES_DIR="$(mktemp -d "${TMPDIR:-/tmp}/parser2_flash_${JOB_TAG}.XXXXXX")"
+HIDDEN_STATES_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dspark_parser2_flash_${JOB_TAG}.XXXXXX")"
 
 "$SPEC_PYTHON" - "$VLLM_PORT" <<'PY'
 import socket
@@ -140,22 +193,29 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         raise SystemExit(f"Port {port} is already in use")
 PY
 
+echo "Node:          $NODE_RANK / $NNODES  (master $MASTER_ADDR:$MASTER_PORT)"
+echo "Global train:  $(( NNODES * TRAIN_GPU_COUNT )) procs"
 echo "Model:         $MODEL"
 echo "Data:          $DATA_DIR"
 echo "Checkpoints:   $CHECKPOINT_DIR"
 echo "vLLM GPUs:     $VLLM_GPUS"
 echo "Training GPUs: $TRAIN_GPUS"
+echo "Block size:    $BLOCK_SIZE"
+echo "Markov head:   $MARKOV_HEAD_TYPE (rank $MARKOV_RANK)"
+echo "DSpark loss:   $LOSS_FN"
+echo "Fetch:         $NUM_WORKERS workers x $FETCH_THREADS threads, timeout ${REQUEST_TIMEOUT}s"
 
 setsid env \
     CUDA_VISIBLE_DEVICES="$VLLM_GPUS" \
     PYTHONUNBUFFERED=1 \
     "$VLLM_PYTHON" "$REPO/scripts/launch_vllm.py" "$MODEL" \
-    --target-layer-ids 2 7 12 17 22 \
+    --target-layer-ids "${TARGET_LAYER_IDS[@]}" \
     --hidden-states-path "$HIDDEN_STATES_DIR" \
     --tensor-parallel-size 1 \
-    --data-parallel-size 4 \
+    --data-parallel-size "$VLLM_GPU_COUNT" \
     --gpu-memory-utilization 0.9 \
-    --max_model_len 131072 \
+    --max_model_len 65536 \
+    --api-server-count 8 \
     --served-model-name "$MODEL" \
     --allowed-local-media-path "$MEDIA_ROOT" \
     --limit-mm-per-prompt '{"image":16}' \
@@ -183,50 +243,60 @@ setsid env \
     WANDB_PROJECT="$WANDB_PROJECT" \
     WANDB_MODE="$WANDB_MODE" \
     "$TORCHRUN" \
-    --standalone \
-    --nproc_per_node 4 \
+    --nnodes "$NNODES" \
+    --node_rank "$NODE_RANK" \
+    --nproc_per_node "$TRAIN_GPU_COUNT" \
+    --master_addr "$MASTER_ADDR" \
+    --master_port "$MASTER_PORT" \
     "$REPO/scripts/train.py" \
     --verifier-name-or-path "$MODEL" \
     --data-path "$DATA_DIR" \
     --save-path "$CHECKPOINT_DIR" \
-    --speculator-type dflash \
+    --speculator-type dspark \
     --draft-arch qwen3 \
     --draft-hidden-act silu \
     --num-layers 5 \
     --mask-token-id 248077 \
-    --block-size 16 \
+    --block-size "$BLOCK_SIZE" \
+    --sample-from-anchor \
     --max-anchors 3072 \
-    --target-layer-ids 2 7 12 17 22 \
+    --target-layer-ids "${TARGET_LAYER_IDS[@]}" \
     --draft-mrope-full-head-hack \
     --sliding-window 2048 \
     --sliding-window-non-causal \
     --draft-attn-impl simple_flex_attention \
-    --no-sample-from-anchor \
-    --loss-fn kl_div \
+    --markov-rank "$MARKOV_RANK" \
+    --markov-head-type "$MARKOV_HEAD_TYPE" \
+    --enable-confidence-head \
+    --confidence-head-with-markov \
+    --confidence-head-alpha "$CONFIDENCE_HEAD_ALPHA" \
+    --loss-fn "$LOSS_FN" \
     --dflash-decay-gamma 4.0 \
-    --optimizer adamw \
+    --optimizer muon \
+    --muon-lr 2e-4 \
     --lr 1e-4 \
-    --weight-decay 0.01 \
     --scheduler-type cosine \
     --scheduler-warmup-ratio 0.04 \
-    --epochs 2 \
-    --total-seq-len 8192 \
+    --epochs 3 \
+    --checkpoint-freq 0.1 \
+    --total-seq-len 16384 \
     --train-data-ratio 0.99 \
     --noise-std 0 \
     --hidden-states-dtype bfloat16 \
-    --prefetch-factor 2 \
+    --num-workers "$NUM_WORKERS" \
+    --prefetch-factor "$PREFETCH_FACTOR" \
+    --fetch-threads "$FETCH_THREADS" \
     --hidden-states-backend file \
     --hidden-states-path "$HIDDEN_STATES_DIR" \
     --vllm-endpoint "http://127.0.0.1:${VLLM_PORT}/v1" \
     --on-missing generate \
     --on-generate delete \
-    --request-timeout 600 \
+    --request-timeout "$REQUEST_TIMEOUT" \
     --max-retries 5 \
     --fail-on-hidden-state-error \
     --seed 42 \
     --logger wandb \
     --log-dir "$LOG_DIR" \
-    --checkpoint-freq 0.1 \
     --run-name "$JOB_TAG" &
 TRAIN_PID=$!
 

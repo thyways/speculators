@@ -15,6 +15,7 @@ export RUN_DIR="${RUN_DIR:-$ROOT/model_weights/domino_qwen3_6_35b_a3b_5swa}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-$RUN_DIR/checkpoints}"
 LOG_DIR="${LOG_DIR:-$RUN_DIR}"
 WANDB_PROJECT="${WANDB_PROJECT:-qwen3.6-35b-a3b-5swa}"
+WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_KEY_FILE="${WANDB_KEY_FILE:-$ROOT/.secrets/wandb_key}"
 
 VLLM_PORT="${VLLM_PORT:-8300}"
@@ -194,6 +195,7 @@ setsid env \
     PYTHONPATH="$LOCAL_PYTHONPATH" \
     PYTHONUNBUFFERED=1 \
     WANDB_PROJECT="$WANDB_PROJECT" \
+    WANDB_MODE="$WANDB_MODE" \
     "$TORCHRUN" \
     --standalone \
     --nproc_per_node 6 \
@@ -201,7 +203,7 @@ setsid env \
     --verifier-name-or-path "$MODEL" \
     --data-path "$DATA_DIR" \
     --save-path "$CHECKPOINT_DIR" \
-    --epochs 1 \
+    --epochs 3 \
     --train-data-ratio 0.98 \
     --optimizer muon \
     --muon-lr 2e-4 \

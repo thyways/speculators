@@ -15,6 +15,7 @@ export RUN_DIR="${RUN_DIR:-$ROOT/model_weights/peagle_qwen3_6_35b_a3b_5swa}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-$RUN_DIR/checkpoints}"
 LOG_DIR="${LOG_DIR:-$RUN_DIR}"
 WANDB_PROJECT="${WANDB_PROJECT:-qwen3.6-35b-a3b-5swa}"
+WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_KEY_FILE="${WANDB_KEY_FILE:-$ROOT/.secrets/wandb_key}"
 
 VLLM_PORT="${VLLM_PORT:-8100}"
@@ -188,6 +189,7 @@ setsid env \
     PYTHONPATH="$LOCAL_PYTHONPATH" \
     PYTHONUNBUFFERED=1 \
     WANDB_PROJECT="$WANDB_PROJECT" \
+    WANDB_MODE="$WANDB_MODE" \
     "$TORCHRUN" \
     --standalone \
     --nproc_per_node 6 \
@@ -222,6 +224,7 @@ setsid env \
     --on-generate delete \
     --logger wandb \
     --log-dir "$LOG_DIR" \
+    --checkpoint-freq 0.1 \
     --run-name peagle_5swa2048nc_muon_fullvocab &
 TRAIN_PID=$!
 
