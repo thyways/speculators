@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 import zlib
 from dataclasses import dataclass
@@ -128,13 +129,16 @@ class MooncakeHiddenStatesStore:
             ) from e
 
         store = MooncakeDistributedStore()
+        device_name = self.config.device_name or os.environ.get(
+            "MOONCAKE_DEVICE_NAME", ""
+        )
         result = store.setup(
             self.config.local_hostname,
             self.config.metadata_server,
             self.config.global_segment_size,
             self.config.local_buffer_size,
             self.config.protocol,
-            self.config.device_name,
+            device_name,
             self.config.master_server_address,
         )
         _check_store_result("setup", self.config.local_hostname, result)
