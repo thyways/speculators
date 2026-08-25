@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# Online DFlash training for Infinity-Parser2-Flash on the prepared 800k corpus.
+# Online DFlash training for Infinity-Parser2.1-Flash on the prepared v2.1 corpus
+# (1443776 records -> 1803882 assistant-turn rows, full verifier vocab).
+# --total-seq-len must stay >= the prepare --seq-length (16384): the packing
+# sampler cannot batch a row longer than its budget.
 
 set -Eeuo pipefail
 
 ROOT="/inspire/sfs/project/inf-multimodal/public/wumengke"
 REPO="$ROOT/speculators"
-MODEL="/home/ma-user/work/data_mllm/publish_models/Infinity-Parser2-2B-2604"
-DATA_DIR="$ROOT/datasets/infinity_parser2_v1_12_dflash_data/full"
+MODEL="/home/ma-user/work/data_mllm/publish_models/Infinity-Parser2.1-Flash-2608"
+DATA_DIR="$ROOT/datasets/infinity_parsers2_v2_1/dflash_data/full"
 RUN_DIR="$REPO/output/dflash_infinity_parser2_flash_online_800k"
 CHECKPOINT_DIR="$RUN_DIR/checkpoints"
 LOG_DIR="${LOG_DIR:-$RUN_DIR}"
@@ -210,7 +213,7 @@ setsid env \
     --scheduler-type cosine \
     --scheduler-warmup-ratio 0.04 \
     --epochs 2 \
-    --total-seq-len 8192 \
+    --total-seq-len 16384 \
     --train-data-ratio 0.99 \
     --noise-std 0 \
     --hidden-states-dtype bfloat16 \
