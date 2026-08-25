@@ -233,6 +233,15 @@ class DataArgs(_Group):
         "a batch of N samples otherwise waits on the sum of N latencies and one slow "
         "sample stalls the rank. Default 1 (serial).",
     )
+    dataloader_in_order: bool = Field(
+        default=True,
+        description="Deliver batches in sampler order. Online generation makes "
+        "per-batch latency heavy-tailed, and in-order delivery holds every finished "
+        "batch behind the one slow worker ahead of it, which then stalls all peers at "
+        "the gradient all-reduce. '--no-dataloader-in-order' hands over whichever "
+        "batch is ready first. Requires --num-workers > 0; the batches seen in an "
+        "epoch are unchanged, only their order.",
+    )
     max_anchors: int = Field(
         default=512,
         description="Maximum anchor positions for DFlash, DSpark, and P-EAGLE training "
@@ -299,6 +308,16 @@ class GenerationArgs(_Group):
             "Abort training when online hidden-state generation fails or returns "
             "token IDs that differ from the prepared sample."
         ),
+    )
+    vllm_http_keepalive: bool = Field(
+        default=True,
+        description="Reuse HTTP connections to the vLLM endpoint. A kept-alive "
+        "connection stays bound to whichever API-server process accepted it, and "
+        "each of those runs multimodal preprocessing on a single thread, so sticky "
+        "connections pin a rank to a fixed slice of the CPU pool however many API "
+        "servers are running. '--no-vllm-http-keepalive' reconnects per request so "
+        "the kernel spreads them across all of them; only worth it against a "
+        "multi-process (--api-server-count > 1) endpoint.",
     )
 
 

@@ -71,6 +71,7 @@ def _setup_dataloader(
     num_target_layers: int = 3,
     prefetch_factor: int | None = 4,
     preprocess: Callable[[BatchType], BatchType] | None = None,
+    in_order: bool = True,
 ) -> DataLoader:
     batch_sampler = MultipackDistributedBatchSamplerV2(
         batch_max_length=total_seq_len,
@@ -79,6 +80,11 @@ def _setup_dataloader(
         rank=get_dp_rank(),
     )
     use_workers = num_workers > 0
+    if not in_order and not use_workers:
+        # Ordering is a property of the multi-worker result queue; with a single
+        # process there is nothing to reorder, so silently ignoring the flag would
+        # hide a misconfigured run behind unchanged (slow) behaviour.
+        raise ValueError("in_order=False requires num_workers > 0")
     worker_dataset = _make_worker_dataset(dataset) if use_workers else dataset
     return DataLoader(
         worker_dataset,
@@ -96,6 +102,14 @@ def _setup_dataloader(
         persistent_workers=use_workers,
         multiprocessing_context="spawn" if use_workers else None,
         worker_init_fn=_worker_init_fn if use_workers else None,
+        # Online hidden-state fetches are heavy-tailed, so the strict round-robin
+        # of in-order delivery makes the rank wait on worker i even when workers
+        # i+1.. already hold finished batches -- and every peer rank then waits on
+        # this one at the all-reduce. Out-of-order delivery lets the prefetch queue
+        # absorb the tail instead of serialising on it. The epoch still covers the
+        # same batches; only mid-epoch resume degrades, since its fast-skip slices
+        # the sampler by count and no longer names the exact batches consumed.
+        in_order=in_order or not use_workers,
     )
 
 
@@ -120,6 +134,8 @@ def create_train_val_loaders(
     train_data_ratio: float = 0.9,
     fail_on_hidden_state_error: bool = False,
     fetch_threads: int = 1,
+    dataloader_in_order: bool = True,
+    vllm_http_keepalive: bool = True,
 ) -> tuple[DataLoader, DataLoader]:
     """Create training and validation DataLoaders.
 
@@ -149,6 +165,7 @@ def create_train_val_loaders(
         max_retries=max_retries,
         fail_on_hidden_state_error=fail_on_hidden_state_error,
         fetch_threads=fetch_threads,
+        http_keepalive=vllm_http_keepalive,
     )
     val_dataset: BaseDataset = ArrowDataset(
         datapath=data_path,
@@ -165,6 +182,7 @@ def create_train_val_loaders(
         max_retries=max_retries,
         fail_on_hidden_state_error=fail_on_hidden_state_error,
         fetch_threads=fetch_threads,
+        http_keepalive=vllm_http_keepalive,
     )
 
     train_loader = _setup_dataloader(
@@ -175,7 +193,10 @@ def create_train_val_loaders(
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
         preprocess=preprocess,
+        in_order=dataloader_in_order,
     )
+    # Validation reduces a mean over the whole split, so its batch order is
+    # irrelevant too and it sees the same heavy-tailed fetch latency.
     val_loader = _setup_dataloader(
         val_dataset,
         total_seq_len,
@@ -184,6 +205,7 @@ def create_train_val_loaders(
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
         preprocess=preprocess,
+        in_order=dataloader_in_order,
     )
 
     return train_loader, val_loader

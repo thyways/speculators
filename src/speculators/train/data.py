@@ -5,6 +5,7 @@ from os import PathLike
 from pathlib import Path
 from typing import Any, Literal, cast
 
+import httpx
 import openai
 import torch
 from datasets import load_from_disk
@@ -209,6 +210,7 @@ class ArrowDataset(BaseDataset):
         max_retries: int = DEFAULT_MAX_RETRIES,
         fail_on_hidden_state_error: bool = False,
         fetch_threads: int = 1,
+        http_keepalive: bool = True,
     ):
         self.data = load_from_disk(datapath)
         if not 0.0 < train_ratio <= 1.0:
@@ -239,9 +241,17 @@ class ArrowDataset(BaseDataset):
         self.request_timeout = request_timeout
         self.max_retries = max_retries
         self.fail_on_hidden_state_error = fail_on_hidden_state_error
+        self.http_keepalive = http_keepalive
 
         # Delay super init so that `_compute_approx_lengths` has required data
         super().__init__(max_len, transform, hidden_states_dtype, fetch_threads)
+
+    def __getstate__(self) -> dict[str, Any]:
+        # An openai/httpx client owns sockets that cannot cross the spawn boundary
+        # into a DataLoader worker; each worker builds its own in `_prepare_fetch`.
+        state = super().__getstate__()
+        state["client"] = None
+        return state
 
     def _map_to_file_idx(self, index: int):
         return index + self.start_file_idx
@@ -257,8 +267,21 @@ class ArrowDataset(BaseDataset):
             self._setup_client()
 
     def _setup_client(self):
+        http_client = None
+        if not self.http_keepalive:
+            # vLLM hands every connection to one of its --api-server-count frontend
+            # processes and keeps it there, and each of those runs the multimodal
+            # processor on a single thread (vllm/renderers/base.py builds
+            # ``_mm_executor`` with max_workers=1). A pooled connection therefore
+            # pins this worker's requests to one CPU slot no matter how wide the
+            # frontend is; retiring the connection after each response sends the
+            # next request through a fresh accept() and spreads the load.
+            http_client = httpx.Client(limits=httpx.Limits(max_keepalive_connections=0))
         self.client = openai.OpenAI(
-            base_url=self.vllm_endpoint, api_key="EMPTY", max_retries=0
+            base_url=self.vllm_endpoint,
+            api_key="EMPTY",
+            max_retries=0,
+            http_client=http_client,
         )
         list_models = self.client.models.list()
         model_id = list_models.data[0].id

@@ -675,6 +675,8 @@ def main(cfg: TrainConfig):  # noqa: C901
         train_data_ratio=args.train_data_ratio,
         fail_on_hidden_state_error=args.fail_on_hidden_state_error,
         fetch_threads=args.fetch_threads,
+        dataloader_in_order=args.dataloader_in_order,
+        vllm_http_keepalive=args.vllm_http_keepalive,
     )
 
     # Get trainer kwargs from model class

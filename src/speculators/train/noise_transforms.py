@@ -7,6 +7,8 @@ class TransformTensors:
         self.std = std
 
     def __call__(self, data):
+        if self.std == 0:
+            return data
         for tensor in self.tensors:
             data[tensor] = self.transform(data[tensor])
         return data
