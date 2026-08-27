@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 import torch
 
+from speculators.losses import eager
 from speculators.models.mtp import shift_batch_mtp
 from speculators.models.mtp.core import compute_step_weights
 from tests.conftest import requires_cuda, requires_transformers_version
@@ -78,7 +79,7 @@ PEAGLE_SPEC = ModelSpec(
     forward_kwargs={
         "num_depths": 4,
         "down_sample_ratio": 0.7,
-        "down_sample_ratio_min": 0.2,
+        "down_sample_ratio_min": 0.0,
     },
 )
 MTP_SPEC = ModelSpec(
@@ -453,6 +454,85 @@ class TestPEagleParams:
 
         assert loss.isfinite()
         loss.backward()
+
+    def test_sequence_partitioning_matches_full_loss_and_gradients(self):
+        model = make_peagle_model(
+            draft_attn_impl="eager",
+            dtype=torch.float32,
+            torch_compile=False,
+        )
+        samples = [
+            make_sample(
+                seq_len=32,
+                hidden_size=HIDDEN_SIZE,
+                vocab_size=VOCAB_SIZE,
+                dtype=torch.float32,
+            )
+        ]
+        batch = make_batch(
+            max_len=32,
+            samples=samples,
+            hidden_size=HIDDEN_SIZE,
+            dtype=torch.float32,
+        )
+        loss_config = {"kl_div": (eager.kl_div_loss, 1.0)}
+        call_kwargs = {
+            "num_depths": 4,
+            "down_sample_ratio": 0.8,
+            "loss_config": loss_config,
+        }
+
+        torch.manual_seed(123)
+        _, full_loss, full_metrics = model(**batch, **call_kwargs)
+        full_loss.backward()
+        full_gradients = {
+            name: parameter.grad.detach().clone()
+            for name, parameter in model.named_parameters()
+            if parameter.grad is not None
+        }
+        model.zero_grad(set_to_none=True)
+
+        torch.manual_seed(123)
+        partitions = model.prepare_partitioned_forward(
+            input_ids=batch["input_ids"],
+            document_ids=batch["document_ids"],
+            loss_mask=batch["loss_mask"],
+            num_depths=4,
+            down_sample_ratio=0.8,
+            sequence_partitions=3,
+        )
+        assert partitions is not None
+        partitioned_loss = torch.zeros((), device="cuda")
+        partitioned_metrics: dict[str, torch.Tensor] = {}
+        for partition_kwargs in partitions:
+            _, segment_loss, segment_metrics = model(
+                **batch,
+                **call_kwargs,
+                **partition_kwargs,
+            )
+            segment_loss.backward()
+            partitioned_loss += segment_loss.detach()
+            for key, value in segment_metrics.items():
+                previous = partitioned_metrics.get(key)
+                partitioned_metrics[key] = (
+                    value if previous is None else previous + value
+                )
+
+        torch.testing.assert_close(partitioned_loss, full_loss.detach())
+        for key, value in full_metrics.items():
+            torch.testing.assert_close(partitioned_metrics[key], value)
+        for name, parameter in model.named_parameters():
+            if name not in full_gradients:
+                assert parameter.grad is None
+                continue
+            assert parameter.grad is not None
+            torch.testing.assert_close(
+                parameter.grad,
+                full_gradients[name],
+                atol=1e-4,
+                rtol=1e-4,
+                msg=name,
+            )
 
     @pytest.mark.parametrize("draft_attn_impl", ["sdpa", "eager"])
     @pytest.mark.parametrize("seq_lengths", SAMPLE_CONFIGS)

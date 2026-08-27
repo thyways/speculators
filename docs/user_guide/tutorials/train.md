@@ -321,7 +321,11 @@ CUDA_VISIBLE_DEVICES=2,3 torchrun --standalone --nproc_per_node 2 \
   --total-seq-len 8192 \
   --speculator-type peagle \
   --num-layers 4 \
-  --num-depths 4 \
+  --num-depths 8 \
+  --down-sample-ratio 0.8 \
+  --sequence-partitions 4 \
+  --embed-requires-grad \
+  --target-layer-ids 2 18 35 \
   --no-norm-before-residual \
   --scheduler-type cosine \
   --lr 6e-4 \
@@ -452,7 +456,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node 4 \
   --total-seq-len 8192 \
   --speculator-type peagle \
   --num-layers 4 \
-  --num-depths 4 \
+  --num-depths 8 \
+  --down-sample-ratio 0.8 \
+  --sequence-partitions 4 \
+  --embed-requires-grad \
+  --target-layer-ids 2 18 35 \
   --no-norm-before-residual \
   --scheduler-type cosine \
   --lr 6e-4 \
@@ -580,7 +588,11 @@ CUDA_VISIBLE_DEVICES=2,3 torchrun --standalone --nproc_per_node 2 \
   --total-seq-len 8192 \
   --speculator-type peagle \
   --num-layers 4 \
-  --num-depths 4 \
+  --num-depths 8 \
+  --down-sample-ratio 0.8 \
+  --sequence-partitions 4 \
+  --embed-requires-grad \
+  --target-layer-ids 2 18 35 \
   --no-norm-before-residual \
   --scheduler-type cosine \
   --lr 6e-4 \

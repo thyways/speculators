@@ -2,8 +2,9 @@ import json
 import logging
 import time
 import warnings
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Literal, NamedTuple
+from typing import Literal, NamedTuple, cast
 
 import torch
 import torch.distributed as dist
@@ -47,10 +48,12 @@ class _StepTimer:
     def __init__(self, enabled: bool = False):
         self.enabled = enabled
         self._marks: dict[str, float] = {}
+        self._duration_overrides_ms: dict[str, float] = {}
 
     def reset(self, enabled: bool) -> None:
         self.enabled = enabled
         self._marks.clear()
+        self._duration_overrides_ms.clear()
 
     def mark(self, name: str) -> None:
         if self.enabled:
@@ -67,13 +70,17 @@ class _StepTimer:
         torch.accelerator.synchronize()
         return time.perf_counter()
 
+    def set_duration_ms(self, name: str, duration_ms: float) -> None:
+        if self.enabled:
+            self._duration_overrides_ms[name] = duration_ms
+
     def profile(self, num_tokens: int) -> dict[str, float] | None:
         if not self.enabled:
             return None
         m = self._marks
         has_start = "start" in m
-        fwd_ms = (m["fwd"] - m["fetch"]) * 1000
-        bwd_ms = (m["bwd"] - m["fwd"]) * 1000
+        fwd_ms = self._duration_overrides_ms.get("fwd", (m["fwd"] - m["fetch"]) * 1000)
+        bwd_ms = self._duration_overrides_ms.get("bwd", (m["bwd"] - m["fwd"]) * 1000)
         opt_ms = (m["opt"] - m["bwd"]) * 1000
         fetch_ms = (m["fetch"] - m["start"]) * 1000 if has_start else 0.0
         step_ms = (m["opt"] - m["start"]) * 1000 if has_start else 0.0
@@ -162,6 +169,17 @@ def _reduce_step_metrics(
     if distributed:
         dist.reduce(stacked, dst=0, op=dist.ReduceOp.SUM)
     return dict(zip(metric_keys, stacked.tolist(), strict=True))
+
+
+def _sum_counted_metrics(
+    accumulated: dict[str, torch.Tensor],
+    metrics: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Add per-partition metric numerators and denominators."""
+    for key, value in metrics.items():
+        previous = accumulated.get(key)
+        accumulated[key] = value if previous is None else previous + value
+    return accumulated
 
 
 def _resolve_scheduler_steps(
@@ -486,6 +504,69 @@ class Trainer:
             total = min(total, self.config.max_steps)
         return total if total > 0 else None
 
+    def _prepare_forward_partitions(
+        self,
+        gpu_batch: dict,
+        call_kwargs: dict,
+    ) -> list[dict[str, torch.Tensor]] | None:
+        unwrapped_model = getattr(self, "_unwrapped_model", self.model)
+        prepare = getattr(unwrapped_model, "prepare_partitioned_forward", None)
+        if prepare is None:
+            return None
+        partitions = prepare(**gpu_batch, **call_kwargs)
+        if partitions is not None and not partitions:
+            raise ValueError("prepare_partitioned_forward returned no partitions")
+        return partitions
+
+    def _partitioned_forward_backward(
+        self,
+        gpu_batch: dict,
+        call_kwargs: dict,
+        partitions: list[dict[str, torch.Tensor]],
+        timer: _StepTimer,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        metrics: dict[str, torch.Tensor] = {}
+        loss = gpu_batch["input_ids"].new_zeros((), dtype=torch.float32)
+        forward_ms = 0.0
+        backward_ms = 0.0
+
+        for partition_index, partition_kwargs in enumerate(partitions):
+            is_last = partition_index == len(partitions) - 1
+            should_sync = not isinstance(self.model, DistributedDataParallel) or is_last
+            sync_context = (
+                nullcontext()
+                if should_sync
+                else cast("DistributedDataParallel", self.model).no_sync()
+            )
+            with sync_context:
+                started = timer.now()
+                with torch.autocast(
+                    self.device_type, dtype=self.config.hidden_states_dtype
+                ):
+                    _draft_tokens, partition_loss, partition_metrics = self.model(
+                        **gpu_batch,
+                        **call_kwargs,
+                        **partition_kwargs,
+                    )
+                forward_done = timer.now()
+                partition_loss.backward()
+                backward_done = timer.now()
+
+            if started is not None and forward_done is not None:
+                forward_ms += (forward_done - started) * 1000
+            if forward_done is not None and backward_done is not None:
+                backward_ms += (backward_done - forward_done) * 1000
+            loss = loss + partition_loss.detach().to(torch.float32)
+            _sum_counted_metrics(metrics, partition_metrics)
+
+        # Timestamp marks retain the optimizer boundary; duration overrides keep
+        # profiling meaningful for interleaved per-segment forward/backward.
+        timer.mark("fwd")
+        timer.mark("bwd")
+        timer.set_duration_ms("fwd", forward_ms)
+        timer.set_duration_ms("bwd", backward_ms)
+        return loss, metrics
+
     def train_epoch(self, epoch: int):
         self.model.train()
         if hasattr(self.train_loader.batch_sampler, "set_epoch"):
@@ -523,25 +604,34 @@ class Trainer:
             }
             # Let progress-dependent objectives update their schedule state.
             self._unwrapped_model.on_training_step(self.global_step, step_horizon)
+            call_kwargs = self.config.train_call_kwargs or {}
+            timer.mark("fetch")
+            partitions = self._prepare_forward_partitions(gpu_batch, call_kwargs)
+            self._optimizers_zero_grad()
 
-            with torch.autocast(
-                self.device_type, dtype=self.config.hidden_states_dtype
-            ):
-                timer.mark("fetch")
-                _draft_tokens, loss, metrics = self.model(
-                    **gpu_batch, **(self.config.train_call_kwargs or {})
+            if partitions is None:
+                with torch.autocast(
+                    self.device_type, dtype=self.config.hidden_states_dtype
+                ):
+                    _draft_tokens, loss, metrics = self.model(
+                        **gpu_batch, **call_kwargs
+                    )
+                timer.mark("fwd")
+                loss.backward()
+                timer.mark("bwd")
+            else:
+                loss, metrics = self._partitioned_forward_backward(
+                    gpu_batch,
+                    call_kwargs,
+                    partitions,
+                    timer,
                 )
 
-            timer.mark("fwd")
-            self._optimizers_zero_grad()
-            loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(),
                 1.0,
                 error_if_nonfinite=True,
             )
-
-            timer.mark("bwd")
             self._optimizers_step()
 
             current_lrs = _optimizer_lrs(self.optimizers)
@@ -620,12 +710,27 @@ class Trainer:
             }
             num_batches += 1
 
-            with torch.autocast(
-                self.device_type, dtype=self.config.hidden_states_dtype
-            ):
-                _draft_tokens, _loss, metrics = self.model(
-                    **gpu_batch, **(self.config.val_call_kwargs or {})
-                )
+            call_kwargs = self.config.val_call_kwargs or {}
+            partitions = self._prepare_forward_partitions(gpu_batch, call_kwargs)
+            if partitions is None:
+                with torch.autocast(
+                    self.device_type, dtype=self.config.hidden_states_dtype
+                ):
+                    _draft_tokens, _loss, metrics = self.model(
+                        **gpu_batch, **call_kwargs
+                    )
+            else:
+                metrics = {}
+                for partition_kwargs in partitions:
+                    with torch.autocast(
+                        self.device_type, dtype=self.config.hidden_states_dtype
+                    ):
+                        _draft_tokens, _loss, partition_metrics = self.model(
+                            **gpu_batch,
+                            **call_kwargs,
+                            **partition_kwargs,
+                        )
+                    _sum_counted_metrics(metrics, partition_metrics)
 
             for k, v in metrics.items():
                 acc = accumulated.get(k)

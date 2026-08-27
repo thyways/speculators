@@ -168,7 +168,9 @@ torchrun --standalone --nproc_per_node=4 scripts/train.py \
 
 - **`--down-sample-ratio`** (float, default: `0.7`) Geometric decay ratio for COD sampling.
 
-- **`--down-sample-ratio-min`** (float, default: `0.2`) Minimum retention ratio for COD sampling.
+- **`--down-sample-ratio-min`** (float, default: `0.0`) Optional minimum retention ratio for COD sampling. Leave at `0.0` for the paper's exact `n × r^d` schedule.
+
+- **`--sequence-partitions`** (int, default: `1`) Number of dependency-aware sequence segments used for within-sequence gradient accumulation. Values greater than 1 enable Algorithm 1 from the P-EAGLE paper.
 
 ### Attention Backend Arguments
 
@@ -180,7 +182,7 @@ torchrun --standalone --nproc_per_node=4 scripts/train.py \
 
 - **`--sample-from-anchor`** / **`--no-sample-from-anchor`** (bool, default: algorithm-specific) Whether to sample from the anchor position. `True`: sample from anchor and all mask positions (default for dspark, produces block_size tokens). `False`: anchor is bonus token (default for dflash, produces block_size-1 tokens).
 
-- **`--max-anchors`** (int, default: `3072`) Maximum anchor positions for DFlash, DSpark, and P-EAGLE training.
+- **`--max-anchors`** (int, default: `512`) Maximum anchor positions for DFlash and DSpark training. P-EAGLE does not truncate COD anchors; use `--sequence-partitions` to control its peak memory.
 
 - **`--dflash-decay-gamma`** (float, default: `4.0`) Decay gamma for DFlash loss weighting.
 

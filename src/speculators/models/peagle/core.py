@@ -11,7 +11,10 @@ from speculators.model import SpeculatorModel
 from speculators.models.eagle3.core import Eagle3DraftModel
 from speculators.models.peagle.attention import create_peagle_mask_mod
 from speculators.models.peagle.config import PEagleSpeculatorConfig
-from speculators.models.peagle.data import generate_cod_sample_indices
+from speculators.models.peagle.data import (
+    generate_cod_sample_indices,
+    partition_cod_sample_indices,
+)
 from speculators.models.peagle.metrics import compute_metrics
 from speculators.models.utils import conditional_torch_compile, resolve_target_layer_ids
 from speculators.proposals.greedy import GreedyTokenProposalConfig
@@ -36,6 +39,10 @@ class PEagleDraftModel(Eagle3DraftModel):
         self,
         config: PEagleSpeculatorConfig,
     ):
+        # P-EAGLE's mask-token embedding is a learned model input.  Enforce the
+        # paper recipe even when resuming an older config that serialized it as
+        # frozen.
+        config.embed_requires_grad = True
         super().__init__(config=config)
 
         self.mask_token_id = config.mask_token_id
@@ -60,10 +67,13 @@ class PEagleDraftModel(Eagle3DraftModel):
         loss_mask: torch.Tensor | None = None,
         verifier_last_hidden_states: torch.Tensor | None = None,
         loss_config: LossConfig | None = None,
-        max_anchors: int | None = None,
         num_depths: int = 8,
         down_sample_ratio: float = 0.7,
-        down_sample_ratio_min: float = 0.2,
+        down_sample_ratio_min: float = 0.0,
+        cod_anchor_pos: torch.Tensor | None = None,
+        cod_depth: torch.Tensor | None = None,
+        cod_supervision_mask: torch.Tensor | None = None,
+        cod_global_loss_count: torch.Tensor | None = None,
         **kwargs,
     ):
         """
@@ -91,15 +101,23 @@ class PEagleDraftModel(Eagle3DraftModel):
         if loss_mask is None:
             loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
 
-        # Generate COD sampling indices
-        anchor_pos, depth = generate_cod_sample_indices(
-            seq_length=seq_length,
-            loss_mask=loss_mask,
-            num_depths=num_depths,
-            down_sample_ratio=down_sample_ratio,
-            down_sample_ratio_min=down_sample_ratio_min,
-            max_anchors=max_anchors,
-        )
+        if (cod_anchor_pos is None) != (cod_depth is None):
+            raise ValueError("cod_anchor_pos and cod_depth must be provided together")
+
+        if cod_anchor_pos is None:
+            anchor_pos, depth = generate_cod_sample_indices(
+                seq_length=seq_length,
+                loss_mask=loss_mask,
+                num_depths=num_depths,
+                down_sample_ratio=down_sample_ratio,
+                down_sample_ratio_min=down_sample_ratio_min,
+                document_ids=document_ids,
+            )
+        else:
+            if cod_depth is None:  # narrowed by the paired-input check above
+                raise RuntimeError("unreachable COD depth state")
+            anchor_pos = cod_anchor_pos
+            depth = cod_depth
         total_sampled = anchor_pos.shape[0]
 
         orig_positions = anchor_pos + depth
@@ -186,12 +204,12 @@ class PEagleDraftModel(Eagle3DraftModel):
             self.norm(hidden_states)
         )  # [1, total_sampled, vocab_size]
 
+        # Select hidden states before applying the verifier head.  Under sequence
+        # partitioning this avoids materializing [full_seq_len, vocab_size] targets
+        # for every segment.
         with torch.no_grad():
-            targets = self.verifier_lm_head(
-                self.verifier_norm(verifier_last_hidden_states)
-            )
-
-        targets = targets[:, orig_positions, :]  # [1, total_sampled, vocab_size]
+            target_hidden = verifier_last_hidden_states[:, orig_positions, :]
+            targets = self.verifier_lm_head(self.verifier_norm(target_hidden))
 
         loss, metrics = compute_metrics(
             logits=logits,
@@ -201,9 +219,63 @@ class PEagleDraftModel(Eagle3DraftModel):
             depth=depth,
             num_depths=num_depths,
             loss_config=loss_config,
+            supervision_mask=cod_supervision_mask,
+            global_loss_count=cod_global_loss_count,
         )
 
         return None, loss, metrics
+
+    @torch.no_grad()
+    def prepare_partitioned_forward(
+        self,
+        input_ids: torch.Tensor,
+        document_ids: torch.Tensor,
+        loss_mask: torch.Tensor | None = None,
+        sequence_partitions: int = 1,
+        num_depths: int = 8,
+        down_sample_ratio: float = 0.7,
+        down_sample_ratio_min: float = 0.0,
+        **_kwargs,
+    ) -> list[dict[str, torch.Tensor]] | None:
+        """Prepare one COD sample and split it with paper Algorithm 1.
+
+        The trainer invokes each returned partition through the wrapped model and
+        performs backward immediately, yielding true within-sequence gradient
+        accumulation without retaining activation graphs from earlier segments.
+        """
+        if sequence_partitions <= 1:
+            return None
+
+        seq_length = input_ids.shape[1]
+        if loss_mask is None:
+            loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+
+        anchor_pos, depth = generate_cod_sample_indices(
+            seq_length=seq_length,
+            loss_mask=loss_mask,
+            num_depths=num_depths,
+            down_sample_ratio=down_sample_ratio,
+            down_sample_ratio_min=down_sample_ratio_min,
+            document_ids=document_ids,
+        )
+        partitions = partition_cod_sample_indices(
+            anchor_pos,
+            depth,
+            seq_length=seq_length,
+            num_segments=sequence_partitions,
+        )
+        orig_positions = anchor_pos + depth
+        global_loss_count = loss_mask[:, orig_positions].to(torch.float32).sum()
+
+        return [
+            {
+                "cod_anchor_pos": partition.anchor_pos,
+                "cod_depth": partition.depth,
+                "cod_supervision_mask": partition.supervision_mask,
+                "cod_global_loss_count": global_loss_count,
+            }
+            for partition in partitions
+        ]
 
     @classmethod
     def from_training_args(
@@ -247,6 +319,7 @@ class PEagleDraftModel(Eagle3DraftModel):
             norm_before_fc=kwargs.get("norm_before_fc", False),
             fc_norm=kwargs.get("fc_norm", False),
             norm_output=kwargs.get("norm_output", False),
+            embed_requires_grad=True,
             eagle_aux_hidden_state_layer_ids=target_layer_ids,
             mask_token_id=kwargs.get("mask_token_id"),
             speculators_config=SpeculatorsConfig(
@@ -282,15 +355,15 @@ class PEagleDraftModel(Eagle3DraftModel):
         loss_config = resolve_loss_config(
             kwargs["loss_fn"], kwargs.get("loss_implementation", "fused")
         )
-        max_anchors = kwargs.get("max_anchors")
         num_depths = kwargs.get("num_depths", 8)
         down_sample_ratio = kwargs.get("down_sample_ratio", 0.7)
-        down_sample_ratio_min = kwargs.get("down_sample_ratio_min", 0.2)
+        down_sample_ratio_min = kwargs.get("down_sample_ratio_min", 0.0)
+        sequence_partitions = kwargs.get("sequence_partitions", 1)
         shared = {
             "loss_config": loss_config,
-            "max_anchors": max_anchors,
             "num_depths": num_depths,
             "down_sample_ratio": down_sample_ratio,
             "down_sample_ratio_min": down_sample_ratio_min,
+            "sequence_partitions": sequence_partitions,
         }
         return dict(shared), dict(shared)

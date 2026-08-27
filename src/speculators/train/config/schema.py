@@ -244,8 +244,8 @@ class DataArgs(_Group):
     )
     max_anchors: int = Field(
         default=512,
-        description="Maximum anchor positions for DFlash, DSpark, and P-EAGLE training "
-        "(default: 512).",
+        description="Maximum anchor positions for DFlash and DSpark training "
+        "(default: 512). P-EAGLE uses COD sequence partitioning instead.",
     )
 
     @field_validator("hidden_states_dtype")
@@ -645,13 +645,31 @@ class DSparkArgs(_Group):
 class PEagleArgs(_Group):
     num_depths: int = Field(
         default=8,
+        ge=1,
         description="Number of parallel prediction depths for P-EAGLE (default: 8).",
     )
     down_sample_ratio: float = Field(
-        default=0.7, description="Geometric decay ratio for COD sampling in P-EAGLE."
+        default=0.7,
+        gt=0,
+        le=1,
+        description="Geometric decay ratio for COD sampling in P-EAGLE.",
     )
     down_sample_ratio_min: float = Field(
-        default=0.2, description="Minimum retention ratio for COD sampling in P-EAGLE."
+        default=0.0,
+        ge=0,
+        le=1,
+        description=(
+            "Optional minimum COD retention ratio. The paper recipe uses 0.0, "
+            "i.e. the exact n * r^d schedule."
+        ),
+    )
+    sequence_partitions: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Number of dependency-aware sequence segments used for within-sequence "
+            "gradient accumulation in P-EAGLE (default: 1, disabled)."
+        ),
     )
 
 
@@ -827,6 +845,7 @@ class TrainConfig(BaseSettings):
         untouched, so :meth:`from_flat` round-trips.
         """
         is_eagle3 = self.speculator_type == "eagle3"
+        is_peagle = self.speculator_type == "peagle"
         # dflash2 is a dflash backbone plus the conv and the selector, so the
         # issue-979 backbone recipe carries over; dspark shares only the layer count.
         is_dflash = self.speculator_type in ("dflash", "dflash2")
@@ -837,6 +856,10 @@ class TrainConfig(BaseSettings):
             self.draft.norm_before_fc = is_eagle3
         if self.draft.norm_output is None:
             self.draft.norm_output = is_eagle3
+        if is_peagle:
+            # The shared mask-token embedding is a learned P-EAGLE input, not a
+            # frozen verifier feature (see the paper's embedding ablation).
+            self.draft.embed_requires_grad = True
         if self.optimizer.muon_lr is None:
             self.optimizer.muon_lr = 10 * self.optimizer.lr
         if self.draft.num_layers is None:

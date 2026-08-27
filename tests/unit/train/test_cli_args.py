@@ -99,6 +99,26 @@ def test_peagle_explicit_ce(monkeypatch):
     assert "ce" in val_kw["loss_config"]
 
 
+def test_peagle_uses_paper_cod_and_trainable_embedding_defaults(monkeypatch):
+    args = _parse(monkeypatch, ["--speculator-type", "peagle"])
+    train_kw, val_kw = PEagleDraftModel.get_trainer_kwargs(**vars(args))
+
+    assert args.embed_requires_grad is True
+    assert train_kw["down_sample_ratio_min"] == 0.0
+    assert train_kw["sequence_partitions"] == 1
+    assert val_kw["sequence_partitions"] == 1
+
+
+def test_peagle_sequence_partitions_flow_to_trainer(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        ["--speculator-type", "peagle", "--sequence-partitions", "4"],
+    )
+    train_kw, val_kw = PEagleDraftModel.get_trainer_kwargs(**vars(args))
+    assert train_kw["sequence_partitions"] == 4
+    assert val_kw["sequence_partitions"] == 4
+
+
 def test_dspark_default_uses_kl(monkeypatch):
     args = _parse(monkeypatch, [])
     train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))

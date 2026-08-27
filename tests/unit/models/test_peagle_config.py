@@ -7,6 +7,7 @@ from transformers import LlamaConfig
 
 from speculators import SpeculatorsConfig, VerifierConfig
 from speculators.models.peagle.config import PEagleSpeculatorConfig
+from speculators.models.peagle.core import PEagleDraftModel
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 
 
@@ -73,6 +74,16 @@ def test_saved_config_is_resumable_and_keeps_speculators_metadata(tmp_path):
     assert restored.mask_token_id == 0
     assert restored.eagle_aux_hidden_state_layer_ids == [1, 2, 3]
     assert "mrope_section" not in restored.transformer_layer_config.rope_parameters
+
+
+def test_embedding_is_trainable_even_for_a_legacy_frozen_config():
+    config = make_config()
+    config.embed_requires_grad = False
+
+    model = PEagleDraftModel(config)
+
+    assert model.config.embed_requires_grad is True
+    assert model.embed_tokens.weight.requires_grad is True
 
 
 def test_vllm_reads_saved_config_without_a_plugin(tmp_path, monkeypatch):

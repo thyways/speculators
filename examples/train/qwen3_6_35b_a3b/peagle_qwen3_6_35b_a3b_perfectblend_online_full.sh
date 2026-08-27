@@ -23,9 +23,10 @@ VLLM_ENDPOINT="${VLLM_ENDPOINT:-http://localhost:${VLLM_PORT}/v1}"
 VLLM_HEALTH_ENDPOINT="${VLLM_HEALTH_ENDPOINT:-http://localhost:${VLLM_PORT}/health}"
 NUM_DEPTHS="${NUM_DEPTHS:-8}"
 DOWN_SAMPLE_RATIO="${DOWN_SAMPLE_RATIO:-0.8}"
-DOWN_SAMPLE_RATIO_MIN="${DOWN_SAMPLE_RATIO_MIN:-0.2}"
+SEQUENCE_PARTITIONS="${SEQUENCE_PARTITIONS:-4}"
+read -r -a TARGET_LAYERS <<< "${TARGET_LAYER_IDS:-2 20 39}"
 JOB_TAG="${SLURM_JOB_ID:-${JOB_ID:-$$}}"
-HIDDEN_STATES_DIR="${HIDDEN_STATES_DIR:-/tmp/peagle_qwen3_6_35b_a3b_hidden_states}"
+HIDDEN_STATES_DIR="${HIDDEN_STATES_DIR:-$REPO/tmp/peagle_qwen3_6_35b_a3b_hidden_states}"
 VLLM_LOG="${VLLM_LOG:-$RUN_DIR/vllm_${JOB_TAG}.log}"
 
 SPEC_PYTHON="${SPEC_PYTHON:-$ENV_REPO/speculators_venv/bin/python}"
@@ -130,8 +131,9 @@ echo "Checkpoints:      $CHECKPOINT_DIR"
 echo "W&B project:      $WANDB_PROJECT"
 echo "P-EAGLE layers:   5"
 echo "P-EAGLE depths:   $NUM_DEPTHS"
-echo "COD ratios:       $DOWN_SAMPLE_RATIO / $DOWN_SAMPLE_RATIO_MIN"
-echo "Target layers:    2 11 20 29 38"
+echo "COD ratio:        $DOWN_SAMPLE_RATIO"
+echo "Seq partitions:   $SEQUENCE_PARTITIONS"
+echo "Target layers:    ${TARGET_LAYERS[*]}"
 echo "Full-attn layers: 0 1 2 3 4"
 echo "vLLM GPUs:        $VLLM_GPUS"
 echo "Training GPUs:    $TRAIN_GPUS"
@@ -156,7 +158,7 @@ setsid env \
     "$VLLM_PYTHON" \
     "$LAUNCH_VLLM" \
     "$MODEL" \
-    --target-layer-ids 2 11 20 29 38 \
+    --target-layer-ids "${TARGET_LAYERS[@]}" \
     --hidden-states-path "$HIDDEN_STATES_DIR" \
     -- \
     --tensor-parallel-size 1 \
@@ -210,14 +212,14 @@ setsid env \
     --speculator-type peagle \
     --draft-arch qwen3 \
     --num-layers 5 \
-    --max-anchors 512 \
     --num-depths "$NUM_DEPTHS" \
     --down-sample-ratio "$DOWN_SAMPLE_RATIO" \
-    --down-sample-ratio-min "$DOWN_SAMPLE_RATIO_MIN" \
+    --sequence-partitions "$SEQUENCE_PARTITIONS" \
+    --embed-requires-grad \
     --no-norm-before-residual \
     --sliding-window 2048 \
     --sliding-window-non-causal \
-    --target-layer-ids 2 11 20 29 38 \
+    --target-layer-ids "${TARGET_LAYERS[@]}" \
     --vllm-endpoint "$VLLM_ENDPOINT" \
     --request-timeout 300 \
     --on-missing generate \

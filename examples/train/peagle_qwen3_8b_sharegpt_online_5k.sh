@@ -49,7 +49,8 @@ SPECULATOR_TYPE="peagle"
 NUM_LAYERS=4
 NUM_DEPTHS=4
 DOWN_SAMPLE_RATIO=0.7
-DOWN_SAMPLE_RATIO_MIN=0.2
+SEQUENCE_PARTITIONS=2
+TARGET_LAYER_IDS=(2 18 35)
 # GPU assignments (online training needs separate GPUs for vLLM and training)
 VLLM_GPUS="2,3"
 TRAIN_GPUS="4,5"
@@ -68,6 +69,7 @@ python scripts/prepare_data.py \
 # Step 2: Launch vLLM server in the background
 echo "=== Step 2: Launching vLLM server ==="
 CUDA_VISIBLE_DEVICES="$VLLM_GPUS" python scripts/launch_vllm.py "$MODEL" \
+    --target-layer-ids "${TARGET_LAYER_IDS[@]}" \
     --hidden-states-path "$OUTPUT_DIR/hidden_states" \
     -- --data-parallel-size 2 --port "$VLLM_PORT" --gpu-memory-utilization 0.85 &
 VLLM_PID=$!
@@ -103,7 +105,9 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" torchrun \
     --num-layers "$NUM_LAYERS" \
     --num-depths "$NUM_DEPTHS" \
     --down-sample-ratio "$DOWN_SAMPLE_RATIO" \
-    --down-sample-ratio-min "$DOWN_SAMPLE_RATIO_MIN" \
+    --sequence-partitions "$SEQUENCE_PARTITIONS" \
+    --embed-requires-grad \
+    --target-layer-ids "${TARGET_LAYER_IDS[@]}" \
     --no-norm-before-residual \
     --scheduler-type cosine \
     --on-missing generate \

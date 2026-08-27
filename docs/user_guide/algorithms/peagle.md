@@ -6,7 +6,7 @@ P-EAGLE (Parallel EAGLE) extends Eagle-3 with parallel multi-token prediction. I
 
 ### Architecture
 
-P-EAGLE builds on the Eagle-3 architecture: the target model produces hidden states at selected layers, which are concatenated, projected, and passed through Llama-style decoder layers. The key difference is that P-EAGLE adds **multiple prediction depths** -- at each position, the model predicts not just the next token but several tokens ahead in parallel. Each depth level d makes predictions for position (anchor + d) in the sequence.
+P-EAGLE builds on the Eagle-3 architecture: the target model produces hidden states from three layers (`2`, `L/2`, and `L-1` in the paper), which are concatenated, projected, and passed through decoder layers. Depth 0 uses those verifier hidden states, while every deeper position uses the same learnable shared hidden state and the learned mask-token embedding. The token embedding remains trainable; freezing it removes the model's ability to learn a useful mask-token representation.
 
 ### COD Sampling
 
@@ -16,9 +16,13 @@ Training a parallel multi-depth model naively would require memory proportional 
 
 - Depth 0 retains all n positions
 - Depth d retains approximately n × r^d positions, where r is the `down-sample-ratio`
-- A minimum retention floor (`down-sample-ratio-min`) prevents over-sampling at deep levels
+- Each sampled depth-d position keeps its depth-(d-1) predecessor, preserving the conditional rollout dependency
 
 This geometric decay means deeper predictions train on fewer positions per batch, keeping memory usage manageable while still learning to predict multiple tokens ahead.
+
+### Sequence Partitioning
+
+`--sequence-partitions S` enables the dependency-aware partitioning from Algorithm 1 of the paper. Depths 0 and 1 are assigned by sequence position; depths 2 and deeper inherit the segment of their predecessor at `(depth - 1, position - 1)`. Each segment receives the cumulative depth-0 causal prefix it needs. The trainer performs a separate forward/backward pass for each segment and updates the optimizer only after all segments, reducing peak activation memory without changing the COD objective.
 
 ### Inference Process
 
@@ -31,13 +35,14 @@ vLLM 0.28 and later provide the P-EAGLE model and parallel-drafting runtime nati
 
 ## Key Parameters
 
-| Parameter                   | Default | Description                                       |
-| --------------------------- | ------- | ------------------------------------------------- |
-| `--num-layers`              | 4       | Number of draft transformer layers                |
-| `--num-depths`              | 4       | Number of parallel prediction depths              |
-| `--down-sample-ratio`       | 0.7     | Geometric decay ratio for COD sampling            |
-| `--down-sample-ratio-min`   | 0.2     | Minimum retention floor for COD sampling          |
-| `--no-norm-before-residual` | —       | Disable normalization before residual connections |
+| Parameter                 | Default | Description                                                   |
+| ------------------------- | ------- | ------------------------------------------------------------- |
+| `--num-depths`            | 8       | Number of parallel prediction depths                          |
+| `--down-sample-ratio`     | 0.7     | Geometric decay ratio for COD sampling                        |
+| `--down-sample-ratio-min` | 0.0     | Optional non-paper retention floor                            |
+| `--sequence-partitions`   | 1       | Dependency-aware within-sequence accumulation segments        |
+| `--embed-requires-grad`   | true    | Keep the embedding trainable, as required by the paper recipe |
+| `--target-layer-ids`      | —       | Pass exactly three verifier layers; paper uses `2 L/2 L-1`    |
 
 ## Pretrained Models
 

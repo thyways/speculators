@@ -175,6 +175,7 @@ def make_peagle_model(
     draft_attn_impl: str | None = None,
     device: str = "cuda:0",
     dtype: torch.dtype = torch.bfloat16,
+    torch_compile: bool = True,
 ) -> PEagleDraftModel:
     """Create a tiny PEagle model with real initialized weights."""
     transformer_config = copy.deepcopy(TINY_LLAMA_CONFIG)
@@ -200,7 +201,13 @@ def make_peagle_model(
     )
     model = PEagleDraftModel(config)
     _fill_nan_weights(model)
-    return model.to(device=device, dtype=dtype)  # type: ignore[call-arg]
+    model = model.to(device=device, dtype=dtype)  # type: ignore[call-arg]
+    if not torch_compile:
+        import types  # noqa: PLC0415
+
+        orig = model.forward._torchdynamo_orig_callable
+        model.forward = types.MethodType(orig, model)
+    return model
 
 
 def make_mtp_model(
@@ -312,6 +319,7 @@ def make_batch(
     num_target_layers: int = 3,
     preprocess: Callable | None = None,
     device: str = "cuda:0",
+    dtype: torch.dtype = torch.bfloat16,
 ) -> dict[str, torch.Tensor]:
     """Collate a list of samples into a single batch using the real collate_fn.
 
@@ -334,6 +342,7 @@ def make_batch(
         max_len=max_len,
         hidden_size=hidden_size,
         num_target_layers=num_target_layers,
+        dtype=dtype,
         preprocess=preprocess,
     )
     batch = collate_fn(samples)
