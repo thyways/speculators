@@ -46,7 +46,6 @@ VLLM_PYTHON="$REPO/vllm_venv/bin/python"
 EVAL_PYTHON="$REPO/speculators_venv/bin/python"
 GUIDELLM="$REPO/speculators_venv/bin/guidellm"
 EVALUATE_PY="$REPO/scripts/evaluate/evaluate.py"
-PLUGIN_PYTHONPATH="$REPO/src:$REPO/hs_connectors/src"
 
 VLLM_PID=""
 
@@ -123,8 +122,7 @@ echo "=== Step 1: Launching vLLM server ==="
 setsid env \
     CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
     HF_ENDPOINT="$HF_ENDPOINT" \
-    PYTHONPATH="$PLUGIN_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}" \
-    VLLM_PLUGINS=speculators_domino \
+    VLLM_PLUGINS="" \
     VLLM_USE_V2_MODEL_RUNNER=1 \
     VLLM_PORT="$VLLM_INTERNAL_PORT" \
     TOKENIZERS_PARALLELISM=false \

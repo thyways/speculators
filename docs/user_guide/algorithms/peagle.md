@@ -27,6 +27,8 @@ This geometric decay means deeper predictions train on fewer positions per batch
 3. The longest correct prefix is accepted
 4. Repeat from the last accepted token
 
+vLLM 0.28 and later provide the P-EAGLE model and parallel-drafting runtime natively. Speculators checkpoints serialize their text-only rotary configuration in the form expected by that runtime, so no external vLLM plugin is required. P-EAGLE parallel drafting currently uses vLLM's V1 model runner; set `VLLM_USE_V2_MODEL_RUNNER=0` when serving it.
+
 ## Key Parameters
 
 | Parameter                   | Default | Description                                       |

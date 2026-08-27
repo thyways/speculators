@@ -9,15 +9,14 @@
 #   * NUM_SPECULATIVE_TOKENS is block_size - 1, not a free knob. DFlash2's
 #     convolution and selector are trained over a block of `block_size` query
 #     slots and at inference that block is 1 + num_speculative_tokens, so serving
-#     a different width convolves over a block the checkpoint never saw. The
-#     plugin refuses to start on a mismatch; this script defaults to the
-#     checkpoint's own value and re-checks it below.
-#   * VLLM_PLUGINS=speculators_dflash2 registers the DFlash2 model, speculator
-#     and config translation from vllm-project/vllm#52816. vLLM releases do not
-#     carry them yet -- see src/speculators/vllm/dflash2.py.
+#     a different width convolves over a block the checkpoint never saw. This
+#     script defaults to the checkpoint's own value and re-checks it below.
+#   * vLLM 0.28+ carries the DFlash2 model, selector and proposal runtime. New
+#     Speculators checkpoints also write the native DFlash2 config fields, so no
+#     external vLLM plugin is loaded.
 #   * VLLM_USE_V2_MODEL_RUNNER=1 is mandatory, not an optimization: the V1
 #     DFlashProposer has no candidate selector, so a DFlash2 checkpoint reaching
-#     it drafts as DFlash1. The plugin raises rather than let that happen.
+#     it drafts as DFlash1.
 #
 # Smoke test:
 #
@@ -68,7 +67,6 @@ VLLM_PYTHON="${VLLM_PYTHON:-$RUNTIME_REPO/vllm_venv/bin/python}"
 EVAL_PYTHON="${EVAL_PYTHON:-$RUNTIME_REPO/speculators_venv/bin/python}"
 GUIDELLM="${GUIDELLM:-$RUNTIME_REPO/speculators_venv/bin/guidellm}"
 EVALUATE_PY="${EVALUATE_PY:-$REPO/scripts/evaluate/evaluate.py}"
-PLUGIN_PYTHONPATH="$REPO/src:$REPO/hs_connectors/src"
 
 VLLM_PID=""
 
@@ -106,18 +104,12 @@ for path in \
     "$MODEL/config.json" \
     "$MODEL/model.safetensors" \
     "$VERIFIER_MODEL/config.json" \
-    "$EVALUATE_PY" \
-    "$REPO/src/speculators/vllm/dflash2.py"; do
+    "$EVALUATE_PY"; do
     if [[ ! -f "$path" ]]; then
         echo "Missing required file: $path" >&2
         exit 1
     fi
 done
-
-if [[ ! -d "$REPO/src/speculators" || ! -d "$REPO/hs_connectors/src" ]]; then
-    echo "Missing Speculators source or hs_connectors under: $REPO" >&2
-    exit 1
-fi
 
 if [[ "$MODE" != "throughput" && "$MODE" != "sweep" ]]; then
     echo "MODE must be 'throughput' or 'sweep', got: $MODE" >&2
@@ -151,25 +143,6 @@ fi
 
 mkdir -p "$OUTPUT_DIR"
 
-# vLLM discovers general plugins through `vllm.general_plugins` entry points, in
-# every process it spawns, so importing the plugin in this shell would not reach
-# the workers. When this repo is not installed into the serving environment (the
-# usual case -- vllm_venv holds a different Speculators checkout), a metadata-only
-# distribution on PYTHONPATH is enough: importlib.metadata scans sys.path for
-# *.dist-info. It carries no modules, so it cannot shadow anything.
-PLUGIN_META_DIR="$OUTPUT_DIR/.vllm_plugin_meta"
-DIST_INFO="$PLUGIN_META_DIR/speculators_dflash2_plugin-0.0.0.dist-info"
-mkdir -p "$DIST_INFO"
-cat >"$DIST_INFO/METADATA" <<'EOF'
-Metadata-Version: 2.1
-Name: speculators-dflash2-plugin
-Version: 0.0.0
-EOF
-cat >"$DIST_INFO/entry_points.txt" <<'EOF'
-[vllm.general_plugins]
-speculators_dflash2 = speculators.vllm.dflash2:register
-EOF
-
 echo "=== DFlash2 evaluation configuration ==="
 echo "Draft model:           $MODEL"
 echo "Verifier model:        $VERIFIER_MODEL"
@@ -194,8 +167,7 @@ echo "=== Step 1: Launching vLLM DFlash2 server ==="
 setsid env \
     CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
     HF_ENDPOINT="$HF_ENDPOINT" \
-    PYTHONPATH="$PLUGIN_META_DIR:$PLUGIN_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}" \
-    VLLM_PLUGINS=speculators_dflash2 \
+    VLLM_PLUGINS="" \
     VLLM_USE_V2_MODEL_RUNNER="$VLLM_USE_V2_MODEL_RUNNER" \
     VLLM_PORT="$VLLM_INTERNAL_PORT" \
     TOKENIZERS_PARALLELISM=false \
@@ -228,17 +200,12 @@ until curl -sf "${SERVER_URL}/health" >/dev/null 2>&1; do
 done
 echo "vLLM server ready."
 
-# Without the plugin the draft config never resolves to DFlash2DraftModel and the
-# checkpoint drafts as DFlash1 -- which serves correct tokens, so nothing fails
-# and every acceptance number below would quietly be the wrong model's.
-for marker in \
-    "Registered Speculators DFlash2 support" \
-    "Resolved architecture: DFlash2DraftModel"; do
-    if ! grep -q "$marker" "$VLLM_LOG"; then
-        echo "DFlash2 did not load (missing: $marker). Inspect $VLLM_LOG." >&2
-        exit 1
-    fi
-done
+# DFlash2 and DFlash share method=dflash, so pin the resolved architecture in the
+# log to guard against silently benchmarking the base DFlash proposer.
+if ! grep -q "Resolved architecture: DFlash2DraftModel" "$VLLM_LOG"; then
+    echo "DFlash2 did not load natively. Inspect $VLLM_LOG." >&2
+    exit 1
+fi
 
 echo "=== Step 2: Running $MODE evaluation ==="
 env HF_ENDPOINT="$HF_ENDPOINT" PATH="$RUNTIME_REPO/speculators_venv/bin:$PATH" \

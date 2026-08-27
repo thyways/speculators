@@ -125,38 +125,21 @@ candidate_selector.hidden_projection.weight          -> ...
 
 `tests/unit/models/test_dflash2.py::TestWeightContract` pins that name set, and `tests/unit/models/test_dflash2_model_definitions.py` runs the PR's own reference tests against this repo's convolution and edge scorer.
 
-`save_pretrained` writes `architectures: ["DFlash2DraftModel"]` into the checkpoint's `config.json` (it takes the model class name), which is the string #52816 selects DFlash2 on.
+With vLLM 0.28 or newer, `save_pretrained` writes a dual-purpose `config.json`:
 
-The config translation still needs two additions on the vLLM side that #52816 does not carry, because it targets a native z-lab-format checkpoint rather than a speculators one. `vllm/transformers_utils/configs/speculators/` dispatches on `speculators_model_type`: `base.py` rejects a value `algos.py` has no entry for, and it derives `speculative_config.method` from that same value -- while #52816 requires `method == "dflash"` in both `_is_dflash2_draft` and `init_speculator`.
+- the draft Qwen3 fields are also present at the top level, with `model_type: "qwen3"`, `architectures: ["DFlash2DraftModel"]`, and the trained convolution/selector settings under `dflash_config`, so vLLM loads its native DFlash2 model and proposal runtime directly;
+- the nested `transformer_layer_config`, `speculators_model_type`, and `speculators_config` remain available to Speculators, so training can resume from the same checkpoint without a second config file.
 
-First, a `dflash2` updater in `algos.py`, alongside the existing `dflash` and `dspark` ones, to carry the module sizes into `dflash_config`:
+No vLLM plugin or repository `PYTHONPATH` is required. Pass the verifier and the draft explicitly so vLLM does not try to treat the draft checkpoint as the main model:
 
-```python
-@register_speculator("dflash2")
-def update_dflash2(config_dict: dict, pre_trained_config: dict) -> None:
-    update_dflash(config_dict, pre_trained_config)
-    pre_trained_config["architectures"] = ["DFlash2DraftModel"]
-    for key in (
-        "conv_kernel_size",
-        "conv_group_size",
-        "selector_rank",
-        "selector_top_k",
-        "input_embedding_scale",
-        "output_multiplier",
-        "final_logit_softcapping",
-    ):
-        if config_dict.get(key) is not None:
-            pre_trained_config["dflash_config"][key] = config_dict[key]
+```bash
+VLLM_PLUGINS="" vllm serve /path/to/verifier \
+  --spec-model /path/to/dflash2-checkpoint \
+  --spec-method dflash \
+  --spec-tokens 15
 ```
 
-Second, `extract_vllm_speculative_config` in `base.py` has to map the method back onto `dflash`, the way it already maps `peagle` onto `eagle3`:
-
-```python
-if result["method"] == "dflash2":
-    result["method"] = "dflash"
-```
-
-Until both land, a checkpoint can be served by writing the native-format config by hand: the draft's `transformer_layer_config` at the top level, `architectures: ["DFlash2DraftModel"]`, and the keys above under `dflash_config`.
+`--spec-tokens` must remain `block_size - 1`; changing it moves the convolution boundary and serves a different model from the one that was trained.
 
 ## See Also
 

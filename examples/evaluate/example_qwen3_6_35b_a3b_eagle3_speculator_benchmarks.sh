@@ -14,7 +14,7 @@
 # translation keys off the *draft* config, which is what `--speculative-config`
 # loads, so the method is spelled out there rather than via --spec-method.
 #
-# Unlike P-EAGLE this needs no plugin and no V1 pin. P-EAGLE sets
+# Unlike P-EAGLE this needs no V1 pin. P-EAGLE sets
 # `parallel_drafting=true`, which makes
 # `net_num_new_slots_per_request = num_speculative_tokens - 1 > 0`, and that is
 # what trips `LlmBaseProposer._raise_if_mrope`. Plain EAGLE-3 keeps
@@ -26,9 +26,9 @@
 # drafter was trained with `--draft-mrope-full-head-hack`, i.e. against linear
 # positions, but its config still advertises `mrope_section`, so vLLM runs it
 # with `uses_mrope=True`. `update_eagle3` does not strip that field the way the
-# `speculators_peagle` plugin does for P-EAGLE. Use the pos0 acceptance rate as
-# the tell: peers land near 0.79-0.84, so a markedly lower value means the
-# positions are wrong and the drafter needs the same normalization.
+# P-EAGLE's checkpoint serializer now does. Use the pos0 acceptance rate as the
+# tell: peers land near 0.79-0.84, so a markedly lower value means the positions
+# are wrong and the drafter needs the same normalization.
 
 set -Eeuo pipefail
 

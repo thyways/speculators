@@ -1,6 +1,7 @@
 """Unit tests for the DFlash2 draft model: config guards, weight contract, forward."""
 
 import copy
+import json
 from typing import Any, cast
 
 import pytest
@@ -268,6 +269,56 @@ class TestWeightContract:
             if key in ("verifier_lm_head.weight", "verifier_norm.weight"):
                 continue  # reloaded from the verifier, excluded on save
             assert torch.equal(value, after[key]), key
+
+    def test_saved_config_is_native_vllm_dflash2_and_resumable(self, tmp_path):
+        model = make_model(
+            input_embedding_scale=1.5,
+            output_multiplier=0.5,
+            final_logit_softcapping=20.0,
+            sliding_window_non_causal=True,
+        )
+        model.save_pretrained(str(tmp_path))
+
+        raw = json.loads((tmp_path / "config.json").read_text())
+        assert raw["model_type"] == "qwen3"
+        assert raw["architectures"] == ["DFlash2DraftModel"]
+        assert raw["eagle_aux_hidden_state_layer_ids"] == list(range(NUM_TARGET_LAYERS))
+        assert raw["speculators_model_type"] == "dflash2"
+        assert raw["speculators_config"]["algorithm"] == "dflash2"
+        assert raw["transformer_layer_config"]["model_type"] == "qwen3"
+        assert "auto_map" not in raw
+
+        runtime = raw["dflash_config"]
+        assert runtime["mask_token_id"] == 0
+        assert runtime["target_layer_ids"] == [-1, 0]
+        assert runtime["sample_from_anchor"] is False
+        assert runtime["block_size"] == BLOCK_SIZE
+        assert runtime["conv_kernel_size"] == 3
+        assert runtime["conv_group_size"] == 8
+        assert runtime["selector_rank"] == 6
+        assert runtime["selector_top_k"] == 4
+        assert runtime["input_embedding_scale"] == 1.5
+        assert runtime["output_multiplier"] == 0.5
+        assert runtime["final_logit_softcapping"] == 20.0
+        assert runtime["causal"] is False
+
+        # The same hybrid config must still recover the training-side subclass.
+        restored = DFlash2SpeculatorConfig.from_pretrained(str(tmp_path))
+        assert restored.speculators_model_type == "dflash2"
+        assert restored.speculators_config.algorithm == "dflash2"
+        assert restored.transformer_layer_config.model_type == "qwen3"
+
+    def test_vllm_reads_saved_config_without_a_plugin(self, tmp_path, monkeypatch):
+        config_module = pytest.importorskip("vllm.transformers_utils.config")
+
+        model = make_model()
+        model.save_pretrained(str(tmp_path))
+        monkeypatch.setenv("VLLM_PLUGINS", "")
+
+        runtime = config_module.get_config(str(tmp_path), trust_remote_code=False)
+        assert runtime.model_type == "qwen3"
+        assert runtime.architectures == ["DFlash2DraftModel"]
+        assert runtime.dflash_config["selector_top_k"] == 4
 
 
 class TestForward:

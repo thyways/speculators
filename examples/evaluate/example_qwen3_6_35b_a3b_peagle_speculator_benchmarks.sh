@@ -17,10 +17,10 @@
 #
 # Parallel drafting on the EAGLE-3 runtime is not implemented by the V2 model
 # runner (vllm/config/vllm.py rejects it outright), so this script pins
-# VLLM_USE_V2_MODEL_RUNNER=0. The V1 EagleProposer in turn refuses a draft whose
-# config still advertises `mrope_section`, which every drafter trained against
-# the M-RoPE Qwen3.6 verifier does; the `speculators_peagle` plugin normalizes
-# that to linear positions. See src/speculators/vllm/peagle.py.
+# VLLM_USE_V2_MODEL_RUNNER=0. New Speculators checkpoints remove inherited
+# multimodal `mrope_section` metadata from the serialized text-only draft config,
+# allowing vLLM 0.28's native P-EAGLE translator and V1 proposer to load it
+# without an external plugin.
 
 set -Eeuo pipefail
 
@@ -66,18 +66,12 @@ VLLM_PYTHON="${VLLM_PYTHON:-$RUNTIME_REPO/vllm_venv/bin/python}"
 EVAL_PYTHON="${EVAL_PYTHON:-$RUNTIME_REPO/speculators_venv/bin/python}"
 GUIDELLM="${GUIDELLM:-$RUNTIME_REPO/speculators_venv/bin/guidellm}"
 EVALUATE_PY="${EVALUATE_PY:-$REPO/scripts/evaluate/evaluate.py}"
-PLUGIN_PYTHONPATH="$REPO/src:$REPO/hs_connectors/src"
 
 VLLM_PID=""
-PLUGIN_METADATA_ROOT=""
 
 cleanup() {
     local status=$?
     trap - EXIT INT TERM
-
-    if [[ -n "$PLUGIN_METADATA_ROOT" && -d "$PLUGIN_METADATA_ROOT" ]]; then
-        rm -rf -- "$PLUGIN_METADATA_ROOT"
-    fi
 
     if [[ -n "$VLLM_PID" ]] && kill -0 "$VLLM_PID" 2>/dev/null; then
         echo "Stopping vLLM server..."
@@ -116,11 +110,6 @@ for path in \
     fi
 done
 
-if [[ ! -d "$REPO/src/speculators" || ! -d "$REPO/hs_connectors/src" ]]; then
-    echo "Missing Speculators source or hs_connectors under: $REPO" >&2
-    exit 1
-fi
-
 if [[ "$MODE" != "throughput" && "$MODE" != "sweep" ]]; then
     echo "MODE must be 'throughput' or 'sweep', got: $MODE" >&2
     exit 1
@@ -139,34 +128,6 @@ SPECULATIVE_CONFIG="$(
     printf '{"model":"%s","method":"eagle3","num_speculative_tokens":%s,"parallel_drafting":true}' \
         "$MODEL" "$NUM_SPECULATIVE_TOKENS"
 )"
-
-# The shared vLLM environment is editable-installed from another worktree, so
-# its dist-info may predate this new plugin entry point. Add a tiny temporary
-# distribution metadata shim when needed; PYTHONPATH still points at this
-# worktree's real source, and the environment itself is left untouched.
-if ! "$VLLM_PYTHON" - <<'PY'
-from importlib.metadata import entry_points
-
-plugins = entry_points(group="vllm.general_plugins")
-raise SystemExit(not any(item.name == "speculators_peagle" for item in plugins))
-PY
-then
-    PLUGIN_METADATA_ROOT="$(mktemp -d /tmp/speculators-peagle-plugin.XXXXXX)"
-    DIST_INFO="$PLUGIN_METADATA_ROOT/speculators_peagle_runtime-0.0.0.dist-info"
-    mkdir -p "$DIST_INFO"
-    printf '%s\n' \
-        'Metadata-Version: 2.1' \
-        'Name: speculators-peagle-runtime' \
-        'Version: 0.0.0' > "$DIST_INFO/METADATA"
-    printf '%s\n' \
-        '[vllm.general_plugins]' \
-        'speculators_peagle = speculators.vllm.peagle:register' \
-        > "$DIST_INFO/entry_points.txt"
-fi
-
-if [[ -n "$PLUGIN_METADATA_ROOT" ]]; then
-    PLUGIN_PYTHONPATH="$PLUGIN_PYTHONPATH:$PLUGIN_METADATA_ROOT"
-fi
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -197,8 +158,7 @@ echo "=== Step 1: Launching vLLM P-EAGLE server ==="
 setsid env \
     CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
     HF_ENDPOINT="$HF_ENDPOINT" \
-    PYTHONPATH="$PLUGIN_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}" \
-    VLLM_PLUGINS=speculators_peagle \
+    VLLM_PLUGINS="" \
     VLLM_USE_V2_MODEL_RUNNER="$VLLM_USE_V2_MODEL_RUNNER" \
     VLLM_PORT="$VLLM_INTERNAL_PORT" \
     TOKENIZERS_PARALLELISM=false \
