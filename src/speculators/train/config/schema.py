@@ -93,7 +93,7 @@ class DraftArgs(_Group):
     num_layers: int | None = Field(
         default=None,
         description="Number of draft decoder layers to synthesize. "
-        "(default: 5 for dflash, 1 otherwise).",
+        "(default: 5 for dflash/dspark/dflash2, 1 otherwise).",
     )
     draft_arch: Literal["llama", "qwen3"] | None = Field(
         default=None,
@@ -804,10 +804,11 @@ class TrainConfig(BaseSettings):
         pre-refactor ``parse_args``: unset ``draft_arch`` -> ``llama`` for eagle3 else
         ``qwen3``; unset ``norm_before_fc`` / ``norm_output`` -> ``True`` for eagle3
         else ``False``; unset ``muon_lr`` -> ``10 * lr``; unset ``num_layers`` -> ``5``
-        for dflash else ``1``; unset ``per_position_loss_weight`` -> ``dpace`` for
-        dflash else ``fixed-exp-decay``; unset ``loss_fn`` -> ``ce`` for dflash else
-        ``kl_div``; unset ``block_size`` -> ``16`` for dflash else ``8``. ``dflash2``
-        is a DFlash backbone plus two modules, so it takes the same four defaults.
+        for dflash/dspark/dflash2 else ``1``; unset ``per_position_loss_weight`` ->
+        ``dpace`` for dflash/dflash2 else ``fixed-exp-decay``; unset ``loss_fn`` ->
+        ``ce`` for dflash/dflash2 else ``kl_div``; unset ``block_size`` -> ``16`` for
+        dflash/dflash2 else ``8``. ``dflash2`` is a DFlash backbone plus two modules,
+        so it takes the same DFlash recipe; DSpark shares only the layer-count default.
 
         The dflash-conditional defaults reflect the recipe from
         https://github.com/vllm-project/speculators/issues/979: this combination
@@ -827,8 +828,9 @@ class TrainConfig(BaseSettings):
         """
         is_eagle3 = self.speculator_type == "eagle3"
         # dflash2 is a dflash backbone plus the conv and the selector, so the
-        # issue-979 backbone recipe carries over; dspark deliberately does not.
+        # issue-979 backbone recipe carries over; dspark shares only the layer count.
         is_dflash = self.speculator_type in ("dflash", "dflash2")
+        is_dflash_family = self.speculator_type in {"dflash", "dspark", "dflash2"}
         if self.draft.draft_arch is None:
             self.draft.draft_arch = "llama" if is_eagle3 else "qwen3"
         if self.draft.norm_before_fc is None:
@@ -838,7 +840,7 @@ class TrainConfig(BaseSettings):
         if self.optimizer.muon_lr is None:
             self.optimizer.muon_lr = 10 * self.optimizer.lr
         if self.draft.num_layers is None:
-            self.draft.num_layers = 5 if is_dflash else 1
+            self.draft.num_layers = 5 if is_dflash_family else 1
         if self.dflash.per_position_loss_weight is None:
             self.dflash.per_position_loss_weight = (
                 "dpace" if is_dflash else "fixed-exp-decay"

@@ -265,9 +265,15 @@ class TestWeightContract:
         assert restored.final_logit_softcapping == 20.0
         after = restored.state_dict()
         assert set(after) == set(before)
+        verifier_owned = {
+            "embed_tokens.weight",
+            "lm_head.weight",
+            "verifier_lm_head.weight",
+            "verifier_norm.weight",
+        }
         for key, value in before.items():
-            if key in ("verifier_lm_head.weight", "verifier_norm.weight"):
-                continue  # reloaded from the verifier, excluded on save
+            if key in verifier_owned:
+                continue  # reloaded from the verifier, excluded on full-vocab save
             assert torch.equal(value, after[key]), key
 
     def test_saved_config_is_native_vllm_dflash2_and_resumable(self, tmp_path):
