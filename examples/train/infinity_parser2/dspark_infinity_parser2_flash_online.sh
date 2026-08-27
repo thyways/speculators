@@ -4,10 +4,10 @@
 set -Eeuo pipefail
 
 ROOT="/inspire/sfs/project/inf-multimodal/public/wumengke"
-REPO="$ROOT/speculators"
+REPO="${REPO:-$ROOT/speculators}"
 MODEL="/inspire/sfs/project/inf-multimodal/public/data_mllm/publish_models/Infinity-Parser2.1-Flash-2608"
 DATA_DIR="$ROOT/datasets/infinity_parsers2_v2_1/dflash_data/full"
-RUN_DIR="${RUN_DIR:-$ROOT/model_weights/dspark_infinity_parser2_1_flash_v2_1}"
+RUN_DIR="${RUN_DIR:-$ROOT/model_weights/dspark_parser2_flash_v2_1_vocab32k}"
 # A worker does more than wait on HTTP: it deserialises ~400 MB of hidden states
 # per packed batch, drops the verifier layer, and collates into a preallocated
 # 16384-token buffer -- roughly a CPU-second of memcpy per batch, and the 6 ranks
@@ -45,10 +45,10 @@ VLLM_MM_PROCESSOR_CACHE_GB="${VLLM_MM_PROCESSOR_CACHE_GB:-0}"
 # fast and let --max-retries retry instead of holding the step for minutes.
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-120}"
 MAX_RETRIES="${MAX_RETRIES:-1}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-$ROOT/model_weights/dspark_infinity_parser2_1_flash_v2_1}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-$ROOT/model_weights/dspark_parser2_flash_v2_1_vocab32k}"
 LOG_DIR="${LOG_DIR:-$RUN_DIR}"
 WANDB_PROJECT="${WANDB_PROJECT:-infinity-parser2-flash}"
-WANDB_MODE="${WANDB_MODE:-offline}"
+WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_KEY_FILE="${WANDB_KEY_FILE:-$ROOT/.secrets/wandb_key}"
 MEDIA_ROOT="/inspire/sfs/project/inf-multimodal/public"
 VLLM_PORT="${VLLM_PORT:-8200}"
@@ -59,6 +59,21 @@ CONFIDENCE_HEAD_ALPHA="${CONFIDENCE_HEAD_ALPHA:-1.0}"
 DEFAULT_LOSS_FN='{"ce": 0.1, "tv": 0.9}'
 LOSS_FN="${LOSS_FN:-$DEFAULT_LOSS_FN}"
 TARGET_LAYER_IDS=(2 7 12 17 22)
+# Draft vocabulary. Empty (the default) trains on the verifier's full 248,320-token
+# vocab, which is what the v2.1 run did. Point DRAFT_VOCAB_DIR at a
+# scripts/build_vocab_mapping.py output directory to train a pruned vocab instead;
+# d2t.npy / t2d.npy are read from there. Set DRAFT_VOCAB_SIZE as well to have the
+# size asserted against the files -- train.py raises on a mismatch.
+#
+# Deliberately not defaulted to $DATA_DIR: train.py auto-discovers d2t.npy/t2d.npy
+# sitting in --data-path (scripts/train.py:parse_vocab_mappings), so dropping them
+# next to the arrow shards would silently switch *every* run on this corpus to a
+# pruned vocab, full-vocab baselines included. Keeping the mappings in their own
+# directory is what lets both configurations stay runnable.
+# 默认走 32k 剪枝词表(vocab32k 续训配置)。要跑全词表基线时显式传空:
+#   DRAFT_VOCAB_DIR= DRAFT_VOCAB_SIZE= bash 本脚本
+DRAFT_VOCAB_DIR="${DRAFT_VOCAB_DIR-$ROOT/datasets/infinity_parsers2_v2_1/dflash_data/vocab_32768}"
+DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE-32768}"
 JOB_TAG="${SLURM_JOB_ID:-${JOB_ID:-$$}}"
 HIDDEN_STATES_DIR=""
 VLLM_LOG="$RUN_DIR/vllm_${JOB_TAG}.log"
@@ -101,6 +116,27 @@ for path in \
         exit 1
     fi
 done
+
+VOCAB_ARGS=()
+DRAFT_VOCAB_DESC="full (verifier vocab, no d2t/t2d)"
+if [[ -n "$DRAFT_VOCAB_DIR" ]]; then
+    for path in "$DRAFT_VOCAB_DIR/d2t.npy" "$DRAFT_VOCAB_DIR/t2d.npy"; do
+        if [[ ! -f "$path" ]]; then
+            echo "Missing vocab mapping: $path" >&2
+            exit 1
+        fi
+    done
+    VOCAB_ARGS=(
+        --d2t-path "$DRAFT_VOCAB_DIR/d2t.npy"
+        --t2d-path "$DRAFT_VOCAB_DIR/t2d.npy"
+    )
+    if [[ -n "$DRAFT_VOCAB_SIZE" ]]; then
+        VOCAB_ARGS+=(--draft-vocab-size "$DRAFT_VOCAB_SIZE")
+    fi
+    DRAFT_VOCAB_DESC="$("$SPEC_PYTHON" -c \
+        'import sys, numpy; print(numpy.load(sys.argv[1]).shape[0])' \
+        "$DRAFT_VOCAB_DIR/d2t.npy") tokens from $DRAFT_VOCAB_DIR"
+fi
 
 for command in curl flock pgrep setsid; do
     if ! command -v "$command" >/dev/null 2>&1; then
@@ -196,6 +232,7 @@ PY
 
 echo "Model:         $MODEL"
 echo "Data:          $DATA_DIR"
+echo "Draft vocab:   $DRAFT_VOCAB_DESC"
 echo "Checkpoints:   $CHECKPOINT_DIR"
 echo "vLLM GPUs:     $VLLM_GPUS"
 echo "Training GPUs: $TRAIN_GPUS"
@@ -252,14 +289,15 @@ setsid env \
     --verifier-name-or-path "$MODEL" \
     --data-path "$DATA_DIR" \
     --save-path "$CHECKPOINT_DIR" \
+    "${VOCAB_ARGS[@]}" \
     --speculator-type dspark \
     --draft-arch qwen3 \
     --draft-hidden-act silu \
-    --num-layers 5 \
+    --num-layers "${NUM_LAYERS:-5}" \
     --mask-token-id 248077 \
     --block-size "$BLOCK_SIZE" \
     --sample-from-anchor \
-    --max-anchors 512 \
+    --max-anchors "${MAX_ANCHORS:-3072}" \
     --target-layer-ids "${TARGET_LAYER_IDS[@]}" \
     --draft-mrope-full-head-hack \
     --sliding-window 2048 \
