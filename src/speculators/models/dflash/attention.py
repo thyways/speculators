@@ -11,6 +11,7 @@ def create_dual_stream_anchor_mask_mod(
     block_size: int,
     sliding_window: int | None = None,
     sliding_window_non_causal: bool = False,
+    force_causal_local: bool = False,
 ):
     """Build the independent prefix and local masks for an anchored block.
 
@@ -20,7 +21,9 @@ def create_dual_stream_anchor_mask_mod(
     :func:`create_anchor_block_mask_mod`) or drive two attention calls with
     independent softmax normalizers.
     """
-    non_causal = sliding_window is None or sliding_window_non_causal
+    non_causal = not force_causal_local and (
+        sliding_window is None or sliding_window_non_causal
+    )
     device = document_ids.device
     anchor_positions = anchor_positions.to(device=device, dtype=torch.long).contiguous()
     if anchor_positions.ndim != 1:
@@ -66,6 +69,7 @@ def create_anchor_block_mask_mod(
     block_size: int,
     sliding_window: int | None = None,
     sliding_window_non_causal: bool = False,
+    force_causal_local: bool = False,
 ):
     """
     Build a flex-attention mask mod where each query block corresponds to one anchor.
@@ -101,6 +105,7 @@ def create_anchor_block_mask_mod(
         block_size=block_size,
         sliding_window=sliding_window,
         sliding_window_non_causal=sliding_window_non_causal,
+        force_causal_local=force_causal_local,
     )
 
     def shifted_local_mask_mod(b, h, q_idx, kv_idx):

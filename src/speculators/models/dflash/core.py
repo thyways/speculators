@@ -355,6 +355,26 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         """
         return self.lm_head(hidden)
 
+    def _force_causal_local_attention(self) -> bool:
+        """Whether every draft layer must use a causal intra-block mask."""
+        return False
+
+    def _init_draft_layer_state(
+        self,
+        _hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Initialize optional state carried across draft layers."""
+        return None
+
+    def _after_draft_layer(
+        self,
+        hidden_states: torch.Tensor,
+        layer_state: torch.Tensor | None,
+        _layer_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Transform one layer's output and its optional side-stream state."""
+        return hidden_states, layer_state
+
     @torch.compiler.disable
     def _create_attention_mask(
         self,
@@ -372,6 +392,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             block_size=self.block_size,
             sliding_window=sliding_window,
             sliding_window_non_causal=sliding_window_non_causal,
+            force_causal_local=self._force_causal_local_attention(),
         )
         return self._create_mask_fn(
             mask_mod,
@@ -413,7 +434,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         return full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid
 
-    def _backbone_forward(
+    def _backbone_raw_hidden_forward(
         self,
         hidden_states: torch.Tensor,  # [1, total_seq_len, num_hidden*hidden_size]
         input_ids: torch.Tensor,  # [1, total_seq_len]
@@ -423,11 +444,12 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         position_ids: torch.Tensor | None = None,  # [1, total_seq_len]
         **kwargs,
     ):
-        """Run the anchored-block draft transformer up to the draft logits.
+        """Run the anchored-block transformer and return pre-norm hidden states.
 
-        Returns ``(hidden, logits, targets, aligned_loss_mask,
-        anchored_block_indices)``. DSpark reuses this and adds its Markov and
-        confidence heads before computing its own loss.
+        The raw hidden-state seam lets DFlash-family heads insert a single
+        block-parallel correction before the shared final RMSNorm and LM head.
+        The returned tuple is ``(raw_hidden, targets, aligned_loss_mask,
+        anchored_block_indices)``.
         """
         device = hidden_states.device
         total_seq_len = hidden_states.shape[1]
@@ -490,6 +512,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 targets = verifier_logits[:, anchored_block_indices]
             # shape: [1, num_anchors*block_size, draft_vocab_size]
 
+        draft_layer_state = self._init_draft_layer_state(noise_embedding)
         for layer_idx, layer in enumerate(self.layers):
             noise_embedding = layer(
                 hidden_states=noise_embedding,
@@ -506,14 +529,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-
-        hidden = self.norm(noise_embedding)
-        logits = self._compute_draft_logits(
-            hidden,
-            input_ids,
-            anchored_block_indices,
-        )
-        # shape: [1, num_anchors*block_size, vocab_size]
+            noise_embedding, draft_layer_state = self._after_draft_layer(
+                noise_embedding,
+                draft_layer_state,
+                layer_idx,
+            )
 
         aligned_loss_mask = loss_mask.clone()[:, anchored_block_indices]
         # shape: [1, num_anchors*block_size]
@@ -529,6 +549,64 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         if not self.config.sample_from_anchor:
             aligned_loss_mask[:, :: self.block_size] = 0
 
+        return noise_embedding, targets, aligned_loss_mask, anchored_block_indices
+
+    def _backbone_hidden_forward(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        loss_mask: torch.Tensor,
+        verifier_last_hidden_states: torch.Tensor,
+        document_ids: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        **kwargs,
+    ):
+        """Run the backbone and apply the shared final RMSNorm."""
+        raw_hidden, targets, aligned_loss_mask, anchored_block_indices = (
+            self._backbone_raw_hidden_forward(
+                hidden_states,
+                input_ids,
+                loss_mask,
+                verifier_last_hidden_states,
+                document_ids,
+                position_ids,
+                **kwargs,
+            )
+        )
+        return (
+            self.norm(raw_hidden),
+            targets,
+            aligned_loss_mask,
+            anchored_block_indices,
+        )
+
+    def _backbone_forward(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        loss_mask: torch.Tensor,
+        verifier_last_hidden_states: torch.Tensor,
+        document_ids: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        **kwargs,
+    ):
+        """Run the backbone, final norm, and the normal draft LM head."""
+        hidden, targets, aligned_loss_mask, anchored_block_indices = (
+            self._backbone_hidden_forward(
+                hidden_states,
+                input_ids,
+                loss_mask,
+                verifier_last_hidden_states,
+                document_ids,
+                position_ids,
+                **kwargs,
+            )
+        )
+        logits = self._compute_draft_logits(
+            hidden,
+            input_ids,
+            anchored_block_indices,
+        )
         return hidden, logits, targets, aligned_loss_mask, anchored_block_indices
 
     @conditional_torch_compile

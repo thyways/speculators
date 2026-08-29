@@ -31,6 +31,8 @@ by duck typing so a model only implements what it needs:
   state carried across steps (Domino). Needs
   ``init_recurrent_state`` / ``advance_recurrent_state`` /
   ``recurrent_logit_correction``.
+* ``has_candidate_selector`` -- bypass the full-vocabulary LM head and let a
+  token-code candidate decoder select the next target-vocabulary token directly.
 """
 
 from __future__ import annotations
@@ -255,7 +257,37 @@ def _emit_step_token(
     )
 
 
-def sample_sequential_block(
+def _sample_candidate_block(
+    self: Any,
+    *,
+    num_reqs: int,
+    head_hidden: torch.Tensor,
+    hidden_per_step: torch.Tensor,
+) -> None:
+    """Run a no-base-logits candidate decoder left to right."""
+    if self.draft_logits is not None:
+        raise NotImplementedError(
+            "Token-latent candidate selection currently supports greedy drafting only."
+        )
+    prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]].long()
+    anchor_hidden = head_hidden[self._anchor_idx[:num_reqs]]
+    selector_state = self.model.init_candidate_selector(
+        hidden_per_step,
+        anchor_hidden,
+        prev,
+    )
+    for step in range(self.num_speculative_steps):
+        sampled = self.model.select_candidate_token(
+            step,
+            hidden_per_step[:, step],
+            prev,
+            selector_state,
+        )
+        self.draft_tokens[:num_reqs, step] = sampled
+        prev = sampled
+
+
+def sample_sequential_block(  # noqa: C901
     self: Any,
     num_reqs: int,
     head_hidden: torch.Tensor,
@@ -267,6 +299,18 @@ def sample_sequential_block(
     hidden_per_step = sample_hidden.view(num_reqs, num_steps, -1)
 
     model = self.model
+    has_candidate_selector = bool(
+        getattr(model, "has_candidate_selector", lambda: False)()
+    )
+    if has_candidate_selector:
+        _sample_candidate_block(
+            self,
+            num_reqs=num_reqs,
+            head_hidden=head_hidden,
+            hidden_per_step=hidden_per_step,
+        )
+        return
+
     has_hidden_correction = bool(
         getattr(model, "has_hidden_correction", lambda: False)()
     )

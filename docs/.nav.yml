@@ -10,6 +10,7 @@ nav:
                 - Eagle3: user_guide/algorithms/eagle3.md
                 - Dflash: user_guide/algorithms/dflash.md
                 - DFlash2: user_guide/algorithms/dflash2.md
+                - Parallel Token-Latent Feedback: user_guide/algorithms/token_latent_feedback.md
                 - DSpark: user_guide/algorithms/dspark.md
                 - Domino: user_guide/algorithms/domino.md
                 - P-Eagle: user_guide/algorithms/peagle.md

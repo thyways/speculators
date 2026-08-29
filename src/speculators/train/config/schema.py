@@ -93,7 +93,7 @@ class DraftArgs(_Group):
     num_layers: int | None = Field(
         default=None,
         description="Number of draft decoder layers to synthesize. "
-        "(default: 5 for dflash/dspark/dflash2, 1 otherwise).",
+        "(default: 5 for dflash/dspark/dflash2/token-latent variants, 1 otherwise).",
     )
     draft_arch: Literal["llama", "qwen3"] | None = Field(
         default=None,
@@ -476,7 +476,7 @@ class LoggingArgs(_Group):
 
 
 class DFlashArgs(_Group):
-    """DFlash-family backbone knobs shared by DFlash, DFly, DSpark, and Domino."""
+    """DFlash-family backbone knobs shared by DFlash-family algorithms."""
 
     block_size: int | None = Field(
         default=None,
@@ -591,6 +591,92 @@ class DominoArgs(_Group):
     )
 
 
+class TokenLatentFeedbackArgs(_Group):
+    """Parallel Token-Latent Feedback (方案设计 v1.2) settings."""
+
+    latent_dim: int = Field(
+        default=128,
+        gt=0,
+        description="Width of the parallel token-intent latent stream.",
+    )
+    token_latent_dim: int | None = Field(
+        default=None,
+        gt=0,
+        description="Optional alias for --latent-dim.",
+    )
+    feedback_stages: int = Field(
+        default=1,
+        ge=1,
+        description="Number of parallel feedback stages (v1.2 uses one).",
+    )
+    latent_feedback_stages: int | None = Field(
+        default=None,
+        ge=1,
+        description="Optional alias for --feedback-stages.",
+    )
+    prefix_mixer_mode: Literal["full", "shifted", "none"] = Field(
+        default="full",
+        description="Prefix mixer mode: full, shifted, or none (ablation).",
+    )
+    feedback_mode: Literal["full", "shifted", "none"] | None = Field(
+        default=None,
+        description="Optional alias for --prefix-mixer-mode.",
+    )
+    prefix_mixer: Literal["full", "shifted", "none"] | None = Field(
+        default=None,
+        description="Optional alias for --prefix-mixer-mode.",
+    )
+    prefix_mixer_parameterization: Literal["toeplitz"] = Field(
+        default="toeplitz",
+        description="Parameterization of the causal prefix mixer.",
+    )
+    use_reliability_gate: bool = Field(
+        default=True,
+        description="Use a scalar per-position reliability gate on source latents.",
+    )
+    reliability_gate: bool | None = Field(
+        default=None,
+        description="Optional alias for --use-reliability-gate.",
+    )
+    strict_causal_prefix: bool = Field(
+        default=True,
+        description="Restrict prefix mixing to strictly earlier positions.",
+    )
+    feedback_output_projection_init: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Initial value of the latent-to-hidden feedback projection.",
+    )
+    position_scale_init: float = Field(
+        default=1.0,
+        ge=0.0,
+        description="Initial learned per-position feedback scale.",
+    )
+    latent_loss_alpha: float = Field(
+        default=0.1,
+        ge=0.0,
+        description="Weight of the token-latent cosine auxiliary loss.",
+    )
+    latent_loss_weight: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Optional alias for --latent-loss-alpha.",
+    )
+    # Compatibility knobs used by the earlier LatentScan/TokenLatentSSM
+    # experiments. They remain harmless no-ops for v1.2 and allow one parser to
+    # launch all token-latent variants from the same training entry point.
+    latent_layer_scale_init: float = Field(default=1e-3, ge=0.0)
+    strict_causal_slots: bool = Field(default=True)
+    token_code_dim: int = Field(default=128, gt=0)
+    ssm_state_dim: int = Field(default=256, gt=0)
+    hidden_candidate_count: int = Field(default=32, gt=0)
+    transition_candidate_count: int = Field(default=32, gt=0)
+    training_negative_count: int = Field(default=128, gt=0)
+    retrieval_loss_weight: float = Field(default=0.5, ge=0.0)
+    conditional_loss_weight: float = Field(default=1.0, ge=0.0)
+    token_latent_logit_scale_init: float = Field(default=1.0 / 0.07, gt=0.0)
+
+
 class DSparkArgs(_Group):
     """DSpark-exclusive heads (sequential Markov head + confidence head)."""
 
@@ -656,6 +742,7 @@ _GROUPS: dict[str, type[_Group]] = {
     "dflash2": DFlash2Args,
     "dfly": DFlyArgs,
     "domino": DominoArgs,
+    "token_latent_feedback": TokenLatentFeedbackArgs,
     "dspark": DSparkArgs,
     "peagle": PEagleArgs,
     "mtp": MTPArgs,
@@ -740,7 +827,8 @@ class TrainConfig(BaseSettings):
     speculator_type: str = Field(
         default="eagle3",
         description="Type of speculator model to train "
-        "(eagle3, dflash, dflash2, dfly, domino, dspark, peagle, mtp).",
+        "(eagle3, dflash, dflash2, dfly, domino, dspark, peagle, "
+        "latent_scan, token_latent_ssm, token_latent_feedback, mtp).",
     )
     dry_run: bool = Field(
         default=False,
@@ -768,6 +856,9 @@ class TrainConfig(BaseSettings):
     dflash2: DFlash2Args = Field(default_factory=DFlash2Args)
     dfly: DFlyArgs = Field(default_factory=DFlyArgs)
     domino: DominoArgs = Field(default_factory=DominoArgs)
+    token_latent_feedback: TokenLatentFeedbackArgs = Field(
+        default_factory=TokenLatentFeedbackArgs
+    )
     dspark: DSparkArgs = Field(default_factory=DSparkArgs)
     peagle: PEagleArgs = Field(default_factory=PEagleArgs)
     mtp: MTPArgs = Field(default_factory=MTPArgs)
@@ -780,8 +871,9 @@ class TrainConfig(BaseSettings):
         else ``False``; unset ``muon_lr`` -> ``10 * lr``; unset ``num_layers`` -> ``5``
         for DFlash-family models else ``1``; unset ``per_position_loss_weight`` ->
         ``dpace`` for dflash and ``fixed-exp-decay`` otherwise; unset ``loss_fn`` ->
-        ``ce`` for dflash and ``kl_div`` otherwise; unset ``block_size`` -> ``16`` for
-        dflash and ``8`` otherwise. DFlash2 has its own experimental defaults.
+        ``ce`` for dflash, ``{\"ce\": 0.1, \"tv\": 0.9}`` for token-latent
+        feedback, and ``kl_div`` otherwise; unset ``block_size`` -> ``16`` for
+        dflash and ``8`` otherwise.
 
         The dflash-conditional defaults reflect the recipe from
         https://github.com/vllm-project/speculators/issues/979: this combination
@@ -801,7 +893,25 @@ class TrainConfig(BaseSettings):
         """
         is_eagle3 = self.speculator_type == "eagle3"
         is_dflash = self.speculator_type == "dflash"
-        is_dflash_family = self.speculator_type in {"dflash", "dspark", "dflash2"}
+        is_feedback = self.speculator_type in {
+            "token_latent_feedback",
+            "parallel_token_latent",
+            "latent_feedback",
+            "parallel_token_latent_feedback",
+        }
+        is_latent_scan = self.speculator_type == "latent_scan"
+        is_token_latent_ssm = self.speculator_type == "token_latent_ssm"
+        is_dflash_family = self.speculator_type in {
+            "dflash",
+            "dspark",
+            "dflash2",
+            "token_latent_feedback",
+            "parallel_token_latent",
+            "latent_feedback",
+            "parallel_token_latent_feedback",
+            "latent_scan",
+            "token_latent_ssm",
+        }
         if self.draft.draft_arch is None:
             self.draft.draft_arch = "llama" if is_eagle3 else "qwen3"
         if self.draft.norm_before_fc is None:
@@ -816,10 +926,18 @@ class TrainConfig(BaseSettings):
             self.draft.sliding_window_non_causal = self.speculator_type == "dflash2"
         if self.dflash.per_position_loss_weight is None:
             self.dflash.per_position_loss_weight = (
-                "dpace" if is_dflash else "fixed-exp-decay"
+                "dpace"
+                if (is_dflash or is_latent_scan or is_token_latent_ssm)
+                else "fixed-exp-decay"
             )
         if self.loss.loss_fn is None:
-            self.loss.loss_fn = "ce" if is_dflash else "kl_div"
+            self.loss.loss_fn = (
+                '{"ce": 0.1, "tv": 0.9}'
+                if is_feedback
+                else "ce"
+                if (is_dflash or is_latent_scan or is_token_latent_ssm)
+                else "kl_div"
+            )
         if self.dflash.block_size is None:
             self.dflash.block_size = 16 if is_dflash else 8
         return self

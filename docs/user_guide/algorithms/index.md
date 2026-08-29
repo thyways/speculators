@@ -1,6 +1,6 @@
 # Algorithms
 
-Speculators supports six speculative decoding algorithms. All are lossless -- they produce output from the same distribution as the target model.
+Speculators supports several speculative decoding algorithms. All are lossless -- they produce output from the same distribution as the target model.
 
 ## [Eagle-3](eagle3.md)
 
@@ -17,6 +17,10 @@ Predicts all draft tokens in a single forward pass using block-based prediction 
 ## [DFlash2](dflash2.md)
 
 Adds local dynamic convolutions and a predecessor-conditioned candidate selector to DFlash while retaining one parallel draft-model forward pass. Experimental training support.
+
+## [Parallel Token-Latent Feedback](token_latent_feedback.md)
+
+Adds one constant-depth, strictly causal token-latent prefix mixer after the DFlash backbone. It retains a single full-vocabulary LM-head call and avoids a serial in-block sampler.
 
 ## [DSpark](dspark.md)
 

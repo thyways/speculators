@@ -144,6 +144,9 @@ speculators = "speculators.__main__:app"
 [project.entry-points."vllm.general_plugins"]
 speculators_dfly = "speculators.vllm.dfly:register"
 speculators_domino = "speculators.vllm.domino:register"
+speculators_latent_scan = "speculators.vllm.latent_scan:register"
+speculators_token_latent_ssm = "speculators.vllm.token_latent_ssm:register"
+speculators_token_latent_feedback = "speculators.vllm.token_latent_feedback:register"
 
 [project.urls]
 homepage = "https://github.com/vllm-project/speculators"

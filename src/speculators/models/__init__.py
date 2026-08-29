@@ -6,8 +6,23 @@ from .dfly import DFlyDraftModel, DFlySpeculatorConfig
 from .domino import DominoDraftModel, DominoSpeculatorConfig
 from .dspark import DSparkDraftModel, DSparkSpeculatorConfig
 from .eagle3 import Eagle3DraftModel, Eagle3SpeculatorConfig
+from .latent_scan import LatentScanDraftModel, LatentScanSpeculatorConfig
 from .mtp import MTPDraftModel, MTPSpeculatorConfig
 from .peagle import PEagleDraftModel, PEagleSpeculatorConfig
+from .token_latent_feedback import (
+    LatentFeedbackDraftModel,
+    LatentFeedbackSpeculatorConfig,
+    ParallelTokenLatentDraftModel,
+    ParallelTokenLatentFeedbackDraftModel,
+    ParallelTokenLatentFeedbackSpeculatorConfig,
+    ParallelTokenLatentSpeculatorConfig,
+    TokenLatentFeedbackDraftModel,
+    TokenLatentFeedbackSpeculatorConfig,
+)
+from .token_latent_ssm import (
+    TokenLatentSSMDraftModel,
+    TokenLatentSSMSpeculatorConfig,
+)
 
 __all__ = [
     "DFlash2DraftModel",
@@ -22,8 +37,20 @@ __all__ = [
     "DominoSpeculatorConfig",
     "Eagle3DraftModel",
     "Eagle3SpeculatorConfig",
+    "LatentFeedbackDraftModel",
+    "LatentFeedbackSpeculatorConfig",
+    "LatentScanDraftModel",
+    "LatentScanSpeculatorConfig",
     "MTPDraftModel",
     "MTPSpeculatorConfig",
     "PEagleDraftModel",
     "PEagleSpeculatorConfig",
+    "ParallelTokenLatentDraftModel",
+    "ParallelTokenLatentFeedbackDraftModel",
+    "ParallelTokenLatentFeedbackSpeculatorConfig",
+    "ParallelTokenLatentSpeculatorConfig",
+    "TokenLatentFeedbackDraftModel",
+    "TokenLatentFeedbackSpeculatorConfig",
+    "TokenLatentSSMDraftModel",
+    "TokenLatentSSMSpeculatorConfig",
 ]
