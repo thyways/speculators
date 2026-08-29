@@ -18,7 +18,7 @@ HIDDEN_STATES_DIR="${HIDDEN_STATES_DIR:-$REPO/tmp/token_latent_feedback_hidden_s
 VLLM_PORT="${VLLM_PORT:-8600}"
 VLLM_ENDPOINT="${VLLM_ENDPOINT:-http://localhost:${VLLM_PORT}/v1}"
 VLLM_HEALTH_ENDPOINT="${VLLM_HEALTH_ENDPOINT:-http://localhost:${VLLM_PORT}/health}"
-WANDB_PROJECT="${WANDB_PROJECT:-qwen3.6-35b-a3b-token-latent-feedback}"
+WANDB_PROJECT="${WANDB_PROJECT:-qwen3.6-35b-a3b-5swa}"
 WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_KEY_FILE="${WANDB_KEY_FILE:-$WS/.secrets/wandb_key}"
 
@@ -67,12 +67,22 @@ echo "Run: $RUN_DIR"
 echo "vLLM GPUs: $VLLM_GPUS; training GPUs: $TRAIN_GPUS"
 echo "Hidden states: $HIDDEN_STATES_DIR"
 
-setsid env CUDA_VISIBLE_DEVICES="$VLLM_GPUS" PYTHONPATH="$PYTHONPATH_LOCAL" \
-    "$VLLM_PYTHON" "$LAUNCH_VLLM" "$MODEL" \
-    --target-layer-ids 2 11 20 29 38 --include-last-layer \
-    --hidden-states-path "$HIDDEN_STATES_DIR" -- \
-    --tensor-parallel-size 1 --data-parallel-size 2 \
-    --max-model-len 10000 --gpu-memory-utilization 0.92 --port "$VLLM_PORT" \
+setsid env \
+    CUDA_VISIBLE_DEVICES="$VLLM_GPUS" \
+    PYTHONPATH="$PYTHONPATH_LOCAL" \
+    PYTHONUNBUFFERED=1 \
+    "$VLLM_PYTHON" \
+    "$LAUNCH_VLLM" \
+    "$MODEL" \
+    --target-layer-ids 2 11 20 29 38 \
+    --include-last-layer \
+    --hidden-states-path "$HIDDEN_STATES_DIR" \
+    -- \
+    --tensor-parallel-size 1 \
+    --data-parallel-size 2 \
+    --max-model-len 10000 \
+    --gpu-memory-utilization 0.92 \
+    --port "$VLLM_PORT" \
     >"$RUN_DIR/vllm.log" 2>&1 &
 VLLM_PID=$!
 
@@ -83,24 +93,55 @@ until curl -sf "$VLLM_HEALTH_ENDPOINT" >/dev/null 2>&1; do
     sleep 2
 done
 
-setsid env CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" PYTHONPATH="$PYTHONPATH_LOCAL" \
-    WANDB_PROJECT="$WANDB_PROJECT" WANDB_MODE="$WANDB_MODE" \
-    "$TORCHRUN" --standalone --nproc_per_node 6 "$TRAIN_SCRIPT" \
-    --verifier-name-or-path "$MODEL" --data-path "$DATA_DIR" \
-    --hidden-states-path "$HIDDEN_STATES_DIR" --save-path "$CHECKPOINT_DIR" \
-    --epochs 1 --train-data-ratio 0.98 --optimizer muon --muon-lr 2e-4 --lr 1e-4 \
-    --weight-decay 0.01 --noise-std 0 --scheduler-type cosine \
-    --scheduler-warmup-ratio 0.04 --total-seq-len 4096 \
-    --hidden-states-dtype bfloat16 --speculator-type token_latent_feedback \
-    --draft-attn-impl simple_flex_attention --block-size 8 --no-sample-from-anchor \
-    --max-anchors 512 --num-layers 5 --sliding-window 2048 \
-    --target-layer-ids 2 11 20 29 38 --loss-fn '{"ce": 0.1, "tv": 0.9}' \
-    --per-position-loss-weight fixed-exp-decay --latent-dim 128 \
-    --feedback-stages 1 --prefix-mixer-mode full --latent-loss-alpha 0.1 \
+setsid env \
+    CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" \
+    PYTHONPATH="$PYTHONPATH_LOCAL" \
+    PYTHONUNBUFFERED=1 \
+    WANDB_PROJECT="$WANDB_PROJECT" \
+    WANDB_MODE="$WANDB_MODE" \
+    "$TORCHRUN" \
+    --standalone \
+    --nproc_per_node 6 \
+    "$TRAIN_SCRIPT" \
+    --verifier-name-or-path "$MODEL" \
+    --data-path "$DATA_DIR" \
+    --hidden-states-path "$HIDDEN_STATES_DIR" \
+    --save-path "$CHECKPOINT_DIR" \
+    --epochs 1 \
+    --train-data-ratio 0.98 \
+    --optimizer muon \
+    --muon-lr 2e-4 \
+    --lr 1e-4 \
+    --weight-decay 0.01 \
+    --noise-std 0 \
+    --scheduler-type cosine \
+    --scheduler-warmup-ratio 0.04 \
+    --total-seq-len 4096 \
+    --hidden-states-dtype bfloat16 \
+    --speculator-type token_latent_feedback \
+    --draft-attn-impl simple_flex_attention \
+    --block-size 8 \
+    --no-sample-from-anchor \
+    --max-anchors 512 \
+    --num-layers 5 \
+    --sliding-window 2048 \
+    --target-layer-ids 2 11 20 29 38 \
+    --loss-fn '{"ce": 0.1, "tv": 0.9}' \
+    --per-position-loss-weight fixed-exp-decay \
+    --latent-dim 128 \
+    --feedback-stages 1 \
+    --prefix-mixer-mode full \
+    --latent-loss-alpha 0.1 \
     --hidden-states-backend file \
-    --vllm-endpoint "$VLLM_ENDPOINT" --request-timeout 300 --max-retries 5 \
-    --on-missing generate --on-generate delete --fail-on-hidden-state-error \
-    --logger wandb --log-dir "$LOG_DIR" --checkpoint-freq 0.1 \
+    --vllm-endpoint "$VLLM_ENDPOINT" \
+    --request-timeout 300 \
+    --max-retries 5 \
+    --on-missing generate \
+    --on-generate delete \
+    --fail-on-hidden-state-error \
+    --logger wandb \
+    --log-dir "$LOG_DIR" \
+    --checkpoint-freq 0.1 \
     --run-name token_latent_feedback_qwen3_6_35b_a3b &
 TRAIN_PID=$!
 wait "$TRAIN_PID"
