@@ -95,7 +95,6 @@ class TokenLatentFeedbackHead(nn.Module):
         self.initializer_range = float(initializer_range)
 
         self.input_norm = LatentRMSNorm(self.hidden_size, rms_norm_eps)
-        self.latent_norm = LatentRMSNorm(self.latent_dim, rms_norm_eps)
         # The latent projection and scalar gate share one packed GEMM.
         self.intent_gate_proj = nn.Linear(
             self.hidden_size,

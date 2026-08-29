@@ -148,3 +148,9 @@ def test_model_forward_uses_ce_tv_and_backpropagates():
     assert "tv_loss_sum" in metrics
     loss.backward()
     assert model.token_latent_head.intent_gate_proj.weight.grad is not None
+    unused = [
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and parameter.grad is None
+    ]
+    assert unused == []
