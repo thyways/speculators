@@ -82,7 +82,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         # Number of draft layers is encoded in transformer_layer_config
         num_draft_layers = tl_config.num_hidden_layers
         self.layers = nn.ModuleList(
-            [self._build_layer(layer_idx) for layer_idx in range(num_draft_layers)]
+            [
+                self._make_decoder_layer(config, layer_idx)
+                for layer_idx in range(num_draft_layers)
+            ]
         )
         self.sliding_window = tl_config.sliding_window
         self.sliding_window_indices = [
@@ -145,13 +148,19 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             keys_to_ignore_on_load_missing
         )
 
-    def _build_layer(self, layer_idx: int) -> nn.Module:
+    def _make_decoder_layer(
+        self, _config: DFlashSpeculatorConfig, layer_idx: int
+    ) -> nn.Module:
         """Build one draft decoder layer.
 
-        Subclasses that carry extra per-layer modules (DFlash2's convolutions)
-        override this instead of rebuilding ``self.layers``; mirrors the
-        ``decoder_layer_cls`` hook on the vLLM side.
+        DFlash2 overrides this factory with its upstream implementation. The
+        legacy ``_build_layer`` hook is retained for the other DFlash-family
+        extensions in this branch.
         """
+        return self._build_layer(layer_idx)
+
+    def _build_layer(self, layer_idx: int) -> nn.Module:
+        """Legacy layer factory used by DFly and Domino subclasses."""
         return Qwen3DFlashDecoderLayer(self.config.transformer_layer_config, layer_idx)  # type: ignore[arg-type]
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -252,13 +261,19 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         # True: sample from anchor too (block_size tokens)
         speculative_tokens = block_size if sample_from_anchor else block_size - 1
 
+        default_non_causal = algorithm == "dflash2"
+        non_causal_arg = kwargs.get("sliding_window_non_causal")
+        sliding_window_non_causal = (
+            default_non_causal if non_causal_arg is None else non_causal_arg
+        )
+
         return {
             "transformer_layer_config": verifier_config,
             "draft_vocab_size": kwargs["draft_vocab_size"],
             "block_size": block_size,
             "aux_hidden_state_layer_ids": target_layer_ids,
             "mask_token_id": kwargs.get("mask_token_id"),
-            "sliding_window_non_causal": kwargs.get("sliding_window_non_causal", False),
+            "sliding_window_non_causal": sliding_window_non_causal,
             "sample_from_anchor": sample_from_anchor,
             "speculators_config": SpeculatorsConfig(
                 algorithm=algorithm,

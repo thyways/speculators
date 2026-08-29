@@ -16,7 +16,7 @@ Predicts all draft tokens in a single forward pass using block-based prediction 
 
 ## [DFlash2](dflash2.md)
 
-Extends DFlash with a grouped dynamic convolution inside each block and a candidate selector that walks the best path through the target head's top-K per slot. Newest; its vLLM inference path is [PR #52816](https://github.com/vllm-project/vllm/pull/52816).
+Adds local dynamic convolutions and a predecessor-conditioned candidate selector to DFlash while retaining one parallel draft-model forward pass. Experimental training support.
 
 ## [DSpark](dspark.md)
 
@@ -28,7 +28,7 @@ Finetunes the model's native multi-token prediction head on domain-specific data
 
 ## Choosing an Algorithm
 
-All algorithms can be paired with any supported verifier model. For help choosing between them, see the [Decision Guide](decision_guide.md).
+Most algorithms can be paired with any supported verifier model. DFlash2 requires the verifier's full vocabulary. For help choosing between them, see the [Decision Guide](decision_guide.md).
 
 ## Adding New Algorithms
 

@@ -32,6 +32,8 @@ _ADAMW_NAME_HINTS = (
     "layer_fusion_weights",
     "lm_head",
     "prefix_gru",
+    # DFlash2 predecessor/successor tables are embedding-like codebooks.
+    "codebook",
 )
 
 # Muon only orthogonalizes 2D weight matrices.

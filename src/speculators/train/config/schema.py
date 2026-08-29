@@ -181,11 +181,11 @@ class DraftArgs(_Group):
         "by default (except mtp). (e.g. '--full-attention-indices 0 2' makes layers 0 "
         "and 2 use full attention; the rest use sliding window).",
     )
-    sliding_window_non_causal: bool = Field(
-        default=False,
+    sliding_window_non_causal: bool | None = Field(
+        default=None,
         description="Use non-causal (bidirectional) masking within draft blocks for "
         "sliding window attention layers. Full attention layers are always "
-        "bidirectional. Note: vLLM currently doesn't support these models.",
+        "bidirectional. Defaults to True for DFlash2 and False otherwise.",
     )
     draft_attn_impl: Literal["simple_flex_attention", "sdpa", "eager"] = Field(
         default="simple_flex_attention",
@@ -505,59 +505,33 @@ class DFlashArgs(_Group):
 
 
 class DFlash2Args(_Group):
-    """DFlash2-exclusive modules (local convolution + candidate selector).
-
-    Every field except ``selector_loss_weight`` lands in the saved speculator config
-    under the same name, which is the ``dflash_config`` key the vLLM DFlash2 model
-    reads. That one weights a loss term, so it belongs to the run, not to the
-    checkpoint.
-    """
+    """DFlash2-exclusive local-convolution and candidate-selector settings."""
 
     conv_kernel_size: int = Field(
-        default=3,
-        description="DFlash2: convolution taps per sublayer. Tap t reaches back t "
-        "draft positions; must not exceed --block-size.",
+        default=2,
+        ge=1,
+        description="DFlash2: number of causal convolution taps.",
     )
     conv_group_size: int = Field(
-        default=64,
-        description="DFlash2: channels sharing one dynamic convolution coefficient. "
-        "Must divide the draft hidden size.",
+        default=16,
+        ge=1,
+        description="DFlash2: hidden channels sharing a dynamic convolution kernel.",
     )
     selector_rank: int = Field(
         default=256,
+        ge=1,
         description="DFlash2: rank of the candidate selector's predecessor/successor "
         "codebooks.",
     )
     selector_top_k: int = Field(
         default=16,
-        description="DFlash2: candidates kept per slot at inference. Training scores "
-        "the same K, so this sizes the selector loss, the path walk and the "
-        "diagnostics.",
+        ge=1,
+        description="DFlash2: unary candidates reranked per position.",
     )
-    selector_loss_weight: float = Field(
+    selector_loss_alpha: float = Field(
         default=1.0,
         ge=0.0,
-        description="DFlash2: weight of the selector's top-K cross-entropy term, "
-        "added to DFlash's full-vocabulary loss on the unary logits. 0 trains the "
-        "backbone only.",
-    )
-    input_embedding_scale: float = Field(
-        default=1.0,
-        gt=0.0,
-        description="DFlash2: multiplier on the draft's input embeddings.",
-    )
-    output_multiplier: float = Field(
-        default=1.0,
-        gt=0.0,
-        description="DFlash2: multiplier on the draft logits before the selector "
-        "bias is added.",
-    )
-    final_logit_softcapping: float | None = Field(
-        default=None,
-        gt=0.0,
-        description="DFlash2: softcap the multiplied draft logits as "
-        "tanh(x / cap) * cap before the selector bias is added. Leave unset to "
-        "disable; a non-positive cap is rejected rather than silently ignored.",
+        description="DFlash2: weight of the selector K-way cross-entropy term.",
     )
 
 
@@ -804,11 +778,10 @@ class TrainConfig(BaseSettings):
         pre-refactor ``parse_args``: unset ``draft_arch`` -> ``llama`` for eagle3 else
         ``qwen3``; unset ``norm_before_fc`` / ``norm_output`` -> ``True`` for eagle3
         else ``False``; unset ``muon_lr`` -> ``10 * lr``; unset ``num_layers`` -> ``5``
-        for dflash/dspark/dflash2 else ``1``; unset ``per_position_loss_weight`` ->
-        ``dpace`` for dflash/dflash2 else ``fixed-exp-decay``; unset ``loss_fn`` ->
-        ``ce`` for dflash/dflash2 else ``kl_div``; unset ``block_size`` -> ``16`` for
-        dflash/dflash2 else ``8``. ``dflash2`` is a DFlash backbone plus two modules,
-        so it takes the same DFlash recipe; DSpark shares only the layer-count default.
+        for DFlash-family models else ``1``; unset ``per_position_loss_weight`` ->
+        ``dpace`` for dflash and ``fixed-exp-decay`` otherwise; unset ``loss_fn`` ->
+        ``ce`` for dflash and ``kl_div`` otherwise; unset ``block_size`` -> ``16`` for
+        dflash and ``8`` otherwise. DFlash2 has its own experimental defaults.
 
         The dflash-conditional defaults reflect the recipe from
         https://github.com/vllm-project/speculators/issues/979: this combination
@@ -827,9 +800,7 @@ class TrainConfig(BaseSettings):
         untouched, so :meth:`from_flat` round-trips.
         """
         is_eagle3 = self.speculator_type == "eagle3"
-        # dflash2 is a dflash backbone plus the conv and the selector, so the
-        # issue-979 backbone recipe carries over; dspark shares only the layer count.
-        is_dflash = self.speculator_type in ("dflash", "dflash2")
+        is_dflash = self.speculator_type == "dflash"
         is_dflash_family = self.speculator_type in {"dflash", "dspark", "dflash2"}
         if self.draft.draft_arch is None:
             self.draft.draft_arch = "llama" if is_eagle3 else "qwen3"
@@ -841,6 +812,8 @@ class TrainConfig(BaseSettings):
             self.optimizer.muon_lr = 10 * self.optimizer.lr
         if self.draft.num_layers is None:
             self.draft.num_layers = 5 if is_dflash_family else 1
+        if self.draft.sliding_window_non_causal is None:
+            self.draft.sliding_window_non_causal = self.speculator_type == "dflash2"
         if self.dflash.per_position_loss_weight is None:
             self.dflash.per_position_loss_weight = (
                 "dpace" if is_dflash else "fixed-exp-decay"

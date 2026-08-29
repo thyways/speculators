@@ -24,7 +24,7 @@ CONV_KERNEL_SIZE="${CONV_KERNEL_SIZE:-2}"
 CONV_GROUP_SIZE="${CONV_GROUP_SIZE:-16}"
 SELECTOR_RANK="${SELECTOR_RANK:-256}"
 SELECTOR_TOP_K="${SELECTOR_TOP_K:-16}"
-SELECTOR_LOSS_WEIGHT="${SELECTOR_LOSS_WEIGHT:-1.0}"
+SELECTOR_LOSS_ALPHA="${SELECTOR_LOSS_ALPHA:-1.0}"
 
 BLOCK_SIZE="${BLOCK_SIZE:-8}"
 
@@ -243,7 +243,7 @@ setsid env \
     --conv-group-size "$CONV_GROUP_SIZE" \
     --selector-rank "$SELECTOR_RANK" \
     --selector-top-k "$SELECTOR_TOP_K" \
-    --selector-loss-weight "$SELECTOR_LOSS_WEIGHT" \
+    --selector-loss-alpha "$SELECTOR_LOSS_ALPHA" \
     --sliding-window 2048 \
     --sliding-window-non-causal \
     --target-layer-ids 2 11 20 29 38 \

@@ -12,11 +12,9 @@
 #     (--selector-rank, --selector-top-k).
 #
 # Same pipeline as dflash_qwen3_8b_ultrachat_online_5k_bestpractices.sh: data
-# preparation, vLLM server launch, online training. The backbone recipe is
-# DFlash's (5 layers, D-PACE with cross-entropy, block_size=16 -- see
-# https://github.com/vllm-project/speculators/issues/979) and --speculator-type
-# dflash2 defaults to it, so the flags below are redundant with the CLI and are
-# passed anyway to keep this script a self-contained reference.
+# preparation, vLLM server launch, online training. This uses main's experimental
+# DFlash2 defaults: five layers, block_size=8, fixed exponential position weighting,
+# KL unary loss, and a two-tap/group-16 local convolution.
 #
 # Two constraints DFlash2 does not share with DFlash:
 #
@@ -48,9 +46,9 @@
 #                           full-vocabulary loss on the unary logits, and the
 #                           cross-entropy of the selector's top-K decision
 #
-# selector_accept_len - unary_accept_len is the selector's contribution. Both
-# exclude the bonus token; add 1 to compare with the acceptance length vLLM
-# reports. They start out identical because the selector is zero-initialized.
+# The selector loss is controlled by --selector-loss-alpha. Both unary and selector
+# objectives use the configured position weighting; the selector is trained with the
+# target injected into the weakest candidate when it is absent from unary Top-K.
 
 set -euo pipefail
 
@@ -66,10 +64,10 @@ LR=3e-4
 
 # DFlash-family backbone (best-practices recipe from RFC #979)
 SPECULATOR_TYPE="dflash2"
-BLOCK_SIZE=16
+BLOCK_SIZE=8
 NUM_LAYERS=5
-PER_POSITION_LOSS_WEIGHT="dpace"  # requires --loss-fn ce
-LOSS_FN="ce"
+PER_POSITION_LOSS_WEIGHT="fixed-exp-decay"
+LOSS_FN="kl_div"
 # Full verifier vocabulary -- required by DFlash2 (see the header). 151936 is
 # Qwen3-8B's vocab_size; change it with the model.
 DRAFT_VOCAB_SIZE=151936
@@ -83,10 +81,11 @@ MAX_ANCHORS=640
 TARGET_LAYER_IDS="2 18 33"  # Must match vLLM's eagle_aux_hidden_state_layer_ids
 
 # DFlash2 modules. Defaults; the reference checkpoint in the PR uses K=16.
-CONV_KERNEL_SIZE=3      # taps per sublayer; must be <= BLOCK_SIZE
-CONV_GROUP_SIZE=64      # channels per dynamic coefficient; must divide hidden_size
+CONV_KERNEL_SIZE=2      # taps per sublayer; must be <= BLOCK_SIZE
+CONV_GROUP_SIZE=16      # channels per dynamic coefficient; must divide hidden_size
 SELECTOR_RANK=256
 SELECTOR_TOP_K=16
+SELECTOR_LOSS_ALPHA=1.0
 
 # GPU assignments (online training needs separate GPUs for vLLM and training)
 VLLM_GPUS="0,1"
@@ -147,6 +146,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" torchrun \
     --conv-group-size "$CONV_GROUP_SIZE" \
     --selector-rank "$SELECTOR_RANK" \
     --selector-top-k "$SELECTOR_TOP_K" \
+    --selector-loss-alpha "$SELECTOR_LOSS_ALPHA" \
     --target-layer-ids $TARGET_LAYER_IDS \
     --on-missing generate \
     --on-generate delete
