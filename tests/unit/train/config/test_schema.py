@@ -75,6 +75,20 @@ def test_flatten_resolves_dflash2_derived_defaults():
     assert flat["sliding_window_non_causal"] is True
 
 
+def test_flatten_resolves_hashgram_defaults():
+    flat = TrainConfig(speculator_type="hashgram").flatten()
+    assert flat["num_layers"] == 5
+    assert flat["per_position_loss_weight"] == "fixed-exp-decay"
+    assert flat["loss_fn"] == "kl_div"
+    assert flat["block_size"] == 8
+    assert flat["hashgram_rank"] == 128
+    assert flat["hashgram_top_k"] == 16
+    assert flat["hashgram_bigram_buckets"] == 1_048_576
+    assert flat["hashgram_trigram_buckets"] == 1_048_576
+    assert flat["hashgram_use_bigram"] is True
+    assert flat["hashgram_use_trigram"] is True
+
+
 def test_flatten_leaves_non_dflash_derived_defaults_unchanged():
     # DSpark shares only the DFlash layer default; the remaining derived defaults
     # keep their pre-existing behavior.

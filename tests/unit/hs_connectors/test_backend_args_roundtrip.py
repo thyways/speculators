@@ -18,6 +18,7 @@ def test_mooncake_args_survive_from_sources():
     flat = cfg.flatten()
     assert flat["mooncake_master"] == "10.0.0.1:50051"
     assert flat["mooncake_protocol"] == "tcp"  # default backfilled
+    assert flat["mooncake_device_name"] == ""
 
 
 def test_mooncake_defaults_backfilled_for_selected_backend():
@@ -29,6 +30,7 @@ def test_mooncake_defaults_backfilled_for_selected_backend():
     assert flat["mooncake_master"] == "127.0.0.1:50051"
     assert flat["mooncake_metadata_server"] == "P2PHANDSHAKE"
     assert flat["mooncake_protocol"] == "tcp"
+    assert flat["mooncake_device_name"] == ""
     assert flat["mooncake_global_segment_gib"] == 4.0
     assert flat["mooncake_local_buffer_gib"] == 2.0
 
@@ -130,11 +132,14 @@ def test_resolve_with_mooncake_args():
             "mooncake",
             "--mooncake-master",
             "10.0.0.1:50051",
+            "--mooncake-device-name",
+            "mlx5_0,mlx5_1",
         ]
     )
     flat = cfg.flatten()
     assert flat["mooncake_master"] == "10.0.0.1:50051"
     assert flat["mooncake_protocol"] == "tcp"
+    assert flat["mooncake_device_name"] == "mlx5_0,mlx5_1"
 
 
 def test_resolve_file_backend_hidden_states_path():

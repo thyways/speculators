@@ -30,6 +30,8 @@ _ADAMW_NAME_HINTS = (
     "codebook",
     "markov_w1",
     "markov_w2",
+    "bigram_table",
+    "trigram_table",
 )
 
 # Muon only orthogonalizes 2D weight matrices.

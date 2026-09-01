@@ -595,6 +595,48 @@ RECIPES: dict[str, dict] = {
         "on_missing": "generate",
         "on_generate": "delete",
     },
+    "hashgram_qwen3_8b_sharegpt_online.sh": {
+        "verifier_name_or_path": (
+            "/inspire/sfs/project/inf-multimodal/public/wumengke/"
+            "model_weights/Qwen--Qwen3-8B"
+        ),
+        "data_path": (
+            "/inspire/sfs/project/inf-multimodal/public/wumengke/datasets/"
+            "jihwan1205--perfectblend-qwen3-8b-regen/800k-len8192"
+        ),
+        "vllm_endpoint": "http://localhost:8000/v1",
+        "save_path": "./output/hashgram_qwen3_8b_1node/checkpoints",
+        "draft_vocab_size": None,
+        "epochs": 3,
+        "train_data_ratio": 0.98,
+        "checkpoint_freq": 0.1,
+        "optimizer": "muon",
+        "muon_lr": 2e-4,
+        "lr": 1e-4,
+        "noise_std": 0,
+        "scheduler_type": "cosine",
+        "scheduler_warmup_ratio": 0.04,
+        "total_seq_len": 8192,
+        "speculator_type": "hashgram",
+        "block_size": 8,
+        "max_anchors": 512,
+        "sample_from_anchor": True,
+        "num_layers": 5,
+        "sliding_window": 2048,
+        "sliding_window_non_causal": True,
+        "target_layer_ids": [1, 9, 17, 25, 33],
+        "hashgram_rank": 128,
+        "hashgram_top_k": 16,
+        "hashgram_bigram_buckets": 1_048_576,
+        "hashgram_trigram_buckets": 1_048_576,
+        "hashgram_num_hashes": 1,
+        "hashgram_loss_alpha": 1.0,
+        "hashgram_markov_rank": 256,
+        "loss_fn": '{"ce": 0.1, "tv": 0.9}',
+        "logger": "wandb",
+        "on_missing": "generate",
+        "on_generate": "delete",
+    },
     "eagle3_llama3_8b_ultrachat_offline_5k.sh": {
         "verifier_name_or_path": "meta-llama/Llama-3.1-8B-Instruct",
         "data_path": "./output",

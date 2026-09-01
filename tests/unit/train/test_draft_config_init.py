@@ -559,6 +559,7 @@ def _capture_full_attention_indices(
     [
         ("dflash", [], []),
         ("dspark", [], []),
+        ("hashgram", [], []),
         ("dflash", [1], [1]),
         ("eagle3", [], []),
         ("peagle", [], []),

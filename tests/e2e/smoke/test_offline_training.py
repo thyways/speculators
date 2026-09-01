@@ -67,6 +67,31 @@ MM_MODEL = "Qwen/Qwen3-VL-2B-Instruct"
         (
             TEXT_MODEL,
             "hf:inference-optimization/speculators-ci-datasets:smoke_regen",
+            "hashgram",
+            [
+                "--block-size",
+                "8",
+                "--max-anchors",
+                "64",
+                "--num-layers",
+                "1",
+                "--hashgram-rank",
+                "16",
+                "--hashgram-top-k",
+                "8",
+                "--hashgram-bigram-buckets",
+                "1024",
+                "--hashgram-trigram-buckets",
+                "1024",
+                "--hashgram-markov-rank",
+                "16",
+            ],
+            [1, 13, 25],
+            151936,
+        ),  # HashGram training-only smoke; serving integration is not available
+        (
+            TEXT_MODEL,
+            "hf:inference-optimization/speculators-ci-datasets:smoke_regen",
             "peagle",
             [
                 "--num-layers",
@@ -134,7 +159,7 @@ def test_offline_smoke(
         tmp_path,
         model,
         dataset=dataset,
-        prompts=prompts,
+        prompts=None if speculator_type == "hashgram" else prompts,
         vllm_kwargs={
             "enforce_eager": True,
             "gpu_memory_utilization": 0.9,

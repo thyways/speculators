@@ -93,7 +93,7 @@ class DraftArgs(_Group):
     num_layers: int | None = Field(
         default=None,
         description="Number of draft decoder layers to synthesize. "
-        "(default: 5 for dflash/dspark/dflash2, 1 otherwise).",
+        "(default: 5 for dflash/dspark/dflash2/hashgram, 1 otherwise).",
     )
     draft_arch: Literal["llama", "qwen3"] | None = Field(
         default=None,
@@ -461,7 +461,7 @@ class DFlashArgs(_Group):
     sample_from_anchor: bool | None = Field(
         default=None,
         description="Sample from the anchor position (all positions predict). "
-        "Default: False for dflash/dflash2, True for dspark.",
+        "Default: False for dflash/dflash2/hashgram, True for dspark.",
     )
     dflash_decay_gamma: float = Field(
         default=4.0, description="Decay gamma for DFlash-family loss weighting."
@@ -526,6 +526,71 @@ class DSparkArgs(_Group):
     )
 
 
+class HashGramArgs(_Group):
+    """HashGram hashed vector n-gram selector knobs."""
+
+    hashgram_rank: int = Field(
+        default=128,
+        ge=1,
+        description="HashGram: dimension of hashed bigram/trigram vectors.",
+    )
+    hashgram_top_k: int = Field(
+        default=16,
+        ge=1,
+        description="HashGram: number of unary candidates reranked per position.",
+    )
+    hashgram_bigram_buckets: int = Field(
+        default=1_048_576,
+        ge=1,
+        description="HashGram: number of hashed bigram buckets.",
+    )
+    hashgram_trigram_buckets: int = Field(
+        default=1_048_576,
+        ge=1,
+        description="HashGram: number of hashed trigram buckets.",
+    )
+    hashgram_num_hashes: int = Field(
+        default=1,
+        ge=1,
+        description="HashGram: independent hash probes averaged per n-gram.",
+    )
+    hashgram_loss_alpha: float = Field(
+        default=1.0,
+        ge=0.0,
+        description="HashGram: candidate-selector loss weight.",
+    )
+    hashgram_markov_rank: int = Field(
+        default=256,
+        ge=0,
+        description="HashGram: DSpark-style recall rank; 0 disables recall bias.",
+    )
+    hashgram_use_markov_recall: bool = Field(
+        default=True,
+        description="HashGram: apply the Markov recall bias before Top-K selection.",
+    )
+    hashgram_hidden_refine: bool = Field(
+        default=False,
+        description="HashGram: use candidate-specific vector-to-hidden refinement.",
+    )
+    hashgram_use_bigram: bool = Field(
+        default=True,
+        description="HashGram: enable the hashed bigram table.",
+    )
+    hashgram_use_trigram: bool = Field(
+        default=True,
+        description="HashGram: enable the hashed trigram table.",
+    )
+
+    @model_validator(mode="after")
+    def _at_least_one_ngram_order(self) -> "HashGramArgs":
+        if not self.hashgram_use_bigram and not self.hashgram_use_trigram:
+            raise ValueError(
+                "At least one of --hashgram-use-bigram/--hashgram-use-trigram "
+                "must be enabled."
+            )
+        return self
+
+
 class PEagleArgs(_Group):
     num_depths: int = Field(
         default=8,
@@ -565,6 +630,7 @@ _GROUPS: dict[str, type[_Group]] = {
     "dflash": DFlashArgs,
     "dflash2": DFlash2Args,
     "dspark": DSparkArgs,
+    "hashgram": HashGramArgs,
     "peagle": PEagleArgs,
     "mtp": MTPArgs,
 }
@@ -648,7 +714,7 @@ class TrainConfig(BaseSettings):
     speculator_type: str = Field(
         default="eagle3",
         description="Type of speculator model to train "
-        "(eagle3, dflash, dflash2, dspark, peagle, mtp).",
+        "(eagle3, dflash, dflash2, dspark, hashgram, peagle, mtp).",
     )
     dry_run: bool = Field(
         default=False,
@@ -675,6 +741,7 @@ class TrainConfig(BaseSettings):
     dflash: DFlashArgs = Field(default_factory=DFlashArgs)
     dflash2: DFlash2Args = Field(default_factory=DFlash2Args)
     dspark: DSparkArgs = Field(default_factory=DSparkArgs)
+    hashgram: HashGramArgs = Field(default_factory=HashGramArgs)
     peagle: PEagleArgs = Field(default_factory=PEagleArgs)
     mtp: MTPArgs = Field(default_factory=MTPArgs)
 
@@ -684,7 +751,8 @@ class TrainConfig(BaseSettings):
         pre-refactor ``parse_args``: unset ``draft_arch`` -> ``llama`` for eagle3 else
         ``qwen3``; unset ``norm_before_fc`` / ``norm_output`` -> ``True`` for eagle3
         else ``False``; unset ``muon_lr`` -> ``10 * lr``; unset ``num_layers`` -> ``5``
-        for dflash/dspark/dflash2 else ``1``; unset ``per_position_loss_weight`` ->
+        for dflash/dspark/dflash2/hashgram else ``1``; unset
+        ``per_position_loss_weight`` ->
         ``dpace`` for dflash else ``fixed-exp-decay``; unset ``loss_fn`` -> ``ce`` for
         dflash else ``kl_div``; unset ``block_size`` -> ``16`` for dflash else
         ``8``.
@@ -710,7 +778,12 @@ class TrainConfig(BaseSettings):
         """
         is_eagle3 = self.speculator_type == "eagle3"
         is_dflash = self.speculator_type == "dflash"
-        is_dflash_family = self.speculator_type in {"dflash", "dspark", "dflash2"}
+        is_dflash_family = self.speculator_type in {
+            "dflash",
+            "dspark",
+            "dflash2",
+            "hashgram",
+        }
         if self.draft.draft_arch is None:
             self.draft.draft_arch = "llama" if is_eagle3 else "qwen3"
         if self.draft.norm_before_fc is None:

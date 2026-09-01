@@ -9,6 +9,7 @@ from speculators.losses import eager
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark.core import DSparkDraftModel
 from speculators.models.eagle3.core import Eagle3DraftModel
+from speculators.models.hashgram.core import HashGramDraftModel
 from speculators.models.peagle.core import PEagleDraftModel
 from speculators.train.config import TrainConfig
 
@@ -136,6 +137,58 @@ def test_dspark_confidence_head_alpha(monkeypatch):
     train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
     assert train_kw["confidence_head_alpha"] == 0.5
     assert val_kw["confidence_head_alpha"] == 0.5
+
+
+def test_hashgram_defaults_and_trainer_kwargs(monkeypatch):
+    args = _parse(monkeypatch, ["--speculator-type", "hashgram"])
+    assert args.hashgram_rank == 128
+    assert args.hashgram_top_k == 16
+    assert args.hashgram_markov_rank == 256
+    assert args.hashgram_use_bigram is True
+    assert args.hashgram_use_trigram is True
+    assert args.num_layers == 5
+    assert args.block_size == 8
+    train_kw, val_kw = HashGramDraftModel.get_trainer_kwargs(**vars(args))
+    assert train_kw["selector_loss_alpha"] == 1.0
+    assert val_kw["selector_loss_alpha"] == 1.0
+
+
+def test_hashgram_flags_override_defaults(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "hashgram",
+            "--hashgram-rank",
+            "64",
+            "--hashgram-top-k",
+            "8",
+            "--hashgram-bigram-buckets",
+            "128",
+            "--hashgram-trigram-buckets",
+            "256",
+            "--hashgram-num-hashes",
+            "2",
+            "--hashgram-loss-alpha",
+            "0.25",
+            "--hashgram-markov-rank",
+            "0",
+            "--no-hashgram-use-markov-recall",
+            "--hashgram-hidden-refine",
+            "--no-hashgram-use-trigram",
+        ],
+    )
+    assert args.hashgram_rank == 64
+    assert args.hashgram_top_k == 8
+    assert args.hashgram_bigram_buckets == 128
+    assert args.hashgram_trigram_buckets == 256
+    assert args.hashgram_num_hashes == 2
+    assert args.hashgram_loss_alpha == pytest.approx(0.25)
+    assert args.hashgram_markov_rank == 0
+    assert args.hashgram_use_markov_recall is False
+    assert args.hashgram_hidden_refine is True
+    assert args.hashgram_use_bigram is True
+    assert args.hashgram_use_trigram is False
 
 
 # ---------------------------------------------------------------------------

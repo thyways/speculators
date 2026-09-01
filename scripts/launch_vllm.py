@@ -117,12 +117,16 @@ def main():
     num_hidden_layers = config.num_hidden_layers
 
     if args.target_layer_ids:
-        target_layer_ids = args.target_layer_ids
+        auxiliary_target_layer_ids = list(args.target_layer_ids)
+        target_layer_ids = list(auxiliary_target_layer_ids)
         if args.include_last_layer and num_hidden_layers not in target_layer_ids:
             target_layer_ids.append(num_hidden_layers)
         warnings.warn(
-            f"Using custom target layer ids {target_layer_ids}. These "
-            "must also be explicitly passed into the training script.",
+            f"Using auxiliary target layer ids {auxiliary_target_layer_ids}; "
+            f"hidden-state extraction layers are {target_layer_ids}. Pass only "
+            f"the auxiliary ids {auxiliary_target_layer_ids} to training because "
+            f"the final layer {num_hidden_layers} is consumed separately as the "
+            "verifier final hidden state.",
             stacklevel=2,
         )
     else:

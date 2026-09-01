@@ -4,6 +4,7 @@ from .dflash import DFlashDraftModel, DFlashSpeculatorConfig
 from .dflash2 import DFlash2DraftModel, DFlash2SpeculatorConfig
 from .dspark import DSparkDraftModel, DSparkSpeculatorConfig
 from .eagle3 import Eagle3DraftModel, Eagle3SpeculatorConfig
+from .hashgram import HashGramDraftModel, HashGramSpeculatorConfig
 from .mtp import MTPDraftModel, MTPSpeculatorConfig
 from .peagle import PEagleDraftModel, PEagleSpeculatorConfig
 
@@ -16,6 +17,8 @@ __all__ = [
     "DSparkSpeculatorConfig",
     "Eagle3DraftModel",
     "Eagle3SpeculatorConfig",
+    "HashGramDraftModel",
+    "HashGramSpeculatorConfig",
     "MTPDraftModel",
     "MTPSpeculatorConfig",
     "PEagleDraftModel",
