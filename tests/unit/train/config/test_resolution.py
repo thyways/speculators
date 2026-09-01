@@ -299,6 +299,26 @@ def test_matching_algorithm_block_does_not_warn():
         )
 
 
+def test_token_latent_ssm_algorithm_blocks_do_not_warn():
+    # token_latent_ssm consumes the shared DFlash fields and the compatibility
+    # token-latent fields that define its codebook, SSM, and candidate decoder.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        cfg = TrainConfig.from_sources(
+            cli={
+                "verifier_name_or_path": "m",
+                "speculator_type": "token_latent_ssm",
+                "block_size": 8,
+                "per_position_loss_weight": "dpace",
+                "token_code_dim": 128,
+                "ssm_state_dim": 256,
+            },
+            argv=["train.py"],
+        )
+    assert cfg.flatten()["token_code_dim"] == 128
+    assert cfg.flatten()["ssm_state_dim"] == 256
+
+
 def test_dflash2_consumes_shared_and_exclusive_algorithm_blocks():
     with warnings.catch_warnings():
         warnings.simplefilter("error")

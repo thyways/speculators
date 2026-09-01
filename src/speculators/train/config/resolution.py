@@ -105,6 +105,7 @@ _ALGORITHM_GROUP_USERS: dict[str, frozenset[str]] = {
             "parallel_token_latent",
             "latent_feedback",
             "parallel_token_latent_feedback",
+            "token_latent_ssm",
         }
     ),
     "dflash2": frozenset({"dflash2"}),
@@ -116,6 +117,7 @@ _ALGORITHM_GROUP_USERS: dict[str, frozenset[str]] = {
             "parallel_token_latent",
             "latent_feedback",
             "parallel_token_latent_feedback",
+            "token_latent_ssm",
         }
     ),
     "dspark": frozenset({"dspark"}),

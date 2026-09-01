@@ -11,6 +11,7 @@ __all__ = [
     "DEFAULT_LATENT_DIM",
     "DEFAULT_LATENT_LOSS_ALPHA",
     "DEFAULT_POSITION_SCALE_INIT",
+    "DEFAULT_PREFIX_LATENT_LOSS_ALPHA",
     "LatentFeedbackSpeculatorConfig",
     "ParallelTokenLatentFeedbackSpeculatorConfig",
     "ParallelTokenLatentSpeculatorConfig",
@@ -19,11 +20,12 @@ __all__ = [
 
 DEFAULT_LATENT_DIM = 128
 DEFAULT_LATENT_LOSS_ALPHA = 0.1
+DEFAULT_PREFIX_LATENT_LOSS_ALPHA = 0.0
 DEFAULT_POSITION_SCALE_INIT = 1.0
 
 
 class _TokenLatentFeedbackConfig(DFlashSpeculatorConfig):
-    """Shared fields for the v1.2 naming aliases."""
+    """Shared fields for the v1.2/v1.3 naming aliases."""
 
     architectures: list[str] = Field(
         default_factory=lambda: ["TokenLatentFeedbackDraftModel"],
@@ -89,12 +91,34 @@ class _TokenLatentFeedbackConfig(DFlashSpeculatorConfig):
     feedback_output_projection_init: float = Field(
         default=0.0,
         ge=0.0,
-        description="Absolute initialization value for the hidden feedback projection.",
+        description=(
+            "Initialization value for the hidden feedback projection. Under "
+            "constant mode it is the constant value; under normal mode a positive "
+            "value is the standard deviation."
+        ),
+    )
+    feedback_output_projection_init_mode: Literal[
+        "constant",
+        "normal",
+        "xavier_uniform",
+        "xavier_normal",
+    ] = Field(
+        default="constant",
+        description="Initialization mode for the latent-to-hidden projection.",
     )
     position_scale_init: float = Field(
         default=DEFAULT_POSITION_SCALE_INIT,
         ge=0.0,
-        description="Initial learned per-slot feedback scale.",
+        description="Initial effective per-slot feedback scale.",
+    )
+    position_scale_parameterization: Literal["direct", "softplus_floor"] = Field(
+        default="direct",
+        description="Direct v1.2 scale or v1.3 softplus scale with a positive floor.",
+    )
+    position_scale_min: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Minimum effective scale for softplus_floor parameterization.",
     )
     latent_loss_alpha: float = Field(
         default=DEFAULT_LATENT_LOSS_ALPHA,
@@ -105,6 +129,16 @@ class _TokenLatentFeedbackConfig(DFlashSpeculatorConfig):
         default=None,
         ge=0.0,
         description="Optional alias for latent_loss_alpha.",
+    )
+    source_latent_loss_alpha: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Readable alias for the source token-latent loss weight.",
+    )
+    prefix_latent_loss_alpha: float = Field(
+        default=DEFAULT_PREFIX_LATENT_LOSS_ALPHA,
+        ge=0.0,
+        description="Weight of the mixed prefix-latent cosine loss.",
     )
 
     @property
@@ -133,7 +167,9 @@ class _TokenLatentFeedbackConfig(DFlashSpeculatorConfig):
     def resolved_latent_loss_alpha(self) -> float:
         """Return the canonical auxiliary-loss weight."""
         return float(
-            self.latent_loss_weight
+            self.source_latent_loss_alpha
+            if self.source_latent_loss_alpha is not None
+            else self.latent_loss_weight
             if self.latent_loss_weight is not None
             else self.latent_loss_alpha
         )
@@ -167,6 +203,14 @@ class _TokenLatentFeedbackConfig(DFlashSpeculatorConfig):
             raise ValueError(
                 "prefix_mixer_mode and feedback_mode disagree: "
                 f"{self.prefix_mixer_mode!r} != {self.feedback_mode!r}."
+            )
+        if (
+            self.position_scale_parameterization == "softplus_floor"
+            and self.position_scale_init <= self.position_scale_min
+        ):
+            raise ValueError(
+                "softplus_floor requires position_scale_init > position_scale_min, "
+                f"got {self.position_scale_init} <= {self.position_scale_min}."
             )
         return self
 

@@ -15,6 +15,7 @@ from speculators.models.dflash.metrics import compute_metrics
 from speculators.models.token_latent_feedback.config import (
     DEFAULT_LATENT_DIM,
     DEFAULT_LATENT_LOSS_ALPHA,
+    DEFAULT_PREFIX_LATENT_LOSS_ALPHA,
     LatentFeedbackSpeculatorConfig,
     ParallelTokenLatentFeedbackSpeculatorConfig,
     ParallelTokenLatentSpeculatorConfig,
@@ -47,6 +48,11 @@ _DEFAULT_EAGER_LOSS_CONFIG: LossConfig = resolve_loss_config(
 )
 
 
+def _value_or_default(kwargs: dict, key: str, default):
+    value = kwargs.get(key)
+    return default if value is None else value
+
+
 @SpeculatorModel.register("token_latent_feedback")
 class TokenLatentFeedbackDraftModel(DFlashDraftModel):
     """DFlash with one parallel causal token-latent feedback stage."""
@@ -71,8 +77,13 @@ class TokenLatentFeedbackDraftModel(DFlashDraftModel):
             use_reliability_gate=config.resolved_reliability_gate,
             strict_causal_prefix=config.strict_causal_prefix,
             position_scale_init=float(config.position_scale_init),
+            position_scale_parameterization=config.position_scale_parameterization,
+            position_scale_min=float(config.position_scale_min),
             feedback_output_projection_init=float(
                 config.feedback_output_projection_init
+            ),
+            feedback_output_projection_init_mode=(
+                config.feedback_output_projection_init_mode
             ),
         )
 
@@ -166,34 +177,43 @@ class TokenLatentFeedbackDraftModel(DFlashDraftModel):
         base["sample_from_anchor"] = (
             False if sample_from_anchor is None else sample_from_anchor
         )
-        latent_dim = kwargs.get("latent_dim")
-        if latent_dim is None:
-            latent_dim = DEFAULT_LATENT_DIM
-        feedback_stages = kwargs.get("feedback_stages")
-        if feedback_stages is None:
-            feedback_stages = 1
-        prefix_mixer_mode = kwargs.get("prefix_mixer_mode")
-        if prefix_mixer_mode is None:
-            prefix_mixer_mode = "full"
+        latent_dim = _value_or_default(kwargs, "latent_dim", DEFAULT_LATENT_DIM)
+        feedback_stages = _value_or_default(kwargs, "feedback_stages", 1)
+        prefix_mixer_mode = _value_or_default(
+            kwargs, "prefix_mixer_mode", "full"
+        )
         prefix_mixer_mode = cast(
             "Literal['full', 'shifted', 'none']",
             prefix_mixer_mode,
         )
-        use_reliability_gate = kwargs.get("use_reliability_gate")
-        if use_reliability_gate is None:
-            use_reliability_gate = True
-        latent_loss_alpha = kwargs.get("latent_loss_alpha")
-        if latent_loss_alpha is None:
-            latent_loss_alpha = DEFAULT_LATENT_LOSS_ALPHA
-        strict_causal_prefix = kwargs.get("strict_causal_prefix")
-        if strict_causal_prefix is None:
-            strict_causal_prefix = True
-        position_scale_init = kwargs.get("position_scale_init")
-        if position_scale_init is None:
-            position_scale_init = 1.0
-        feedback_output_init = kwargs.get("feedback_output_projection_init")
-        if feedback_output_init is None:
-            feedback_output_init = 0.0
+        use_reliability_gate = _value_or_default(
+            kwargs, "use_reliability_gate", True
+        )
+        latent_loss_alpha = _value_or_default(
+            kwargs, "latent_loss_alpha", DEFAULT_LATENT_LOSS_ALPHA
+        )
+        strict_causal_prefix = _value_or_default(
+            kwargs, "strict_causal_prefix", True
+        )
+        position_scale_init = _value_or_default(
+            kwargs, "position_scale_init", 1.0
+        )
+        feedback_output_init = _value_or_default(
+            kwargs, "feedback_output_projection_init", 0.0
+        )
+        feedback_output_init_mode = _value_or_default(
+            kwargs, "feedback_output_projection_init_mode", "constant"
+        )
+        position_scale_parameterization = _value_or_default(
+            kwargs, "position_scale_parameterization", "direct"
+        )
+        position_scale_min = _value_or_default(kwargs, "position_scale_min", 0.0)
+        source_latent_loss_alpha = kwargs.get("source_latent_loss_alpha")
+        prefix_latent_loss_alpha = _value_or_default(
+            kwargs,
+            "prefix_latent_loss_alpha",
+            DEFAULT_PREFIX_LATENT_LOSS_ALPHA,
+        )
         config = cls.config_class(
             **base,
             latent_dim=latent_dim,
@@ -209,9 +229,14 @@ class TokenLatentFeedbackDraftModel(DFlashDraftModel):
             reliability_gate=kwargs.get("reliability_gate"),
             strict_causal_prefix=strict_causal_prefix,
             feedback_output_projection_init=feedback_output_init,
+            feedback_output_projection_init_mode=feedback_output_init_mode,
             position_scale_init=position_scale_init,
+            position_scale_parameterization=position_scale_parameterization,
+            position_scale_min=position_scale_min,
             latent_loss_alpha=latent_loss_alpha,
             latent_loss_weight=kwargs.get("latent_loss_weight"),
+            source_latent_loss_alpha=source_latent_loss_alpha,
+            prefix_latent_loss_alpha=prefix_latent_loss_alpha,
         )
         model = cls(config=config)
         model.load_vocab_mappings(t2d, d2t)
@@ -232,18 +257,17 @@ class TokenLatentFeedbackDraftModel(DFlashDraftModel):
             ),
             "dpace_alpha": kwargs.get("dpace_alpha", 0.5),
             "latent_loss_alpha": kwargs.get(
-                "latent_loss_alpha", DEFAULT_LATENT_LOSS_ALPHA
+                "source_latent_loss_alpha",
+                kwargs.get("latent_loss_alpha", DEFAULT_LATENT_LOSS_ALPHA),
+            ),
+            "prefix_latent_loss_alpha": kwargs.get(
+                "prefix_latent_loss_alpha", DEFAULT_PREFIX_LATENT_LOSS_ALPHA
             ),
         }
         return dict(shared), dict(shared)
 
-    def _compute_latent_loss(
-        self,
-        latents: torch.Tensor,
-        targets: torch.Tensor,
-        loss_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Align predicted latents with hard verifier-token codes."""
+    def _target_codes(self, targets: torch.Tensor) -> torch.Tensor:
+        """Project hard verifier targets into the shared token-code space."""
         target_ids = targets.argmax(dim=-1)
         target_weights = self.verifier_lm_head.weight[target_ids]
         embedding_weights = self.embed_tokens.weight[target_ids]
@@ -257,7 +281,15 @@ class TokenLatentFeedbackDraftModel(DFlashDraftModel):
             target_weights.float(),
             self._target_code_projection.float(),
         )
-        target_codes = functional.normalize(target_codes, dim=-1)
+        return functional.normalize(target_codes, dim=-1)
+
+    def _compute_latent_loss(
+        self,
+        latents: torch.Tensor,
+        target_codes: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Align a latent stream with precomputed hard-target token codes."""
         return compute_latent_cosine_loss(latents, target_codes, loss_mask)
 
     @conditional_torch_compile
@@ -275,6 +307,7 @@ class TokenLatentFeedbackDraftModel(DFlashDraftModel):
         per_position_loss_weight: str = "fixed-exp-decay",
         dpace_alpha: float = 0.5,
         latent_loss_alpha: float | None = None,
+        prefix_latent_loss_alpha: float | None = None,
         **kwargs,
     ):
         raw_hidden, targets, aligned_loss_mask, anchored_block_indices = (
@@ -316,25 +349,54 @@ class TokenLatentFeedbackDraftModel(DFlashDraftModel):
             dpace_alpha=dpace_alpha,
             sample_from_anchor=False,
         )
-        latent_loss, latent_cosine = self._compute_latent_loss(
+        target_codes = self._target_codes(targets)
+        source_latent_loss, source_latent_cosine = self._compute_latent_loss(
             feedback.latents.reshape(1, -1, self.latent_dim),
-            targets,
+            target_codes,
             aligned_loss_mask,
         )
-        alpha = (
+        source_alpha = (
             float(latent_loss_alpha)
             if latent_loss_alpha is not None
             else self.config.resolved_latent_loss_alpha
         )
-        loss = final_loss + alpha * latent_loss
+        prefix_alpha = (
+            float(prefix_latent_loss_alpha)
+            if prefix_latent_loss_alpha is not None
+            else float(self.config.prefix_latent_loss_alpha)
+        )
+        if prefix_alpha > 0.0:
+            prefix_mask = aligned_loss_mask.clone()
+            prefix_mask[:, 1 :: self.block_size] = 0
+            prefix_latent_loss, prefix_latent_cosine = self._compute_latent_loss(
+                feedback.prefix_latents.reshape(1, -1, self.latent_dim),
+                target_codes,
+                prefix_mask,
+            )
+        else:
+            prefix_latent_loss = final_loss.new_zeros(())
+            prefix_latent_cosine = final_loss.new_zeros(())
+        loss = (
+            final_loss
+            + source_alpha * source_latent_loss
+            + prefix_alpha * prefix_latent_loss
+        )
 
         one = torch.ones((), device=loss.device)
         metrics["final_loss_sum"] = final_loss.detach().clone()
         metrics["final_loss_total"] = one.clone()
-        metrics["latent_loss_sum"] = latent_loss.detach().clone()
+        metrics["latent_loss_sum"] = source_latent_loss.detach().clone()
         metrics["latent_loss_total"] = one.clone()
-        metrics["latent_cosine_sum"] = latent_cosine.detach().clone()
+        metrics["latent_cosine_sum"] = source_latent_cosine.detach().clone()
         metrics["latent_cosine_total"] = one.clone()
+        metrics["source_latent_loss_sum"] = source_latent_loss.detach().clone()
+        metrics["source_latent_loss_total"] = one.clone()
+        metrics["source_latent_cosine_sum"] = source_latent_cosine.detach().clone()
+        metrics["source_latent_cosine_total"] = one.clone()
+        metrics["prefix_latent_loss_sum"] = prefix_latent_loss.detach().clone()
+        metrics["prefix_latent_loss_total"] = one.clone()
+        metrics["prefix_latent_cosine_sum"] = prefix_latent_cosine.detach().clone()
+        metrics["prefix_latent_cosine_total"] = one.clone()
         reliability = feedback.reliability.reshape(1, -1)
         metrics["reliability_sum"] = (
             (reliability * aligned_loss_mask.float()).sum().detach().clone()

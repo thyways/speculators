@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import NamedTuple
 
 import torch
@@ -75,7 +76,10 @@ class TokenLatentFeedbackHead(nn.Module):
         use_reliability_gate: bool = True,
         strict_causal_prefix: bool = True,
         position_scale_init: float = 1.0,
+        position_scale_parameterization: str = "direct",
+        position_scale_min: float = 0.0,
         feedback_output_projection_init: float = 0.0,
+        feedback_output_projection_init_mode: str = "constant",
     ) -> None:
         super().__init__()
         if block_size < 2:  # noqa: PLR2004
@@ -85,6 +89,34 @@ class TokenLatentFeedbackHead(nn.Module):
                 "prefix_mixer_mode must be one of 'full', 'shifted', or 'none', "
                 f"got {prefix_mixer_mode!r}"
             )
+        if position_scale_parameterization not in {"direct", "softplus_floor"}:
+            raise ValueError(
+                "position_scale_parameterization must be 'direct' or "
+                f"'softplus_floor', got {position_scale_parameterization!r}"
+            )
+        if position_scale_min < 0.0:
+            raise ValueError(
+                "position_scale_min must be non-negative, got "
+                f"{position_scale_min}"
+            )
+        if (
+            position_scale_parameterization == "softplus_floor"
+            and position_scale_init <= position_scale_min
+        ):
+            raise ValueError(
+                "softplus_floor requires position_scale_init > position_scale_min, "
+                f"got {position_scale_init} <= {position_scale_min}"
+            )
+        if feedback_output_projection_init_mode not in {
+            "constant",
+            "normal",
+            "xavier_uniform",
+            "xavier_normal",
+        }:
+            raise ValueError(
+                "Unsupported feedback_output_projection_init_mode: "
+                f"{feedback_output_projection_init_mode!r}"
+            )
 
         self.hidden_size = int(hidden_size)
         self.latent_dim = int(latent_dim)
@@ -93,12 +125,19 @@ class TokenLatentFeedbackHead(nn.Module):
         self.use_reliability_gate = bool(use_reliability_gate)
         self.strict_causal_prefix = bool(strict_causal_prefix)
         self.initializer_range = float(initializer_range)
+        self.position_scale_parameterization = position_scale_parameterization
+        self.position_scale_min = float(position_scale_min)
+        self.feedback_output_projection_init_mode = (
+            feedback_output_projection_init_mode
+        )
 
         self.input_norm = LatentRMSNorm(self.hidden_size, rms_norm_eps)
-        # The latent projection and scalar gate share one packed GEMM.
+        gate_features = 1 if self.use_reliability_gate else 0
+        # v1.2 packs the latent projection and scalar gate into one GEMM.  v1.3
+        # removes the unused gate row entirely when gating is disabled.
         self.intent_gate_proj = nn.Linear(
             self.hidden_size,
-            self.latent_dim + 1,
+            self.latent_dim + gate_features,
             bias=True,
         )
         self.prefix_norm = LatentRMSNorm(self.latent_dim, rms_norm_eps)
@@ -108,11 +147,19 @@ class TokenLatentFeedbackHead(nn.Module):
             bias=False,
         )
         self.toeplitz_coeff = nn.Parameter(torch.empty(self.block_size - 1))
+        raw_position_scale = float(position_scale_init)
+        if position_scale_parameterization == "softplus_floor":
+            raw_position_scale = math.log(
+                math.expm1(float(position_scale_init) - float(position_scale_min))
+            )
         self.position_scale = nn.Parameter(
-            torch.full((self.block_size,), float(position_scale_init))
+            torch.full((self.block_size,), raw_position_scale)
         )
 
-        self.reset_parameters(feedback_output_projection_init)
+        self.reset_parameters(
+            feedback_output_projection_init,
+            feedback_output_projection_init_mode,
+        )
 
     # Read-only compatibility names used by experiment notebooks.  Properties
     # avoid registering the same module twice (which would duplicate checkpoint
@@ -129,8 +176,12 @@ class TokenLatentFeedbackHead(nn.Module):
     def prefix_mixer_coefficients(self) -> nn.Parameter:
         return self.toeplitz_coeff
 
-    def reset_parameters(self, feedback_output_projection_init: float = 0.0) -> None:
-        """Use a stable small initialization and an exact zero feedback path."""
+    def reset_parameters(
+        self,
+        feedback_output_projection_init: float = 0.0,
+        feedback_output_projection_init_mode: str = "constant",
+    ) -> None:
+        """Initialize the v1.2 zero path or a v1.3 non-zero feedback path."""
         nn.init.normal_(
             self.intent_gate_proj.weight,
             mean=0.0,
@@ -146,14 +197,32 @@ class TokenLatentFeedbackHead(nn.Module):
         )
         with torch.no_grad():
             self.toeplitz_coeff.copy_(distances.reciprocal().sqrt())
-            self.position_scale[0] = 0.0
-        if feedback_output_projection_init == 0.0:
-            nn.init.zeros_(self.feedback_up_proj.weight)
-        else:
+            if self.position_scale_parameterization == "direct":
+                self.position_scale[0] = 0.0
+        if feedback_output_projection_init_mode == "constant":
             nn.init.constant_(
                 self.feedback_up_proj.weight,
                 float(feedback_output_projection_init),
             )
+        elif feedback_output_projection_init_mode == "normal":
+            std = float(feedback_output_projection_init) or self.initializer_range
+            nn.init.normal_(self.feedback_up_proj.weight, mean=0.0, std=std)
+        elif feedback_output_projection_init_mode == "xavier_uniform":
+            nn.init.xavier_uniform_(self.feedback_up_proj.weight)
+        else:
+            nn.init.xavier_normal_(self.feedback_up_proj.weight)
+
+    def effective_position_scale(self) -> torch.Tensor:
+        """Return per-slot residual scales with the anchor fixed to zero."""
+        if self.position_scale_parameterization == "softplus_floor":
+            scales = self.position_scale_min + functional.softplus(
+                self.position_scale.float()
+            ).to(self.position_scale.dtype)
+        else:
+            scales = self.position_scale
+        anchor_mask = torch.ones_like(scales)
+        anchor_mask[0] = 0.0
+        return scales * anchor_mask
 
     def _mixer_matrix(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
         """Materialize the small strict lower-triangular Toeplitz matrix."""
@@ -193,20 +262,24 @@ class TokenLatentFeedbackHead(nn.Module):
             )
 
         packed = self.intent_gate_proj(self.input_norm(hidden_states))
-        latent_logits, gate_logits = packed.split([self.latent_dim, 1], dim=-1)
+        if self.use_reliability_gate:
+            latent_logits, gate_logits = packed.split([self.latent_dim, 1], dim=-1)
+        else:
+            latent_logits = packed
+            gate_logits = None
         latents = functional.normalize(latent_logits.float(), dim=-1).to(
             hidden_states.dtype
         )
         reliability = (
             torch.sigmoid(gate_logits.float()).to(hidden_states.dtype)
             if self.use_reliability_gate
-            else torch.ones_like(gate_logits, dtype=hidden_states.dtype)
+            else torch.ones_like(latent_logits[..., :1], dtype=hidden_states.dtype)
         )
         gated_latents = latents * reliability
         prefix_latents = self.mix_prefix(gated_latents)
         prefix_latents = self.prefix_norm(prefix_latents)
         correction = self.feedback_up_proj(prefix_latents)
-        scales = self.position_scale.to(
+        scales = self.effective_position_scale().to(
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         ).view(1, self.block_size, 1)

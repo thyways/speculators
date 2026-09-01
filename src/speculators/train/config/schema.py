@@ -592,7 +592,7 @@ class DominoArgs(_Group):
 
 
 class TokenLatentFeedbackArgs(_Group):
-    """Parallel Token-Latent Feedback (方案设计 v1.2) settings."""
+    """Parallel Token-Latent Feedback v1.2/v1.3 settings."""
 
     latent_dim: int = Field(
         default=128,
@@ -645,12 +645,30 @@ class TokenLatentFeedbackArgs(_Group):
     feedback_output_projection_init: float = Field(
         default=0.0,
         ge=0.0,
-        description="Initial value of the latent-to-hidden feedback projection.",
+        description="Value/std used by --feedback-output-projection-init-mode.",
+    )
+    feedback_output_projection_init_mode: Literal[
+        "constant",
+        "normal",
+        "xavier_uniform",
+        "xavier_normal",
+    ] = Field(
+        default="constant",
+        description="Initialization mode for the latent-to-hidden projection.",
     )
     position_scale_init: float = Field(
         default=1.0,
         ge=0.0,
-        description="Initial learned per-position feedback scale.",
+        description="Initial effective per-position feedback scale.",
+    )
+    position_scale_parameterization: Literal["direct", "softplus_floor"] = Field(
+        default="direct",
+        description="Direct scale or softplus scale with a positive floor.",
+    )
+    position_scale_min: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Minimum effective scale for softplus_floor.",
     )
     latent_loss_alpha: float = Field(
         default=0.1,
@@ -661,6 +679,16 @@ class TokenLatentFeedbackArgs(_Group):
         default=None,
         ge=0.0,
         description="Optional alias for --latent-loss-alpha.",
+    )
+    source_latent_loss_alpha: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Readable alias for --latent-loss-alpha.",
+    )
+    prefix_latent_loss_alpha: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Weight of the mixed prefix-latent cosine loss.",
     )
     # Compatibility knobs used by the earlier LatentScan/TokenLatentSSM
     # experiments. They remain harmless no-ops for v1.2 and allow one parser to

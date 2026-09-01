@@ -18,6 +18,20 @@ logger = logging.getLogger(__name__)
 _FEEDBACK_ARCH = "Qwen3TokenLatentFeedbackModel"
 
 
+def _first_set(config_dict: dict[str, Any], *keys: str, default: Any) -> Any:
+    """Return the first alias that carries a value, else ``default``.
+
+    Checkpoints serialize every unused legacy alias as ``null``, so a plain
+    ``config_dict.get(legacy, config_dict.get(current, default))`` resolves to
+    ``None`` instead of falling through to the current key.
+    """
+    for key in keys:
+        value = config_dict.get(key)
+        if value is not None:
+            return value
+    return default
+
+
 def _update_token_latent_feedback(
     config_dict: dict[str, Any],
     pre_trained_config: dict[str, Any],
@@ -34,12 +48,16 @@ def _update_token_latent_feedback(
         raise ValueError("token_latent_feedback requires aux_hidden_state_layer_ids.")
 
     latent_dim = int(
-        config_dict.get("token_latent_dim") or config_dict.get("latent_dim", 128)
+        _first_set(config_dict, "token_latent_dim", "latent_dim", default=128)
     )
     mixer_mode = str(
-        config_dict.get("prefix_mixer")
-        or config_dict.get("feedback_mode")
-        or config_dict.get("prefix_mixer_mode", "full")
+        _first_set(
+            config_dict,
+            "prefix_mixer",
+            "feedback_mode",
+            "prefix_mixer_mode",
+            default="full",
+        )
     )
     pre_trained_config["architectures"] = [_FEEDBACK_ARCH]
     pre_trained_config["model_arch"] = "token_latent_feedback"
@@ -52,17 +70,21 @@ def _update_token_latent_feedback(
     pre_trained_config["sample_from_anchor"] = False
     pre_trained_config["latent_dim"] = latent_dim
     pre_trained_config["feedback_stages"] = int(
-        config_dict.get(
+        _first_set(
+            config_dict,
             "latent_feedback_stages",
-            config_dict.get("feedback_stages", 1),
+            "feedback_stages",
+            default=1,
         )
     )
     pre_trained_config["prefix_mixer_mode"] = mixer_mode
     pre_trained_config["prefix_mixer_parameterization"] = "toeplitz"
     pre_trained_config["use_reliability_gate"] = bool(
-        config_dict.get(
+        _first_set(
+            config_dict,
             "reliability_gate",
-            config_dict.get("use_reliability_gate", True),
+            "use_reliability_gate",
+            default=True,
         )
     )
     pre_trained_config["strict_causal_prefix"] = bool(
@@ -71,8 +93,17 @@ def _update_token_latent_feedback(
     pre_trained_config["position_scale_init"] = float(
         config_dict.get("position_scale_init", 1.0)
     )
+    pre_trained_config["position_scale_parameterization"] = str(
+        config_dict.get("position_scale_parameterization", "direct")
+    )
+    pre_trained_config["position_scale_min"] = float(
+        config_dict.get("position_scale_min", 0.0)
+    )
     pre_trained_config["feedback_output_projection_init"] = float(
         config_dict.get("feedback_output_projection_init", 0.0)
+    )
+    pre_trained_config["feedback_output_projection_init_mode"] = str(
+        config_dict.get("feedback_output_projection_init_mode", "constant")
     )
     pre_trained_config["dflash_config"] = {
         "mask_token_id": config_dict["mask_token_id"],

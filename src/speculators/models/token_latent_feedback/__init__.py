@@ -1,4 +1,4 @@
-"""Parallel token-latent feedback speculator (方案设计 v1.2)."""
+"""Parallel token-latent feedback speculator (方案设计 v1.2/v1.3)."""
 
 from .config import (
     LatentFeedbackSpeculatorConfig,

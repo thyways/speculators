@@ -17,6 +17,10 @@ def test_token_latent_feedback_defaults_are_resolved():
     assert flat["prefix_mixer_mode"] == "full"
     assert flat["prefix_mixer_parameterization"] == "toeplitz"
     assert flat["latent_loss_alpha"] == 0.1
+    assert flat["prefix_latent_loss_alpha"] == 0.0
+    assert flat["feedback_output_projection_init_mode"] == "constant"
+    assert flat["position_scale_parameterization"] == "direct"
+    assert flat["position_scale_min"] == 0.0
     assert config.loss.loss_fn == '{"ce": 0.1, "tv": 0.9}'
     assert config.dflash.per_position_loss_weight == "fixed-exp-decay"
     assert "target_projection_seed" not in flat
@@ -32,7 +36,13 @@ def test_token_latent_feedback_cli_values_round_trip():
             "prefix_mixer_mode": "shifted",
             "use_reliability_gate": False,
             "feedback_output_projection_init": 0.001,
+            "feedback_output_projection_init_mode": "normal",
+            "position_scale_init": 0.05,
+            "position_scale_parameterization": "softplus_floor",
+            "position_scale_min": 0.02,
             "latent_loss_alpha": 0.25,
+            "source_latent_loss_alpha": 0.05,
+            "prefix_latent_loss_alpha": 0.1,
         },
         argv=[
             "--speculator-type",
@@ -46,4 +56,10 @@ def test_token_latent_feedback_cli_values_round_trip():
     assert flat["prefix_mixer_mode"] == "shifted"
     assert flat["use_reliability_gate"] is False
     assert flat["feedback_output_projection_init"] == 0.001
+    assert flat["feedback_output_projection_init_mode"] == "normal"
+    assert flat["position_scale_init"] == 0.05
+    assert flat["position_scale_parameterization"] == "softplus_floor"
+    assert flat["position_scale_min"] == 0.02
     assert flat["latent_loss_alpha"] == 0.25
+    assert flat["source_latent_loss_alpha"] == 0.05
+    assert flat["prefix_latent_loss_alpha"] == 0.1

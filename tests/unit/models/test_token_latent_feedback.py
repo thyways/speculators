@@ -16,7 +16,7 @@ from speculators.models.token_latent_feedback import (
 from speculators.proposals import GreedyTokenProposalConfig
 
 
-def _config() -> TokenLatentFeedbackSpeculatorConfig:
+def _config(**overrides) -> TokenLatentFeedbackSpeculatorConfig:
     transformer = Qwen3Config(
         hidden_size=16,
         intermediate_size=32,
@@ -27,13 +27,13 @@ def _config() -> TokenLatentFeedbackSpeculatorConfig:
         vocab_size=64,
         _attn_implementation="eager",  # type: ignore[call-arg]
     )
-    return TokenLatentFeedbackSpeculatorConfig(
-        transformer_layer_config=transformer,
-        draft_vocab_size=64,
-        block_size=4,
-        aux_hidden_state_layer_ids=[0, 1],
-        mask_token_id=0,
-        speculators_config=SpeculatorsConfig(
+    values = {
+        "transformer_layer_config": transformer,
+        "draft_vocab_size": 64,
+        "block_size": 4,
+        "aux_hidden_state_layer_ids": [0, 1],
+        "mask_token_id": 0,
+        "speculators_config": SpeculatorsConfig(
             algorithm="token_latent_feedback",
             proposal_methods=[GreedyTokenProposalConfig(speculative_tokens=3)],
             default_proposal_method="greedy",
@@ -42,7 +42,9 @@ def _config() -> TokenLatentFeedbackSpeculatorConfig:
                 architectures=["Qwen3ForCausalLM"],
             ),
         ),
-    )
+    }
+    values.update(overrides)
+    return TokenLatentFeedbackSpeculatorConfig(**values)
 
 
 def test_config_defaults_match_v12_design():
@@ -51,6 +53,9 @@ def test_config_defaults_match_v12_design():
     assert config.feedback_stages == 1
     assert config.resolved_prefix_mixer_mode == "full"
     assert config.sample_from_anchor is False
+    assert config.feedback_output_projection_init_mode == "constant"
+    assert config.position_scale_parameterization == "direct"
+    assert config.prefix_latent_loss_alpha == 0.0
 
 
 def test_config_rejects_anchor_sampling():
@@ -110,6 +115,45 @@ def test_zero_feedback_projection_preserves_hidden_and_has_gradients():
     assert head.feedback_up_proj.weight.grad is not None
 
 
+def test_v13_head_has_nonzero_feedback_and_positive_scale_floor():
+    torch.manual_seed(0)
+    head = TokenLatentFeedbackHead(
+        hidden_size=8,
+        latent_dim=4,
+        block_size=4,
+        rms_norm_eps=1e-6,
+        initializer_range=0.02,
+        use_reliability_gate=False,
+        position_scale_init=0.05,
+        position_scale_parameterization="softplus_floor",
+        position_scale_min=0.02,
+        feedback_output_projection_init_mode="xavier_normal",
+    )
+    assert head.intent_gate_proj.out_features == 4
+    assert torch.count_nonzero(head.feedback_up_proj.weight) > 0
+    torch.testing.assert_close(
+        head.effective_position_scale(),
+        torch.tensor([0.0, 0.05, 0.05, 0.05]),
+    )
+    hidden = torch.randn(2, 4, 8, requires_grad=True)
+    output = head(hidden)
+    assert not torch.equal(output.hidden_states, hidden)
+    output.hidden_states.square().mean().backward()
+    assert head.intent_gate_proj.weight.grad is not None
+    assert head.feedback_up_proj.weight.grad is not None
+    assert head.toeplitz_coeff.grad is not None
+    assert head.position_scale.grad is not None
+
+
+def test_v13_config_requires_scale_init_above_floor():
+    with pytest.raises(ValueError, match="position_scale_init > position_scale_min"):
+        _config(
+            position_scale_init=0.02,
+            position_scale_parameterization="softplus_floor",
+            position_scale_min=0.02,
+        )
+
+
 def test_target_projection_follows_the_global_training_seed():
     torch.manual_seed(19)
     first = TokenLatentFeedbackDraftModel(_config())
@@ -123,7 +167,17 @@ def test_target_projection_follows_the_global_training_seed():
 
 def test_model_forward_uses_ce_tv_and_backpropagates():
     torch.manual_seed(0)
-    model = TokenLatentFeedbackDraftModel(_config())
+    model = TokenLatentFeedbackDraftModel(
+        _config(
+            use_reliability_gate=False,
+            feedback_output_projection_init_mode="xavier_normal",
+            position_scale_init=0.05,
+            position_scale_parameterization="softplus_floor",
+            position_scale_min=0.02,
+            source_latent_loss_alpha=0.05,
+            prefix_latent_loss_alpha=0.1,
+        )
+    )
     nn.init.normal_(model.embed_tokens.weight)
     nn.init.normal_(model.lm_head.weight)
     nn.init.normal_(model.verifier_lm_head.weight)
@@ -146,6 +200,8 @@ def test_model_forward_uses_ce_tv_and_backpropagates():
     )
     assert torch.isfinite(loss)
     assert "tv_loss_sum" in metrics
+    assert "source_latent_loss_sum" in metrics
+    assert "prefix_latent_loss_sum" in metrics
     loss.backward()
     assert model.token_latent_head.intent_gate_proj.weight.grad is not None
     unused = [

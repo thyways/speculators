@@ -61,8 +61,19 @@ class Qwen3TokenLatentFeedbackModel(DFlashQwen3Model):
             ),
             strict_causal_prefix=bool(getattr(config, "strict_causal_prefix", True)),
             position_scale_init=float(getattr(config, "position_scale_init", 1.0)),
+            position_scale_parameterization=str(
+                getattr(config, "position_scale_parameterization", "direct")
+            ),
+            position_scale_min=float(getattr(config, "position_scale_min", 0.0)),
             feedback_output_projection_init=float(
                 getattr(config, "feedback_output_projection_init", 0.0)
+            ),
+            feedback_output_projection_init_mode=str(
+                getattr(
+                    config,
+                    "feedback_output_projection_init_mode",
+                    "constant",
+                )
             ),
         ).to(dtype=vllm_config.model_config.dtype)
         # Training-only target projection is not part of this module; the
