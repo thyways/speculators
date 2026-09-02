@@ -1,10 +1,9 @@
 #!/bin/bash
 # Online HashGram training example.
 #
-# HashGram is an experimental training model: one DFlash backbone pass is
-# followed by a DSpark-style low-rank recall bias and hashed vector
-# bigram/trigram candidate reranking. vLLM serving integration is not included
-# yet; this recipe only exercises data generation and training.
+# HashGram uses one DFlash backbone pass followed by a DSpark-style low-rank
+# recall bias and hashed vector bigram/trigram candidate reranking. Trained
+# checkpoints are served by the speculators_hashgram vLLM general plugin.
 # For one inference node + one training node with Mooncake, use
 # hashgram_qwen3_8b_sharegpt_2node_mooncake.sh instead.
 
