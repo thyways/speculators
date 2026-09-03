@@ -11,10 +11,8 @@
 #     head's top-K candidates and walks the best path from the verified anchor
 #     (--selector-rank, --selector-top-k).
 #
-# Same pipeline as dflash_qwen3_8b_ultrachat_online_5k_bestpractices.sh: data
-# preparation, vLLM server launch, online training. This uses main's experimental
-# DFlash2 defaults: five layers, block_size=8, fixed exponential position weighting,
-# KL unary loss, and a two-tap/group-16 local convolution.
+# This runs the unified Speculators pipeline: data preparation, vLLM server
+# launch, and online training against the live server.
 #
 # Two constraints DFlash2 does not share with DFlash:
 #
@@ -31,31 +29,14 @@
 #
 # Usage: Copy this script, modify the configuration variables below, then run:
 #   bash examples/train/dflash2_qwen3_8b_ultrachat_online_5k.sh
-#
-# With 5k samples the drafter will not be good; there is enough signal to verify
-# the pipeline runs and the model learns. Watch these metrics, which the DFlash2
-# model reports alongside DFlash's:
-#
-#   candidate_recall        fraction of slots whose target token is in the top-K;
-#                           the ceiling on what the selector can reach, and what
-#                           the unary_loss term buys
-#   unary_accept_len        mean accepted run using the per-slot top-1, i.e. the
-#                           DFlash baseline inside the same run
-#   selector_accept_len     the same run using the selector's path walk
-#   unary_loss/selector_loss  the two terms of the total loss: DFlash's
-#                           full-vocabulary loss on the unary logits, and the
-#                           cross-entropy of the selector's top-K decision
-#
-# The selector loss is controlled by --selector-loss-alpha. Both unary and selector
-# objectives use the configured position weighting; the selector is trained with the
-# target injected into the weakest candidate when it is absent from unary Top-K.
 
 set -euo pipefail
 
 # ============ Configuration ============
 MODEL="Qwen/Qwen3-8B"
-DATASET="ultrachat"               # sharegpt, ultrachat, or path to custom data
-OUTPUT_DIR="./output/dflash2_qwen3_8b_ultrachat"
+# On-policy regenerated Qwen3-8B data (pretokenized); or a preset/path to custom data.
+DATASET="hf:inference-optimization/speculators-ci-datasets:tutorial_regen"
+OUTPUT_DIR="./output/dflash2_qwen3_8b_ultrachat_200k_regen"
 VLLM_PORT=8000
 MAX_SAMPLES=5000
 SEQ_LENGTH=8192
@@ -71,12 +52,9 @@ LOSS_FN="kl_div"
 # Full verifier vocabulary -- required by DFlash2 (see the header). 151936 is
 # Qwen3-8B's vocab_size; change it with the model.
 DRAFT_VOCAB_SIZE=151936
-# The DFlash script this mirrors uses 3072 anchors, but it pairs them with a pruned
-# 32k draft vocabulary. The forward holds two
-# [MAX_ANCHORS * BLOCK_SIZE, DRAFT_VOCAB_SIZE] tensors at peak -- the targets and
-# the unary logits -- so at 151936 the same footprint (~3 GiB per tensor in bf16)
-# means about a fifth as many anchors. Scale this with the verifier's vocab_size,
-# not by copying it from a DFlash recipe.
+# The forward holds two [MAX_ANCHORS * BLOCK_SIZE, DRAFT_VOCAB_SIZE] tensors at
+# peak -- the targets and the unary logits -- so at 151936 the same footprint
+# (~3 GiB per tensor in bf16) means about a fifth as many anchors.
 MAX_ANCHORS=640
 TARGET_LAYER_IDS="2 18 33"  # Must match vLLM's eagle_aux_hidden_state_layer_ids
 
@@ -93,9 +71,10 @@ TRAIN_GPUS="2,3"
 NUM_TRAIN_GPUS=2
 # =======================================
 
-# Step 1: Prepare data
+# Step 1: Prepare data. The regenerated dataset is pretokenized, so this step
+# packages it without requiring a render endpoint.
 echo "=== Step 1: Preparing data ==="
-python scripts/prepare_data.py \
+speculators prepare-data \
     --model "$MODEL" \
     --data "$DATASET" \
     --output "$OUTPUT_DIR" \
@@ -127,7 +106,7 @@ echo "vLLM server ready."
 echo "=== Step 3: Training ==="
 CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" torchrun \
     --standalone --nproc_per_node "$NUM_TRAIN_GPUS" \
-    scripts/train.py \
+    -m speculators.train \
     --verifier-name-or-path "$MODEL" \
     --data-path "$OUTPUT_DIR" \
     --vllm-endpoint "http://localhost:${VLLM_PORT}/v1" \

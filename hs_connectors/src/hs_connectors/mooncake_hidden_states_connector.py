@@ -22,6 +22,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
     SupportsHMA,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.example_hidden_states_connector import (  # noqa: E501
+    ExampleHiddenStatesConnector,
+    extract_from_kv_cache,
+)
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
@@ -39,13 +43,6 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
-
-
-def extract_from_kv_cache(
-    kv_cache: torch.Tensor, slot_mapping: torch.Tensor, num_tokens: int
-) -> torch.Tensor:
-    block_size = kv_cache.shape[1]
-    return kv_cache[slot_mapping // block_size, slot_mapping % block_size][:num_tokens]
 
 
 def sanitize_key(key: str) -> str:
@@ -241,7 +238,9 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             with torch.cuda.stream(copy_stream):
                 slot_mapping = slot_mapping.to(self._kv_cache.device, non_blocking=True)
                 hidden_states = extract_from_kv_cache(
-                    self._kv_cache, slot_mapping, num_tokens
+                    self._kv_cache,
+                    slot_mapping,
+                    num_tokens,
                 )
                 assert_finite("hidden_states", hidden_states)
                 # Async DtoH copy into pinned host memory.
@@ -367,11 +366,6 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
     @classmethod
     def get_required_kvcache_layout(
         cls,
-        vllm_config: VllmConfig,  # noqa: ARG003 (KVConnector interface)
+        vllm_config: VllmConfig,
     ) -> str | None:
-        if cls is KVConnectorBase_V1:
-            raise TypeError(
-                "get_required_kvcache_layout should not be called on the base class"
-            )
-        # NHD keeps each token's hidden states contiguous in memory.
-        return "NHD"
+        return ExampleHiddenStatesConnector.get_required_kvcache_layout(vllm_config)
