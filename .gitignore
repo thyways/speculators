@@ -201,3 +201,4 @@ hs_connectors/pip-delete-this-directory.txt
 /benchmark_data/
 /benchmark_results/
 /output/
+tmp/

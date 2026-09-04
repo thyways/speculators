@@ -10,22 +10,22 @@ export ROOT="${ROOT:-$(dirname -- "$REPO")}"
 export ENV_REPO="${ENV_REPO:-$ROOT/speculators}"
 
 MODEL="${MODEL:-$ROOT/model_weights/Qwen--Qwen3.6-35B-A3B}"
-DATA_DIR="${DATA_DIR:-$ROOT/datasets/qwen3.6-35b-a3b/qwen3.6-35b-a3b_train_spec_800k_len4096_fullvocab}"
-export RUN_DIR="${RUN_DIR:-$ROOT/model_weights/dfly_qwen3_6_35b_a3b_5swa}"
+DATA_DIR="${DATA_DIR:-$ROOT/datasets/qwen3.6-35b-a3b/qwen3.6-35b-a3b_train_spec_len3072_fullvocab}"
+export RUN_DIR="${RUN_DIR:-$ROOT/model_weights/dfly_qwen3_6-35b-a3b-perfectblend}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-$RUN_DIR/checkpoints}"
-LOG_DIR="${LOG_DIR:-$RUN_DIR}"
-WANDB_PROJECT="${WANDB_PROJECT:-qwen3.6-35b-a3b-5swa}"
+LOG_DIR="${LOG_DIR:-$RUN_DIR/logs}"
+WANDB_PROJECT="${WANDB_PROJECT:-speculators-qwen3_6-35b-a3b-perfectblend}"
 WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_KEY_FILE="${WANDB_KEY_FILE:-$ROOT/.secrets/wandb_key}"
 
-VLLM_PORT="${VLLM_PORT:-8100}"
+VLLM_PORT="${VLLM_PORT:-8000}"
 VLLM_ENDPOINT="${VLLM_ENDPOINT:-http://localhost:${VLLM_PORT}/v1}"
 VLLM_HEALTH_ENDPOINT="${VLLM_HEALTH_ENDPOINT:-http://localhost:${VLLM_PORT}/health}"
-BLOCK_SIZE="${BLOCK_SIZE:-8}"
-MAX_ANCHORS="${MAX_ANCHORS:-512}"
+BLOCK_SIZE="${BLOCK_SIZE:-7}"
+MAX_ANCHORS="${MAX_ANCHORS:-2048}"
 JOB_TAG="${SLURM_JOB_ID:-${JOB_ID:-$$}}"
 HIDDEN_STATES_DIR="${HIDDEN_STATES_DIR:-/tmp/dfly_qwen3_6_35b_a3b_hidden_states}"
-VLLM_LOG="${VLLM_LOG:-$RUN_DIR/vllm_${JOB_TAG}.log}"
+VLLM_LOG="${VLLM_LOG:-$RUN_DIR/logs/vllm_${JOB_TAG}.log}"
 
 SPEC_PYTHON="${SPEC_PYTHON:-$ENV_REPO/speculators_venv/bin/python}"
 TORCHRUN="${TORCHRUN:-$ENV_REPO/speculators_venv/bin/torchrun}"
@@ -34,7 +34,7 @@ LAUNCH_VLLM="${LAUNCH_VLLM:-$REPO/scripts/launch_vllm.py}"
 TRAIN_SCRIPT="${TRAIN_SCRIPT:-$REPO/scripts/train.py}"
 LOCAL_PYTHONPATH="${LOCAL_PYTHONPATH:-$REPO/src:$REPO/hs_connectors/src}"
 
-mkdir -p "$RUN_DIR" "$CHECKPOINT_DIR" "$HIDDEN_STATES_DIR"
+mkdir -p "$RUN_DIR" "$RUN_DIR/logs" "$CHECKPOINT_DIR" "$HIDDEN_STATES_DIR"
 
 for executable in "$SPEC_PYTHON" "$TORCHRUN" "$VLLM_PYTHON"; do
     if [[ ! -x "$executable" ]]; then
@@ -150,12 +150,12 @@ setsid env \
     "$VLLM_PYTHON" \
     "$LAUNCH_VLLM" \
     "$MODEL" \
-    --target-layer-ids 2 11 20 29 38 \
+    --target-layer-ids 2 20 37 \
     --hidden-states-path "$HIDDEN_STATES_DIR" \
     -- \
     --tensor-parallel-size 1 \
     --data-parallel-size 2 \
-    --max-model-len 10000 \
+    --max-model-len 3088 \
     --gpu-memory-utilization 0.92 \
     --port "$VLLM_PORT" \
     >"$VLLM_LOG" 2>&1 &
@@ -191,31 +191,32 @@ setsid env \
     --verifier-name-or-path "$MODEL" \
     --data-path "$DATA_DIR" \
     --save-path "$CHECKPOINT_DIR" \
-    --epochs 1 \
+    --epochs 3 \
     --train-data-ratio 0.98 \
     --optimizer muon \
     --muon-lr 2e-4 \
     --lr 1e-4 \
     --weight-decay 0.01 \
-    --noise-std 0 \
-    --scheduler-type cosine \
-    --scheduler-warmup-ratio 0.04 \
-    --total-seq-len 4096 \
+    --noise-std 0.05 \
+    --scheduler-type linear \
+    --scheduler-warmup-ratio 0.01 \
+    --total-seq-len 8192 \
     --speculator-type dfly \
     --enable-hidden-correction \
     --block-size "$BLOCK_SIZE" \
     --max-anchors "$MAX_ANCHORS" \
     --num-layers 5 \
+    --dflash-decay-gamma 7 \
     --sliding-window 2048 \
     --sliding-window-non-causal \
-    --target-layer-ids 2 11 20 29 38 \
+    --target-layer-ids 2 20 37 \
     --vllm-endpoint "$VLLM_ENDPOINT" \
-    --request-timeout 300 \
+    --request-timeout 180 \
     --on-missing generate \
     --on-generate delete \
     --logger wandb \
     --log-dir "$LOG_DIR" \
-    --checkpoint-freq 0.1 \
+    --checkpoint-freq 0.5 \
     --run-name dfly_5swa2048nc_muon_fullvocab &
 TRAIN_PID=$!
 
