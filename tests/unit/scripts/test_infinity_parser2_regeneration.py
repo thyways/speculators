@@ -7,6 +7,8 @@ import asyncio
 import importlib.util
 import json
 import os
+import shutil
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -191,6 +193,161 @@ def test_run_all_retries_errors_even_when_stage_is_complete(
         assert "--retry-errors" in generations[0]
         assert "--allow-config-change" in generations[0]
         assert generations[0][generations[0].index("--max-tokens") + 1] == "16384"
+
+
+def available_port_range(count: int) -> int:
+    reservations = []
+    for base_port in range(40000, 60000, count):
+        try:
+            for port in range(base_port, base_port + count):
+                reservation = socket.socket()
+                reservations.append(reservation)
+                reservation.bind(("127.0.0.1", port))
+        except OSError:
+            for reservation in reservations:
+                reservation.close()
+            reservations.clear()
+        else:
+            break
+    assert len(reservations) == count
+    for reservation in reservations:
+        reservation.close()
+    return base_port
+
+
+def test_four_nodes_use_one_endpoint_per_gpu_and_stop_all_servers(tmp_path: Path):
+    # Run both real launchers, replacing only the model and pipeline processes.
+    # Separate port ranges let four simulated nodes share this test machine.
+    scripts = tmp_path / "repo" / "scripts"
+    launchers = scripts / "infinity_parser2_regeneration"
+    launchers.mkdir(parents=True)
+    for name in ("run_4node_dp.sh", "run_all.sh"):
+        shutil.copyfile(SCRIPT_DIR / name, launchers / name)
+    (scripts / "build_vocab_mapping.py").touch()
+    (launchers / "script.py").touch()
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    source = tmp_path / "source.jsonl"
+    source.touch()
+
+    fake_vllm = tmp_path / "vllm"
+    fake_vllm.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
+        "from pathlib import Path\n"
+        "args = sys.argv[1:]\n"
+        "port = int(args[args.index('--port') + 1])\n"
+        "root = Path(os.environ['REGEN_TEST_ROOT'])\n"
+        "record = {'args': args, 'gpu': os.environ['CUDA_VISIBLE_DEVICES'],\n"
+        "          'node': os.environ['PET_NODE_RANK'], 'pid': os.getpid(),\n"
+        "          'world_size': os.environ.get('WORLD_SIZE')}\n"
+        "(root / f'server_{port}.json').write_text(json.dumps(record))\n"
+        "class Handler(BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        self.send_response(200)\n"
+        "        self.end_headers()\n"
+        "    def log_message(self, *args):\n"
+        "        pass\n"
+        "HTTPServer(('127.0.0.1', port), Handler).serve_forever()\n"
+    )
+    fake_vllm.chmod(0o755)
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys, urllib.request\n"
+        "from pathlib import Path\n"
+        "args = sys.argv[1:]\n"
+        "if '--require-complete' in args:\n"
+        "    sys.exit(1)\n"
+        "if args[1] == 'generate':\n"
+        "    endpoints = [args[i + 1] for i, a in enumerate(args)\n"
+        "                 if a == '--endpoint']\n"
+        "    client = urllib.request.build_opener(urllib.request.ProxyHandler({}))\n"
+        "    for endpoint in endpoints:\n"
+        "        url = endpoint.replace('/v1/chat/completions', '/health')\n"
+        "        with client.open(url, timeout=5) as response:\n"
+        "            assert response.status == 200\n"
+        "    output = Path(os.environ['REGEN_TEST_ROOT'], 'generate.json')\n"
+        "    output.write_text(json.dumps(args))\n"
+    )
+    fake_python.chmod(0o755)
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("PARSER2_", "PET_"))
+    }
+    env.update(
+        REGEN_TEST_ROOT=str(tmp_path),
+        PARSER2_PYTHON_BIN=str(fake_python),
+        PARSER2_VLLM_BIN=str(fake_vllm),
+        PARSER2_SOURCE_JSONL=str(source),
+        PARSER2_MODEL=str(model),
+        PARSER2_DATA_ROOT=str(tmp_path / "data"),
+        PARSER2_TEACHER_ADVERTISE_HOST="127.0.0.1",
+        PARSER2_TEACHER_START_TIMEOUT="30",
+        PET_NNODES="4",
+        PET_NPROC_PER_NODE="8",
+        MASTER_ADDR="test-worker-0",
+        MASTER_PORT="23456",
+        WORLD_SIZE="32",
+        CUDA_VISIBLE_DEVICES="7,6,5,4,3,2,1,0",
+        no_proxy="127.0.0.1,localhost",
+        NO_PROXY="127.0.0.1,localhost",
+    )
+    # Reserve an available range before launching the stand-in HTTP servers.
+    base_port = available_port_range(32)
+
+    processes = []
+    try:
+        for rank in range(4):
+            node_env = dict(
+                env,
+                PET_NODE_RANK=str(rank),
+                PARSER2_TEACHER_BASE_PORT=str(base_port + 8 * rank),
+            )
+            processes.append(
+                subprocess.Popen(  # noqa: S603
+                    ["/bin/bash", str(launchers / "run_4node_dp.sh"), "generate"],
+                    env=node_env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            )
+        for process in processes:
+            output, _ = process.communicate(timeout=45)
+            assert process.returncode == 0, output
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+        for process in processes:
+            process.wait(timeout=40)
+
+    args = json.loads((tmp_path / "generate.json").read_text())
+    endpoints = [args[i + 1] for i, value in enumerate(args) if value == "--endpoint"]
+    assert endpoints == [
+        f"http://127.0.0.1:{port}/v1/chat/completions"
+        for port in range(base_port, base_port + 32)
+    ]
+    assert args[args.index("--concurrency-per-endpoint") + 1] == "32"
+    servers = [json.loads(path.read_text()) for path in tmp_path.glob("server_*.json")]
+    assert len(servers) == 32
+    for server in servers:
+        argv = server["args"]
+        port = int(argv[argv.index("--port") + 1])
+        assert server["node"] == str((port - base_port) // 8)
+        assert server["gpu"] == str(7 - (port - base_port) % 8)
+        assert server["world_size"] is None
+        assert argv[argv.index("--tensor-parallel-size") + 1] == "1"
+        assert "--max-num-seqs" not in argv
+        assert "--data-parallel-size" not in argv
+        assert "--api-server-count" not in argv
+        with pytest.raises(ProcessLookupError):
+            os.kill(server["pid"], 0)
+    assert not list((tmp_path / "repo" / "tmp").iterdir())
 
 
 def test_multiturn_skeleton_drops_old_answers_and_preserves_image_order():

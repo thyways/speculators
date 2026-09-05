@@ -1,172 +1,90 @@
 #!/usr/bin/env bash
+# Online DFlash Training Script (Qwen3.6-35B-A3B + open-perfectblend, full dataset)
+
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_REPO="$(cd -- "$SCRIPT_DIR/../../.." && pwd)"
+COMMENT=""
+while getopts "c:" opt; do
+    case $opt in
+        c) COMMENT="$OPTARG" ;;
+        *) echo "Usage: $0 [-c comment]" >&2; exit 1 ;;
+    esac
+done
 
-export REPO="${REPO:-$DEFAULT_REPO}"
-export ROOT="${ROOT:-$(dirname -- "$REPO")}"
-export ENV_REPO="${ENV_REPO:-$ROOT/speculators}"
+export WANDB_PROJECT="${WANDB_PROJECT:-speculators-qwen3_6-35b-a3b-perfectblend}"
 
-MODEL="${MODEL:-$ROOT/model_weights/Qwen--Qwen3.6-35B-A3B}"
-DATA_DIR="${DATA_DIR:-$ROOT/datasets/qwen3.6-35b-a3b/qwen3.6-35b-a3b_train_spec_len3072_fullvocab}"
-export RUN_DIR="${RUN_DIR:-$ROOT/model_weights/dflash_qwen3_6-35b-a3b-perfectblend}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-$RUN_DIR/checkpoints}"
-LOG_DIR="${LOG_DIR:-$RUN_DIR/logs}"
-WANDB_PROJECT="${WANDB_PROJECT:-speculators-qwen3_6-35b-a3b-perfectblend}"
-WANDB_MODE="${WANDB_MODE:-online}"
-WANDB_KEY_FILE="${WANDB_KEY_FILE:-$ROOT/.secrets/wandb_key}"
-
-VLLM_PORT="${VLLM_PORT:-8000}"
-VLLM_ENDPOINT="${VLLM_ENDPOINT:-http://localhost:${VLLM_PORT}/v1}"
-VLLM_HEALTH_ENDPOINT="${VLLM_HEALTH_ENDPOINT:-http://localhost:${VLLM_PORT}/health}"
-BLOCK_SIZE="${BLOCK_SIZE:-7}"
-MAX_ANCHORS="${MAX_ANCHORS:-2048}"
+# ============ Configuration ============
+WS="/inspire/sfs/project/inf-multimodal/public/wumengke"
+MODEL="$WS/model_weights/Qwen--Qwen3.6-35B-A3B"
+OUTPUT_DIR="$WS/model_weights/dflash_qwen3_6-35b-a3b-perfectblend"
+DATA_DIR="$WS/datasets/qwen3.6-35b-a3b/qwen3.6-35b-a3b_train_spec_len3072_fullvocab"
+LOG_DIR="$OUTPUT_DIR/logs"
+SEQ_LENGTH=3072                 # Data truncation length (prepare_data); fixed by the shared artifacts
+PACK_SEQ_LEN=8192
+EPOCHS=3
+LR=1e-4
+VLLM_PORT=8000
 JOB_TAG="${SLURM_JOB_ID:-${JOB_ID:-$$}}"
-HIDDEN_STATES_DIR="${HIDDEN_STATES_DIR:-/tmp/dflash_qwen3_6_35b_a3b_hidden_states}"
-VLLM_LOG="${VLLM_LOG:-$RUN_DIR/logs/vllm_${JOB_TAG}.log}"
+HS_PATH="/tmp/hs_dflash_qwen3_6_35b_a3b_${JOB_TAG}"
+VLLM_LOG="$OUTPUT_DIR/logs/vllm_${JOB_TAG}.log"
 
-SPEC_PYTHON="${SPEC_PYTHON:-$ENV_REPO/speculators_venv/bin/python}"
-TORCHRUN="${TORCHRUN:-$ENV_REPO/speculators_venv/bin/torchrun}"
-VLLM_PYTHON="${VLLM_PYTHON:-$ENV_REPO/vllm_venv/bin/python}"
-LAUNCH_VLLM="${LAUNCH_VLLM:-$REPO/scripts/launch_vllm.py}"
-TRAIN_SCRIPT="${TRAIN_SCRIPT:-$REPO/scripts/train.py}"
-LOCAL_PYTHONPATH="${LOCAL_PYTHONPATH:-$REPO/src:$REPO/hs_connectors/src}"
+# Online training uses two GPUs for the verifier server and six for training.
+VLLM_GPUS="0,1"
+TRAIN_GPUS="2,3,4,5,6,7"
+NUM_TRAIN_GPUS=6
 
-mkdir -p "$RUN_DIR" "$RUN_DIR/logs" "$CHECKPOINT_DIR" "$HIDDEN_STATES_DIR"
+# DFlash-specific parameters
+SPECULATOR_TYPE="dflash"
+NUM_LAYERS=5
+FULL_ATTENTION_INDICES="0 1 2 3 4"
+TARGET_LAYER_IDS="1 10 19 28 37"
+BLOCK_SIZE="7"
+MAX_ANCHORS="2048"
+DECAY_GAMMA=7
 
-for executable in "$SPEC_PYTHON" "$TORCHRUN" "$VLLM_PYTHON"; do
-    if [[ ! -x "$executable" ]]; then
-        echo "Missing executable: $executable" >&2
-        exit 1
-    fi
-done
+SPEC_PYTHON="$WS/speculators/speculators_venv/bin/python"
+TORCHRUN="$WS/speculators/speculators_venv/bin/torchrun"
+VLLM_PYTHON="$WS/speculators/vllm_venv/bin/python"
+LAUNCH_VLLM="$WS/speculators/scripts/launch_vllm.py"
+TRAIN_SCRIPT="$WS/speculators/scripts/train.py"
 
-exec 9>"$RUN_DIR/training.lock"
-if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
-    echo "Another cluster job already holds $RUN_DIR/training.lock" >&2
-    exit 1
-fi
+mkdir -p "$OUTPUT_DIR/runs" "$OUTPUT_DIR/logs" "$HS_PATH"
 
-if [[ ! -f "$MODEL/config.json" ]]; then
-    echo "Missing model config: $MODEL/config.json" >&2
-    exit 1
-fi
+echo "=== Step 2: Using prepared training data from $DATA_DIR ==="
 
-if [[ ! -f "$WANDB_KEY_FILE" ]]; then
-    echo "Missing W&B key file: $WANDB_KEY_FILE" >&2
-    exit 1
-fi
-WANDB_API_KEY="$(tr -d '[:space:]' < "$WANDB_KEY_FILE")"
-if [[ -z "$WANDB_API_KEY" ]]; then
-    echo "W&B key file is empty: $WANDB_KEY_FILE" >&2
-    exit 1
-fi
-export WANDB_API_KEY
-
-for path in \
-    "$DATA_DIR/state.json" \
-    "$DATA_DIR/dataset_info.json"; do
-    if [[ ! -f "$path" ]]; then
-        echo "Missing prepared-data artifact: $path" >&2
-        exit 1
-    fi
-done
-
-for command in setsid curl; do
-    if ! command -v "$command" >/dev/null 2>&1; then
-        echo "The cluster image must provide the '$command' command." >&2
-        exit 1
-    fi
-done
-
-ALLOCATED_GPUS="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-IFS=',' read -r -a GPU_LIST <<< "$ALLOCATED_GPUS"
-if (( ${#GPU_LIST[@]} != 8 )); then
-    echo "Expected exactly 8 allocated GPUs, got: $ALLOCATED_GPUS" >&2
-    exit 1
-fi
-VLLM_GPUS=$(IFS=,; printf '%s' "${GPU_LIST[*]:0:2}")
-TRAIN_GPUS=$(IFS=,; printf '%s' "${GPU_LIST[*]:2:6}")
-
-VLLM_PID=""
-TRAIN_PID=""
-
-terminate_group() {
-    local pgid="$1"
-    [[ -z "$pgid" ]] && return 0
-    if ! kill -0 -- "-$pgid" 2>/dev/null; then
-        return 0
-    fi
-
-    kill -TERM -- "-$pgid" 2>/dev/null || true
-    for _ in {1..30}; do
-        if ! kill -0 -- "-$pgid" 2>/dev/null; then
-            return 0
-        fi
-        sleep 1
-    done
-    kill -KILL -- "-$pgid" 2>/dev/null || true
-}
-
-cleanup() {
-    local status=$?
-    trap - EXIT INT TERM
-    terminate_group "$TRAIN_PID"
-    terminate_group "$VLLM_PID"
-    rm -rf "$HIDDEN_STATES_DIR"
-    exit "$status"
-}
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-
-echo "Repository:     $REPO"
-echo "Model:          $MODEL"
-echo "Data:           $DATA_DIR"
-echo "Checkpoints:    $CHECKPOINT_DIR"
-echo "W&B project:    $WANDB_PROJECT"
-echo "vLLM GPUs:      $VLLM_GPUS"
-echo "Training GPUs:  $TRAIN_GPUS"
-echo "vLLM log:       $VLLM_LOG"
-
-"$SPEC_PYTHON" - "$VLLM_PORT" <<'PY'
-import socket
-import sys
-
-port = int(sys.argv[1])
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-    sock.settimeout(1)
-    if sock.connect_ex(("127.0.0.1", port)) == 0:
-        raise SystemExit(f"Port {port} is already in use; refusing to launch another server")
-PY
-
-echo "=== Launching vLLM ==="
-setsid env \
-    CUDA_VISIBLE_DEVICES="$VLLM_GPUS" \
-    PYTHONPATH="$LOCAL_PYTHONPATH" \
-    PYTHONUNBUFFERED=1 \
-    "$VLLM_PYTHON" \
-    "$LAUNCH_VLLM" \
-    "$MODEL" \
-    --target-layer-ids 2 20 37 \
-    --hidden-states-path "$HIDDEN_STATES_DIR" \
+# Step 3: Launch vLLM server in the background (generates hidden states on-the-fly)
+# --target-layer-ids selects the auxiliary hidden-state layers; it must match
+# the --target-layer-ids passed to the trainer below.
+echo "=== Step 3: Launching vLLM server for hidden states ==="
+echo "vLLM log: $VLLM_LOG"
+CUDA_VISIBLE_DEVICES="$VLLM_GPUS" "$VLLM_PYTHON" "$LAUNCH_VLLM" "$MODEL" \
+    --target-layer-ids $TARGET_LAYER_IDS \
+    --hidden-states-path "$HS_PATH" \
     -- \
     --tensor-parallel-size 1 \
     --data-parallel-size 2 \
-    --max-model-len 3088 \
-    --gpu-memory-utilization 0.92 \
+    --max-model-len $((SEQ_LENGTH + 16)) \
     --port "$VLLM_PORT" \
+    --gpu-memory-utilization 0.92 \
     >"$VLLM_LOG" 2>&1 &
 VLLM_PID=$!
 
-echo "Waiting for vLLM on port $VLLM_PORT (PID/PGID $VLLM_PID)..."
+cleanup() {
+    echo "Stopping vLLM server..."
+    kill "$VLLM_PID" 2>/dev/null || true
+    wait "$VLLM_PID" 2>/dev/null || true
+    rm -rf "$HS_PATH"
+}
+trap cleanup EXIT
+
+echo "Waiting for vLLM server to be ready..."
 deadline=$((SECONDS + 1800))
-until curl -sf "$VLLM_HEALTH_ENDPOINT" >/dev/null 2>&1; do
+until curl -sf "http://localhost:${VLLM_PORT}/health" > /dev/null 2>&1; do
     if ! kill -0 "$VLLM_PID" 2>/dev/null; then
         echo "vLLM exited before becoming healthy. Last log lines:" >&2
         tail -n 100 "$VLLM_LOG" >&2 || true
-        wait "$VLLM_PID"
+        wait "$VLLM_PID" || true
+        exit 1
     fi
     if (( SECONDS >= deadline )); then
         echo "Timed out after 30 minutes waiting for vLLM. See $VLLM_LOG" >&2
@@ -174,48 +92,43 @@ until curl -sf "$VLLM_HEALTH_ENDPOINT" >/dev/null 2>&1; do
     fi
     sleep 2
 done
+echo "vLLM server ready."
 
-echo "vLLM is healthy."
-echo "=== Launching DFlash training ==="
-setsid env \
-    CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" \
-    PYTHONPATH="$LOCAL_PYTHONPATH" \
-    PYTHONUNBUFFERED=1 \
-    WANDB_PROJECT="$WANDB_PROJECT" \
-    WANDB_MODE="$WANDB_MODE" \
-    "$TORCHRUN" \
-    --standalone \
-    --nproc_per_node 6 \
+RUN_NAME="dflash-${COMMENT:-base}-$(date +%Y%m%d-%H%M%S)"
+SAVE_DIR="$OUTPUT_DIR/runs/$RUN_NAME"
+echo "=== Step 4: Training (max_anchors = $MAX_ANCHORS, stream $((MAX_ANCHORS * BLOCK_SIZE))) ==="
+CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" "$TORCHRUN" \
+    --standalone --nproc_per_node "$NUM_TRAIN_GPUS" \
     "$TRAIN_SCRIPT" \
     --verifier-name-or-path "$MODEL" \
     --data-path "$DATA_DIR" \
-    --save-path "$CHECKPOINT_DIR" \
-    --epochs 3 \
+    --save-path "$SAVE_DIR" \
+    --epochs "$EPOCHS" \
     --train-data-ratio 0.98 \
     --optimizer muon \
     --muon-lr 2e-4 \
-    --lr 1e-4 \
-    --noise-std 0.05 \
+    --lr "$LR" \
+    --noise-std 0 \
     --scheduler-type cosine \
     --scheduler-warmup-ratio 0.01 \
-    --total-seq-len 8192 \
-    --speculator-type dflash \
+    --total-seq-len "$PACK_SEQ_LEN" \
+    --speculator-type "$SPECULATOR_TYPE" \
     --block-size "$BLOCK_SIZE" \
     --max-anchors "$MAX_ANCHORS" \
-    --num-layers 5 \
-    --dflash-decay-gamma 7 \
+    --num-layers "$NUM_LAYERS" \
+    --dflash-decay-gamma "$DECAY_GAMMA" \
     --loss-fn ce \
-    --sliding-window 2048 \
-    --sliding-window-non-causal \
-    --target-layer-ids 2 20 37 \
-    --vllm-endpoint "$VLLM_ENDPOINT" \
+    --target-layer-ids $TARGET_LAYER_IDS \
+    --vllm-endpoint "http://localhost:${VLLM_PORT}/v1" \
     --request-timeout 180 \
     --on-missing generate \
     --on-generate delete \
     --logger wandb \
     --log-dir "$LOG_DIR" \
     --checkpoint-freq 0.5 \
-    --run-name dflash_qwen3_6_35b_a3b_5swa &
-TRAIN_PID=$!
+    --run-name "$RUN_NAME" \
+    --hidden-states-backend file \
+    --hidden-states-path "$HS_PATH" \
+    --full-attention-indices $FULL_ATTENTION_INDICES
 
-wait "$TRAIN_PID"
+echo "Done. Checkpoints saved to $SAVE_DIR"

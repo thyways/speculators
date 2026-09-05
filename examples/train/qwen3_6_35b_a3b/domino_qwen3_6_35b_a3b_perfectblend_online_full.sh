@@ -19,13 +19,13 @@ MODEL="$WS/model_weights/Qwen--Qwen3.6-35B-A3B"
 OUTPUT_DIR="$WS/model_weights/domino_qwen3_6-35b-a3b-perfectblend"
 DATA_DIR="$WS/datasets/qwen3.6-35b-a3b/qwen3.6-35b-a3b_train_spec_len3072_fullvocab"
 LOG_DIR="$OUTPUT_DIR/logs"
-HS_PATH="/tmp/hs_qwen3_6_35b_a3b"  # transient hidden states
 SEQ_LENGTH=3072                 # Data truncation length (prepare_data); fixed by the shared artifacts
 PACK_SEQ_LEN=8192
 EPOCHS=3
 LR=1e-4
 VLLM_PORT=8000
 JOB_TAG="${SLURM_JOB_ID:-${JOB_ID:-$$}}"
+HS_PATH="/tmp/hs_domino_qwen3_6_35b_a3b_${JOB_TAG}"
 VLLM_LOG="$OUTPUT_DIR/logs/vllm_${JOB_TAG}.log"
 
 # Online training uses two GPUs for the verifier server and six for training.
@@ -38,7 +38,8 @@ SPECULATOR_TYPE="domino"
 BLOCK_SIZE=7
 MAX_ANCHORS=2048
 NUM_LAYERS=5
-TARGET_LAYER_IDS="2 20 37"
+FULL_ATTENTION_INDICES="0 1 2 3 4"
+TARGET_LAYER_IDS="1 10 19 28 37"
 DECAY_GAMMA=7
 GRU_HIDDEN_DIM=1024         # GRU over verifier embeddings of block tokens
 LOGITS_CORRECTION_EMB_DIM=256  # bias MLP: [draft hidden; GRU state] -> emb_dim -> vocab
@@ -88,7 +89,8 @@ until curl -sf "http://localhost:${VLLM_PORT}/health" > /dev/null 2>&1; do
     if ! kill -0 "$VLLM_PID" 2>/dev/null; then
         echo "vLLM exited before becoming healthy. Last log lines:" >&2
         tail -n 100 "$VLLM_LOG" >&2 || true
-        wait "$VLLM_PID"
+        wait "$VLLM_PID" || true
+        exit 1
     fi
     if (( SECONDS >= deadline )); then
         echo "Timed out after 30 minutes waiting for vLLM. See $VLLM_LOG" >&2
@@ -112,6 +114,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" "$TORCHRUN" \
     --epochs "$EPOCHS" \
     --checkpoint-freq 0.5 \
     --lr "$LR" \
+    --noise-std 0 \
     --muon-lr 2e-4 \
     --scheduler-type cosine \
     --total-seq-len "$PACK_SEQ_LEN" \
@@ -119,6 +122,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" "$TORCHRUN" \
     --block-size "$BLOCK_SIZE" \
     --max-anchors "$MAX_ANCHORS" \
     --num-layers "$NUM_LAYERS" \
+    --full-attention-indices $FULL_ATTENTION_INDICES \
     --target-layer-ids $TARGET_LAYER_IDS \
     --dflash-decay-gamma "$DECAY_GAMMA" \
     --gru-hidden-dim "$GRU_HIDDEN_DIM" \
