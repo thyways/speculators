@@ -432,7 +432,9 @@ case "$action" in
     generate)
         stage="${2:-full}"
         sample_data
-        if ! "$PYTHON_BIN" "$PIPELINE" status \
+        # A completed stage may still contain errors. Explicit retries must
+        # reach generate_stage even when there are no unattempted rows left.
+        if [[ "${PARSER2_RETRY_ERRORS:-0}" == "1" ]] || ! "$PYTHON_BIN" "$PIPELINE" status \
             --output-root "$OUTPUT_ROOT" \
             --stage "$stage" \
             --require-complete >/dev/null; then
@@ -451,7 +453,7 @@ case "$action" in
     smoke|pilot|full)
         sample_data
         if [[ "$PREPARE_ONLY" == "0" ]]; then
-            if ! "$PYTHON_BIN" "$PIPELINE" status \
+            if [[ "${PARSER2_RETRY_ERRORS:-0}" == "1" ]] || ! "$PYTHON_BIN" "$PIPELINE" status \
                 --output-root "$OUTPUT_ROOT" \
                 --stage "$action" \
                 --require-complete >/dev/null; then

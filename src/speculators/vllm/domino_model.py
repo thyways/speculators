@@ -63,6 +63,7 @@ class Qwen3DominoModel(DFlashQwen3Model):
             start_layer_id=start_layer_id,
             prefix=prefix,
         )
+        self.confidence_head = None
         config = self.config
         draft_vocab_size = (
             getattr(config, "draft_vocab_size", None) or config.vocab_size

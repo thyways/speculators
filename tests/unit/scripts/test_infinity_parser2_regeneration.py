@@ -6,6 +6,8 @@ import argparse
 import asyncio
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -133,13 +135,62 @@ def populate_successes(output_root: Path) -> tuple[str, str]:
 
 
 def test_directory_contains_only_the_real_entrypoints():
-    # Guards against scratch scripts accumulating here. prepare_fast.sh is the
-    # third: it replaces run_all.sh's prepare stage for the full-size corpus.
+    # Guards against scratch scripts accumulating alongside the real launchers.
     assert {path.name for path in SCRIPT_DIR.iterdir() if path.is_file()} == {
         "prepare_fast.sh",
+        "run_4node_dp.sh",
         "run_all.sh",
         "script.py",
     }
+
+
+@pytest.mark.parametrize("action", ["generate", "full"])
+@pytest.mark.parametrize("retry_errors", [False, True])
+def test_run_all_retries_errors_even_when_stage_is_complete(
+    tmp_path: Path, action: str, retry_errors: bool
+):
+    # Stub the pipeline processes, leaving the real shell control flow intact.
+    # status exits 0, as it does when every row has already returned HTTP 400.
+    calls_path = tmp_path / "calls.jsonl"
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "with open(os.environ['REGEN_TEST_CALLS'], 'a') as f:\n"
+        "    f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+    )
+    fake_python.chmod(0o755)
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PARSER2_")
+    }
+    env.update(
+        REGEN_TEST_CALLS=str(calls_path),
+        PARSER2_PYTHON_BIN=str(fake_python),
+        PARSER2_DATA_ROOT=str(tmp_path / "data"),
+        PARSER2_ENDPOINTS="http://teacher.invalid/v1/chat/completions",
+        PARSER2_PREPARE_MODE="render",
+        PARSER2_RETRY_ERRORS=str(int(retry_errors)),
+        PARSER2_ALLOW_CONFIG_CHANGE="1",
+    )
+    subprocess.run(  # noqa: S603
+        ["/bin/bash", str(SCRIPT_DIR / "run_all.sh"), action],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    calls = [json.loads(line) for line in calls_path.read_text().splitlines()]
+    generations = [
+        call for call in calls if call[0] == str(SCRIPT_PATH) and call[1] == "generate"
+    ]
+    assert len(generations) == int(retry_errors)
+    if retry_errors:
+        assert "--retry-errors" in generations[0]
+        assert "--allow-config-change" in generations[0]
+        assert generations[0][generations[0].index("--max-tokens") + 1] == "16384"
 
 
 def test_multiturn_skeleton_drops_old_answers_and_preserves_image_order():
@@ -285,8 +336,10 @@ def test_sample_status_and_ranked_export(tmp_path: Path):
     assert [row["provenance"]["candidate_rank"] for row in final_rows] == list(range(4))
 
 
+@pytest.mark.parametrize("max_tokens", [128, 16384])
 def test_generate_event_regenerates_assistant_turns_in_order(
     monkeypatch: pytest.MonkeyPatch,
+    max_tokens: int,
 ):
     skeleton, _ = regen.build_conversation_skeleton(
         [
@@ -330,7 +383,7 @@ def test_generate_event_regenerates_assistant_turns_in_order(
     monkeypatch.setattr(regen, "post_chat", fake_post_chat)
     args = argparse.Namespace(
         model="unit-test",
-        max_tokens=128,
+        max_tokens=max_tokens,
         temperature=0.0,
         top_p=1.0,
         seed=42,
@@ -355,6 +408,7 @@ def test_generate_event_regenerates_assistant_turns_in_order(
         "user",
     ]
     assert "discard" not in repr(payloads)
+    assert all(payload["max_tokens"] == max_tokens for payload in payloads)
 
 
 def test_async_generation_persists_results_incrementally(
