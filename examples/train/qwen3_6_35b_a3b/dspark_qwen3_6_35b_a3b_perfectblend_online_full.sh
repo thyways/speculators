@@ -205,7 +205,7 @@ setsid env \
     --lr 1e-4 \
     --weight-decay 0.01 \
     --noise-std 0.05 \
-    --scheduler-type linear \
+    --scheduler-type cosine \
     --scheduler-warmup-ratio 0.01 \
     --total-seq-len 8192 \
     --speculator-type dspark \

@@ -204,7 +204,7 @@ setsid env \
     --muon-lr 2e-4 \
     --lr 1e-4 \
     --noise-std 0.05 \
-    --scheduler-type linear \
+    --scheduler-type cosine \
     --scheduler-warmup-ratio 0.01 \
     --total-seq-len 8192 \
     --hidden-states-dtype bfloat16 \

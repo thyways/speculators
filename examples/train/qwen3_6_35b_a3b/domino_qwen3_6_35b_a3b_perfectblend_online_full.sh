@@ -113,6 +113,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" "$TORCHRUN" \
     --checkpoint-freq 0.5 \
     --lr "$LR" \
     --muon-lr 2e-4 \
+    --scheduler-type cosine \
     --total-seq-len "$PACK_SEQ_LEN" \
     --speculator-type "$SPECULATOR_TYPE" \
     --block-size "$BLOCK_SIZE" \
